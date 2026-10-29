@@ -1,0 +1,18 @@
+[Unit]
+Description=Ermik issue polling controller
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ermik
+EnvironmentFile=%h/.config/ermik/providers.env
+EnvironmentFile=-%h/.config/ermik/publisher.env
+ExecStart=/usr/bin/python3 -m ermik --config %h/ermik/config.json poll
+Restart=on-failure
+RestartSec=30s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

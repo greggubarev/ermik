@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="650" viewBox="0 0 1320 650" role="img" aria-labelledby="title description">
+  <title id="title">From issue to main</title>
+  <desc id="description">The maintainer admits an issue. The server completes the task and creates a draft PR. The maintainer requests changes in the same PR or merges the verified result.</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#edf3fb"/>
+    </linearGradient>
+    <filter id="shadow" x="-15%" y="-20%" width="130%" height="150%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#24466f" flood-opacity=".11"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10" fill="none" stroke="#62758f" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="return-arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10" fill="none" stroke="#e08b35" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="accept-arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2 2 L10 6 L2 10" fill="none" stroke="#2f9c79" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: Arial, "Noto Sans", "DejaVu Sans", sans-serif; }
+      .heading { fill: #15283f; font-size: 30px; font-weight: 700; }
+      .subtitle { fill: #52647c; font-size: 16px; }
+      .step { fill: #71839b; font-size: 13px; font-weight: 700; letter-spacing: 1.6px; }
+      .card-title { fill: #172b43; font-size: 21px; font-weight: 700; }
+      .body { fill: #465972; font-size: 16px; }
+      .badge { font-size: 13px; font-weight: 700; }
+      .route { fill: none; stroke: #62758f; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1320" height="650" fill="url(#background)" rx="24"/>
+  <text class="heading" x="48" y="62">From issue to merged change</text>
+  <text class="subtitle" x="48" y="91">The server runs the task and checks. The maintainer decides when to merge.</text>
+
+  <path class="route" d="M305 242 H352"/>
+  <path class="route" d="M615 242 H662"/>
+  <path class="route" d="M925 242 H972"/>
+
+  <g filter="url(#shadow)"><rect x="45" y="155" width="260" height="174" rx="18" fill="#fff"/></g>
+  <rect x="45" y="155" width="260" height="7" rx="3" fill="#4779c5"/>
+  <text class="step" x="68" y="194">01 · MAINTAINER</text>
+  <text class="card-title" x="68" y="232">Prepare issue</text>
+  <text class="body" x="68" y="264">Goal and allowed files</text>
+  <text class="body" x="68" y="290">Approve admission</text>
+
+  <g filter="url(#shadow)"><rect x="355" y="155" width="260" height="174" rx="18" fill="#fff"/></g>
+  <rect x="355" y="155" width="260" height="7" rx="3" fill="#5b81b6"/>
+  <text class="step" x="378" y="194">02 · GITHUB</text>
+  <text class="card-title" x="378" y="232">Issue queue</text>
+  <rect x="378" y="252" width="188" height="32" rx="16" fill="#e9f2ff"/>
+  <text class="badge" x="391" y="273" fill="#245793">queue:worker · ready</text>
+  <text class="body" x="378" y="309">Verify issue hash</text>
+
+  <g filter="url(#shadow)"><rect x="665" y="155" width="260" height="174" rx="18" fill="#fff"/></g>
+  <rect x="665" y="155" width="260" height="7" rx="3" fill="#765eb7"/>
+  <text class="step" x="688" y="194">03 · SERVER</text>
+  <text class="card-title" x="688" y="232">Execute task</text>
+  <text class="body" x="688" y="264">Container and local CI</text>
+  <text class="body" x="688" y="290">Branch and draft PR</text>
+
+  <g filter="url(#shadow)"><rect x="975" y="155" width="300" height="174" rx="18" fill="#fff"/></g>
+  <rect x="975" y="155" width="300" height="7" rx="3" fill="#318f92"/>
+  <text class="step" x="998" y="194">04 · MAINTAINER</text>
+  <text class="card-title" x="998" y="232">Review PR</text>
+  <text class="body" x="998" y="264">Exact HEAD and full diff</text>
+  <text class="body" x="998" y="290">Repeat local checks</text>
+
+  <path d="M1088 329 V389 H507 V427" fill="none" stroke="#e08b35" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#return-arrow)"/>
+  <rect x="703" y="369" width="115" height="31" rx="15" fill="#fff1dc"/>
+  <text class="badge" x="721" y="390" fill="#a85b19">revise</text>
+
+  <g filter="url(#shadow)"><rect x="355" y="430" width="305" height="139" rx="18" fill="#fff"/></g>
+  <rect x="355" y="430" width="305" height="7" rx="3" fill="#e08b35"/>
+  <text class="step" x="378" y="469">RETURN</text>
+  <text class="card-title" x="378" y="506">Change request</text>
+  <text class="body" x="378" y="539">Same issue, branch, and PR</text>
+
+  <path d="M355 514 H330 V359 H795 V329" fill="none" stroke="#e08b35" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#return-arrow)"/>
+
+  <path d="M1132 329 V427" fill="none" stroke="#2f9c79" stroke-width="3" stroke-linecap="round" marker-end="url(#accept-arrow)"/>
+  <rect x="1150" y="377" width="94" height="31" rx="15" fill="#def7ed"/>
+  <text class="badge" x="1166" y="398" fill="#177459">accept</text>
+
+  <g filter="url(#shadow)"><rect x="975" y="430" width="300" height="139" rx="18" fill="#fff"/></g>
+  <rect x="975" y="430" width="300" height="7" rx="3" fill="#2f9c79"/>
+  <text class="step" x="998" y="469">COMPLETE</text>
+  <text class="card-title" x="998" y="506">Explicit merge</text>
+  <text class="body" x="998" y="539">Check new main</text>
+
+  <text x="48" y="617" fill="#71839b" font-family="Arial, sans-serif" font-size="14">Review every new HEAD after revision · Only the maintainer merges</text>
+</svg>

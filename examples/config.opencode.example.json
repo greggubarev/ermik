@@ -1,0 +1,18 @@
+{
+  "repo": "example-org/example-project",
+  "maintainer": "example-maintainer",
+  "base_branch": "main",
+  "state_dir": "/var/lib/ermik",
+  "workspace": "/srv/ermik/workspace",
+  "image": "ermik-opencode:1.18.35",
+  "worker_command": ["python3", "/opt/worker/opencode-worker.py"],
+  "worker_env": [],
+  "models": [
+    {"provider_id": "kimi-code", "model_id": "k3-256k", "credential_env": "KIMI_CODE_API_KEY"},
+    {"provider_id": "opencode-go", "model_id": "kimi-k3", "credential_env": "OPENCODE_GO_API_KEY"}
+  ],
+  "checks": [["python3", "-c", "import runpy; greeting = runpy.run_path('src/example.py')['greeting']; assert greeting() == 'Hello from the example project'"]],
+  "max_parallel": 2,
+  "min_free_gb": 2,
+  "poll_seconds": 60
+}

@@ -1,0 +1,12 @@
+FROM ghcr.io/anomalyco/opencode:1.18.35@sha256:ae90ec960c871b0ea6df9abc1c2ec1e6b36464e8eca9b0e71e1ed3b553f47aa2
+
+RUN apk add --no-cache python3 ca-certificates
+
+COPY ermik/__init__.py /opt/worker/ermik/__init__.py
+COPY ermik/providers.py /opt/worker/ermik/providers.py
+COPY ermik/ci.py /opt/worker/ermik/ci.py
+COPY examples/opencode-worker.py /opt/worker/opencode-worker.py
+ENV PYTHONPATH=/opt/worker
+WORKDIR /work
+ENTRYPOINT []
+CMD ["python3", "/opt/worker/opencode-worker.py"]

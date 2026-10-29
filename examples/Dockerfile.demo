@@ -1,0 +1,6 @@
+FROM python:3.11-alpine
+
+COPY examples/worker.sh /worker.sh
+RUN chmod 0755 /worker.sh
+
+WORKDIR /work

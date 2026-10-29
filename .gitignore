@@ -1,0 +1,37 @@
+# Local configuration and credentials
+.local/
+config.json
+*.env
+*.token
+*.key
+*.pem
+*.p12
+.secrets/
+
+# Runtime state and local checkouts
+state/
+workspace/
+workspaces/
+logs/
+*.sqlite3
+*.sqlite3-*
+
+# Python and tool output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Editor and operating system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

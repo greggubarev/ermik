@@ -1,0 +1,14 @@
+[Unit]
+Description=Ermik read-only deployment preflight
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/ermik
+EnvironmentFile=%h/.config/ermik/providers.env
+EnvironmentFile=-%h/.config/ermik/publisher.env
+ExecStart=/usr/bin/python3 -m ermik --config %h/ermik/config.json doctor
+ExecStart=/usr/bin/python3 -m ermik --config %h/ermik/config.json status
+UMask=0077
+NoNewPrivileges=yes

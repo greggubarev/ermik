@@ -1,0 +1,13 @@
+{
+  "repo": "example-org/example-project",
+  "maintainer": "example-maintainer",
+  "base_branch": "main",
+  "state_dir": "/var/lib/ermik",
+  "workspace": "/srv/ermik/workspace",
+  "image": "ermik-demo:latest",
+  "worker_command": ["/bin/sh", "/worker.sh"],
+  "worker_env": [],
+  "checks": [["python3", "-c", "import runpy; greeting = runpy.run_path('src/example.py')['greeting']; assert greeting() == 'Hello from the example project'"]],
+  "max_parallel": 1,
+  "poll_seconds": 60
+}
