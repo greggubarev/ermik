@@ -20,7 +20,7 @@ For JUnit XML, the OpenCode image includes `python3 -m ermik.ci`. Configure a tr
 "checks": [["sh", "-c", "PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -p no:cacheprovider tests --junitxml=/tmp/ermik-tests.xml && python3 -m ermik.ci /tmp/ermik-tests.xml --min-tests 2"]]
 ```
 
-This replaces the example `checks` field. `/tmp` exists only inside that check's container, so create and read the report in one command. The validator accepts a `testsuite` or `testsuites` root, counts `testcase` elements, requires at least one test by default, and rejects `failure` or `error`. It also rejects missing, symbolic, invalid, or over 4 MiB reports. Set the minimum to the number your project expects. For a different image, include `ermik/ci.py` and Python or use an equivalent validator. The test command itself must also exit nonzero on failure.
+This replaces the example `checks` field. `/tmp` exists only inside that check's container, so create and read the report in one command. The validator accepts a `testsuite` or `testsuites` root, counts executed `testcase` elements toward the minimum, and rejects skipped-only, failed, inconsistent, missing, symbolic, invalid, or over 4 MiB reports. The default minimum is one executed case; set it to the number your project expects. For a different image, include `ermik/ci.py` and Python or use an equivalent validator. The test command itself must also exit nonzero on failure.
 
 | Stage | Check | Failure outcome |
 | --- | --- | --- |

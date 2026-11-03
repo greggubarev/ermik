@@ -17,6 +17,27 @@ _ROOT = Path(__file__).resolve().parent.parent
 _MAX_CASES = 40
 _MAX_TEXT = 240
 _MAX_JSON_BYTES = 32 * 1024
+_WINDOWS_SKIPS = {
+    "test_evidence_store.EvidenceStoreTests.test_shared_evidence_mode": "POSIX permissions",
+    "test_evidence_store.EvidenceStoreTests.test_reject_world_writable_existing_file": "POSIX permissions",
+    "test_evidence_store.EvidenceStoreTests.test_read_and_replace_legacy_0644_in_private_directory": "POSIX permissions",
+    "test_evidence_store.EvidenceStoreTests.test_reject_legacy_0644_in_group_accessible_directory": "POSIX permissions",
+    "test_evidence_store.EvidenceStoreTests.test_reject_unsafe_parent_directory": "POSIX permissions",
+    "test_review_store.ReviewStoreTests.test_legacy_0644_record_in_private_directory_upgrades_on_save": "POSIX permissions",
+    "test_review_store.ReviewStoreTests.test_group_writable_review_record_is_rejected": "POSIX permissions",
+    "test_fork_git.ForkGitTests.test_fork_git_uses_only_scoped_askpass":
+        "fork publisher runs on the POSIX server",
+    "test_fork_git.ForkGitTests.test_nonzero_push_is_ambiguous_until_remote_reconciliation":
+        "fork publisher runs on the POSIX server",
+    "test_evidence_store.EvidenceStoreTests.test_reject_symlink_and_unsafe_existing_path":
+        "symlinks unavailable",
+    "test_review_store.ReviewStoreTests.test_load_and_save_reject_symlink":
+        "symlinks unavailable",
+    "test_release_gate.ReleaseGateTests.test_rejects_symlink":
+        "symlink creation unavailable",
+    "test_workspace_recovery.WorkspaceRecoveryTests.test_symlink_issue_directory_is_not_followed":
+        "directory symlinks unavailable",
+}
 
 
 class _DiscardOutput(io.TextIOBase):
@@ -40,20 +61,7 @@ class _Results(unittest.TextTestResult):
 
 def _allowed_skip(test_id: str, reason: str) -> bool:
     """Keep platform exceptions explicit; missing tools remain failures."""
-    if os.name != "nt":
-        return False
-    if reason == "POSIX permissions" and (
-            test_id.startswith("test_evidence_store.")
-            or test_id.startswith("test_review_store.")):
-        return True
-    if reason == "fork publisher runs on the POSIX server" and (
-            test_id.startswith("test_fork_git.")):
-        return True
-    return reason in {"symlinks unavailable", "symlink creation unavailable",
-                      "directory symlinks unavailable"} and any(
-        test_id.startswith(prefix) for prefix in (
-            "test_evidence_store.", "test_review_store.",
-            "test_release_gate.", "test_workspace_recovery."))
+    return os.name == "nt" and _WINDOWS_SKIPS.get(test_id) == reason
 
 
 def _unit_suite() -> dict:
@@ -67,8 +75,10 @@ def _unit_suite() -> dict:
                   if not _allowed_skip(name, reason)]
     failures = (result.failure_ids + [test.id() for test in result.unexpectedSuccesses])
     return {
-        "result": "passed" if result.wasSuccessful() and not unexpected else "failed",
+        "result": ("passed" if result.wasSuccessful() and not unexpected
+                   and result.testsRun > len(skipped) else "failed"),
         "run": result.testsRun,
+        "executed": result.testsRun - len(skipped),
         "failures": len(result.failures),
         "errors": len(result.errors),
         "unexpected_successes": len(result.unexpectedSuccesses),
@@ -148,8 +158,8 @@ def verify(*, docker: bool = False, image: str | None = None) -> dict:
             report["host"] = {"result": "failed", "reason": "docker_or_image_unavailable"}
         else:
             report["host"] = {
-                "smoke": _host_check("host_smoke.py", image),
-                "container_recovery": _host_check("host_container_recovery.py", image),
+                "smoke": _host_check("host_smoke.py", image_id),
+                "container_recovery": _host_check("host_container_recovery.py", image_id),
             }
     host_passed = (not docker or (report["host"].get("smoke", {}).get("result") == "passed"
                                   and report["host"].get("container_recovery", {}).get("result")
