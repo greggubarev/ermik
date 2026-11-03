@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import stat
 import struct
@@ -356,7 +357,12 @@ def main() -> None:
     _require(args.socket_gid >= 0, "invalid socket group")
     old_umask = os.umask(0o117)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    def stop_on_term(_signum, _frame) -> None:
+        raise SystemExit(0)
+
+    old_term_handler = None
     try:
+        old_term_handler = signal.signal(signal.SIGTERM, stop_on_term)
         server.bind(str(args.socket))
         os.chown(args.socket, -1, args.socket_gid)
         os.chmod(args.socket, 0o660)
@@ -374,6 +380,8 @@ def main() -> None:
         server.close()
         os.umask(old_umask)
         args.socket.unlink(missing_ok=True)
+        if old_term_handler is not None:
+            signal.signal(signal.SIGTERM, old_term_handler)
 
 
 if __name__ == "__main__":
