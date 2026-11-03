@@ -4,7 +4,9 @@ import json
 import io
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
@@ -31,6 +33,12 @@ def rest_pr(number=57, *, repo="example/project", branch=BRANCH, base="main"):
 class GitHubPRIdentityTests(unittest.TestCase):
     def setUp(self):
         self.github = GitHub("example/project")
+
+    def fork_github(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN",
+                      probe_state_dir=Path(directory.name))
 
     def test_issue_allows_closed_issue_only_when_requested_and_rejects_pr(self):
         issue = {"number": 42, "state": "closed", "body": "Completed task"}
@@ -101,7 +109,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                                          base_sha=BASE, draft=True, state="OPEN")
 
     def test_fork_pr_uses_fork_owner_and_verifies_fork_source(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         rows = [rest_pr(11, repo="example/project"),
                 rest_pr(57, repo="publisher/project")]
         with patch.object(github, "_pages", return_value=rows) as pages:
@@ -116,7 +124,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
         self.assertEqual(command.call_args.args[0][6:8], ["--head", f"publisher:{BRANCH}"])
 
     def test_fork_access_requires_exact_parent_and_probes_both_credentials(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         upstream = {"full_name": "example/project", "default_branch": "main",
                     "permissions": {"push": True}}
         fork = {"full_name": "publisher/project", "fork": True,
@@ -149,7 +157,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                         github.validate_publish_access()
 
     def test_publication_probe_cleans_created_branch_and_rejects_ambiguous_status(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
 
         class Response(io.BytesIO):
             def __enter__(self):
@@ -197,7 +205,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                                                         allow_404=True))
 
     def test_probe_reconciles_lost_post_response_before_cleanup(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         ref = "refs/heads/ermik-access-probe-" + "f" * 32
 
         def response(status, body=None):
@@ -219,11 +227,13 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 self.assertEqual([call.args[0].get_method() for call in request.call_args_list],
                                  ["POST", "GET", "GET", "DELETE"])
             changed = {"ref": ref, "object": {"sha": BASE}}
+            github = self.fork_github()
             with patch("ermik.github.urlopen", side_effect=[URLError("lost POST"),
                                                              response(200, changed)]) as request:
                 with self.assertRaisesRegex(GitHubError, ref):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
                 self.assertEqual(request.call_count, 2)
+            github = self.fork_github()
             with patch("ermik.github.urlopen", side_effect=[URLError("lost POST"), missing(),
                                                              response(200, {"full_name": "publisher/project",
                                                                             "default_branch": "main"}),
@@ -234,7 +244,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 self.assertEqual(request.call_count, 4)
 
     def test_probe_reconciles_lost_delete_response_and_preserves_changed_ref(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         ref = "refs/heads/ermik-access-probe-" + "f" * 32
 
         def response(status, body=None):
@@ -272,6 +282,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(GitHubError, ref + r".*expected " + HEAD):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
                 self.assertEqual(request.call_count, 4)
+            github = self.fork_github()
             with patch("ermik.github.urlopen", side_effect=[response(201),
                                                              response(200, matching),
                                                              URLError("lost DELETE"), missing(),
@@ -279,6 +290,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(GitHubError, "repository visibility unconfirmed"):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
                 self.assertEqual(request.call_count, 5)
+            github = self.fork_github()
             with patch("ermik.github.urlopen", side_effect=[response(201),
                                                              response(200, changed)]) as request:
                 with self.assertRaisesRegex(GitHubError, "ref changed"):
@@ -287,7 +299,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                                  ["POST", "GET"])
 
     def test_probe_ref_404_requires_exact_repository_visibility(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         ref = "refs/heads/ermik-access-probe-" + "f" * 32
         headers = {"Authorization": "Bearer secret"}
 
@@ -306,7 +318,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 self.assertEqual(request.call_count, 2)
 
     def test_probe_ref_404_rejects_metadata_only_visibility(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         ref = "refs/heads/ermik-access-probe-" + "f" * 32
         headers = {"Authorization": "Bearer secret"}
 
@@ -331,7 +343,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                                  request.call_args_list[0].args[0].get_header("Authorization"))
 
     def test_existing_branch_update_probe_distinguishes_permission_from_validation(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
 
         def denied(status):
             return HTTPError("https://api.github.com", status, "secret response", None, None)
@@ -360,7 +372,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 github._probe_existing_branch_update("example/project", "main", "secret")
 
     def test_publication_access_rejects_unsafe_upstream_and_unwritable_fork(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         upstream = {"full_name": "example/project", "default_branch": "main"}
         fork = {"full_name": "publisher/project", "fork": True,
                 "parent": {"full_name": "example/project"}, "default_branch": "main"}
@@ -388,7 +400,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 self.assertEqual(probe.call_count, 3)
 
     def test_publication_access_rejects_upstream_update_capability_after_creation_refusal(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         upstream = {"full_name": "example/project", "default_branch": "main"}
         fork = {"full_name": "publisher/project", "fork": True,
                 "parent": {"full_name": "example/project"}, "default_branch": "main"}
@@ -409,7 +421,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 github.validate_publish_access()
 
     def test_fork_upstream_visibility_requires_exact_identity_or_404(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         class Response(io.BytesIO):
             def __enter__(self):
                 return self
@@ -424,7 +436,7 @@ class GitHubPRIdentityTests(unittest.TestCase):
             self.assertTrue(github._fork_token_upstream_hidden("secret"))
 
     def test_fork_command_passes_token_only_in_child_environment(self):
-        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        github = self.fork_github()
         completed = subprocess.CompletedProcess(["gh", "api", "user"], 0, stdout="{}")
         with patch.dict(os.environ, {"GH_TOKEN": "upstream-secret",
                                   "ERMIK_FORK_TOKEN": "fork-secret"}), patch(

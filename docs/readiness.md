@@ -10,6 +10,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 | SQLite state upgrade | Six migration tests use populated, synthetic preview state. They cover an idempotent upgrade to schema version 1, preserved admissions, jobs, retry and usage rows and review evidence files, refusal of an unknown newer version, an interrupted transaction, and backup/restore. Run `python3 -m unittest tests.test_state_migrations -v`. The [setup guide](setup.md#stop-update-and-roll-back) gives the stopped-service backup and rollback procedure. |
 | Demo runner | The Docker host smoke covers a failed check, task execution, correction, and local checks. |
 | Container cleanup | A host smoke removes only a stopped run's labelled container. |
+| Publication probe recovery | Issue #30 adds a durable exact repository, ref, and expected SHA intent for a fork capability probe. Restart reconciliation is limited to that recorded ref and the same scoped credential; a changed or unreadable ref blocks automatic cleanup. Unit tests cover the crash windows and a second controller's ref. A live hard-stop trial against a disposable fork remains to be verified. |
 | Evidence file writes | Unit tests cover atomic replacement, malformed records, POSIX permissions, and a simulated failure before and after replacement. Interrupted-run recovery blocks a partial evidence file without creating another PR. The Linux suite passed; live process termination remains to be verified. |
 | Maintainer review records | Unit tests cover private atomic replacement, failed writes, malformed and oversized records, and legacy permission upgrades. Real process termination during a maintainer decision remains to be verified. |
 | Review policy identity | Merge checks the ordered check commands and resolved review image against the saved review before changing the PR. A policy or image change requires a new review. |
@@ -22,6 +23,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 ## Not yet verified
 
 - Recovery from a real process kill in every remote-write window.
+- A live hard-stop trial of publication probe recovery before POST, after POST, after DELETE, and after lost responses against a disposable fork.
 - Reboot of the execution host while a task is active.
 - Setup on a clean host by an unrelated operator.
 - A live upgrade and rollback of an existing controller installation; the SQLite migration and backup/restore evidence above uses synthetic preview-shaped state.
