@@ -9,7 +9,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 | State and policy | Unit tests cover admission, path reservations, provider routing, publication, review, and recovery transitions. |
 | Demo runner | The Docker host smoke covers a failed check, task execution, correction, and local checks. |
 | Container cleanup | A host smoke removes only a stopped run's labelled container. |
-| Evidence file writes | Unit tests cover atomic replacement, malformed records, and a simulated failure before and after replacement. Interrupted-run recovery blocks a partial evidence file without creating another PR. Linux file permissions and live process termination remain to be verified. |
+| Evidence file writes | Unit tests cover atomic replacement, malformed records, POSIX permissions, and a simulated failure before and after replacement. Interrupted-run recovery blocks a partial evidence file without creating another PR. All 203 tests passed on Linux; live process termination remains to be verified. |
 | Issue handoff | A private test repository completed admission, draft PR publication, requested changes on the same PR, local review, explicit merge, and a check on the resulting default branch. |
 | Provider routes | The two documented subscription routes each completed a live task and returned usage data. |
 
