@@ -8,7 +8,7 @@ Ermik is a self-hosted path from scoped GitHub Issues to draft pull requests. A 
 
 ## What we are building
 
-The goal is a reusable execution queue that can work through admitted Issues while the maintainer is away. Each task gets an isolated checkout, a configured runner and local checks. The controller publishes one draft PR per Issue, resumes safely after interruptions, and sends requested changes back to the same PR. A separate maintainer installation verifies the current HEAD and decides when to merge. No execution-host command merges; the [security model](docs/security.md) explains the credentials needed to enforce that boundary.
+The goal is a reusable execution queue that can work through admitted Issues while the maintainer is away. Each task gets an isolated checkout, a configured runner and local checks. The controller publishes one draft PR per Issue and sends requested changes back to the same PR. Safe resumption after interruptions is a v0.2 goal still under test. A separate maintainer installation verifies the current HEAD and decides when to merge. The execution loop does not merge; the [security model](docs/security.md) explains the credentials needed to enforce that boundary.
 
 Later releases aim to carry a portable record of checks and task identity to the maintainer, compare provider routes by accepted PR outcomes and cost, and explain blocked or waiting work through optional local views. These are tracked goals, not claims about the preview. The [release status](docs/readiness.md) lists what has actually been verified.
 
@@ -73,7 +73,7 @@ The [phased roadmap](docs/roadmap.md) defines the acceptance gates. The mileston
 | [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measure provider outcomes, quota observations, context use and cost per accepted PR before changing routing policy. |
 | [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Add optional diagnostics and views, and validate the setup on unrelated projects. |
 
-Ermik remains a preview while the v0.2 recovery and credential gates are open. See [release status](docs/readiness.md) for verified trials and [published versions](https://github.com/greggubarev/ermik/releases) for actual releases.
+Ermik remains a preview while the v0.2 recovery and credential gates are open. See [release status](docs/readiness.md) for verified trials and [Releases](https://github.com/greggubarev/ermik/releases) when a version is published.
 
 ## Documentation
 
