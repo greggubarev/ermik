@@ -175,7 +175,7 @@ On the Docker host, you can test cleanup of a container left by a stopped contro
 PYTHONPATH=. python3 tests/host_container_recovery.py ermik-opencode:1.18.35
 ```
 
-The example configuration is not ready for arbitrary projects: its `checks` validates only the demo task file. Build an image with your dependencies, configure meaningful checks, and add [JUnit XML validation](local-ci.md) if needed. See [provider routing](providers.md) for models and additional OpenAI-compatible accounts.
+The example configuration is not ready for arbitrary projects: its `checks` validates only the demo task file. Build an image with your dependencies, configure meaningful checks, and add [JUnit XML validation](local-ci.md) if needed. See [provider routing](providers.md) for models and additional compatible accounts.
 
 Create a private environment file **outside the checkout** under the controller account. It needs only keys for providers enabled in `models`. Do not put values in documentation, JSON, or command-line arguments.
 
@@ -290,7 +290,7 @@ If `main` advances and the accepted file contents need no changes, put `SEMI_REB
 
 ## Stop, update and roll back
 
-Stop this unit before changing its checkout, image, config or secret file. Preserve its state and workspace and reconcile any interrupted Issue, branch and PR with GitHub before retrying a write. Record the old commit and image ID so a rollback targets exact versions:
+Stop this unit before changing its checkout, image, config or secret file. Ensure no other controller or maintenance command is using the same `state_dir`. Preserve its state and workspace and reconcile any interrupted Issue, branch and PR with GitHub before retrying a write. The first database open by the updated controller migrates the preview SQLite database in place to schema version 1. Back up the complete private state before that open. Record the old commit and image ID so a rollback targets exact versions:
 
 ```sh
 systemctl --user stop ermik.service
@@ -303,13 +303,53 @@ cp -a config.json "$backup_dir/config.json"
 cp -a "$HOME/.config/ermik/providers.env" "$backup_dir/providers.env"
 if test -f "$HOME/.config/ermik/publisher.env"; then cp -a "$HOME/.config/ermik/publisher.env" "$backup_dir/publisher.env"; fi
 cp -a "$HOME/.config/systemd/user/ermik.service" "$HOME/.config/systemd/user/ermik-preflight.service" "$backup_dir/"
-tar -C / -czf "$backup_dir/state.tar.gz" var/lib/ermik
+state_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["state_dir"])')"
+test -d "$state_dir" && test -f "$state_dir/state.sqlite3"
+python3 - "$state_dir/state.sqlite3" "$backup_dir/state.sqlite3" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+source = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
+target = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(target)
+    if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        raise RuntimeError("SQLite backup integrity check failed")
+    print("backed up SQLite schema version", target.execute("PRAGMA user_version").fetchone()[0])
+finally:
+    target.close()
+    source.close()
+PY
+tar -C "$state_dir" --exclude='./state.sqlite3' --exclude='./state.sqlite3-wal' --exclude='./state.sqlite3-shm' -czf "$backup_dir/state-files.tar.gz" .
 chmod 0600 "$backup_dir"/*
 ```
 
-   The backup contains the commit SHA, image ID, config and state. The archive uses the isolated example state path; adjust it to match the configured path if different. Keep the workspace in place for reconciliation instead of copying its cached clone and worktrees on every update. Use an immutable image tag or digest, and save the image separately only when it cannot be rebuilt or pulled from its pinned source. The controller records the resolved image ID in the job ledger before launching its first container. Retries, corrections, and recovery use that ID even if the configured tag moves; they stop if the old image is unavailable. Keep the old image on both hosts until every existing PR has been reviewed and finished. A new image applies to newly claimed jobs. A maintainer must build or pull the exact published image and run `review` again after any image update. Jobs created by an earlier version without a saved image ID require inspection before resumption; do not infer an ID from a mutable tag. Check available disk space before a large state backup, and retain only backups still needed for rollback after verifying their exact paths. Keep backups outside the checkout and protect them as controller state. Update to a reviewed exact commit, install the matching unit copies if changed, rebuild or pull the pinned image, and run the systemd preflight above before restarting. A shell-level `doctor` is insufficient for this gate. Do not start polling while another controller uses the same state directory.
+The backup contains the commit SHA, image ID, config, a consistent SQLite copy, and the other state files. It uses `state_dir` from `config.json`; the database backup includes committed data from any SQLite journal. Keep the workspace in place for reconciliation instead of copying its cached clone and worktrees on every update. Use an immutable image tag or digest, and save the image separately only when it cannot be rebuilt or pulled from its pinned source. The controller records the resolved image ID in the job ledger before launching its first container. Retries, corrections, and recovery use that ID even if the configured tag moves; they stop if the old image is unavailable. Keep the old image on both hosts until every existing PR has been reviewed and finished. A new image applies to newly claimed jobs. A maintainer must build or pull the exact published image and run `review` again after any image update. Jobs created by an earlier version without a saved image ID require inspection before resumption; do not infer an ID from a mutable tag. Check available disk space before a large state backup, and retain only backups still needed for rollback after verifying their exact paths. Keep backups outside the checkout and protect them as controller state. Update to a reviewed exact commit, install the matching unit copies if changed, rebuild or pull the pinned image, and run the systemd preflight above before restarting. A shell-level `doctor` is insufficient for this gate. Do not start polling while another controller uses the same state directory.
 
-If the new version fails, stop **only** `ermik.service`, restore the recorded commit (`git checkout --detach COMMIT`), the saved config, provider file and unit copies, and verify that the recorded image ID is still available. Rebuild or pull the pinned image if necessary; if you saved an image archive separately, load it. Reload the user manager and repeat the preflight before restarting. Keep the current state and workspace for reconciliation with GitHub. Restoring an older SQLite snapshot after a remote Issue, branch or PR write can replay work, so restore the archived state only after comparing every affected remote identity and local event with the backup. Do not remove state or re-admit an Issue merely because a command timed out.
+The migration runs automatically when the updated controller opens the database; there is no separate migration command. It preserves the preview admissions, jobs, retry state, events and usage records. If the migration fails, leave the service stopped and inspect the error and backed-up database before retrying. An unknown newer schema version is rejected. After the systemd preflight, migrate the stopped installation locally and verify it before polling:
+
+```sh
+python3 - "$state_dir" <<'PY'
+import sys
+from pathlib import Path
+from ermik.state import initialize
+
+print("state database", initialize(Path(sys.argv[1])))
+PY
+python3 - "$state_dir/state.sqlite3" <<'PY'
+import sqlite3
+import sys
+
+with sqlite3.connect(sys.argv[1]) as db:
+    print("schema version", db.execute("PRAGMA user_version").fetchone()[0])
+    print("integrity", db.execute("PRAGMA quick_check").fetchone()[0])
+PY
+```
+
+Expect schema version `1` and integrity `ok`. A read-only `doctor` preflight does not itself migrate the database. Use the same local migration and verification on a disposable copy first when rehearsing the upgrade.
+
+If the new version fails, stop **only** `ermik.service`, restore the recorded commit (`git checkout --detach COMMIT`), the saved config, provider file and unit copies, and verify that the recorded image ID is still available. Rebuild or pull the pinned image if necessary; if you saved an image archive separately, load it. Reload the user manager and repeat the preflight before restarting. The old preview controller must not open a version 1 database. Before starting it, either return to the updated controller or restore the pre-upgrade state backup using the procedure below. Keep the current state and workspace for reconciliation with GitHub. Restoring an older SQLite snapshot after a remote Issue, branch or PR write can replay work, so restore the archived state only after comparing every affected remote identity and local event with the backup. Do not remove state or re-admit an Issue merely because a command timed out.
 
 After setting `backup_dir` to the saved directory, the local rollback commands are:
 
@@ -328,4 +368,39 @@ systemctl --user daemon-reload
 systemctl --user start ermik-preflight.service
 ```
 
-Inspect the preflight result and reconcile remote state before `systemctl --user start ermik.service`.
+Inspect the preflight result and reconcile remote state before `systemctl --user start ermik.service`. If reverting to the preview commit, use the pre-upgrade database and other state files **only after** that reconciliation confirms the snapshot can safely replace the current state. Keep the post-upgrade state intact for investigation. Restore into a new private directory and point the rollback config there, so the two versions cannot open the same database:
+
+```sh
+rollback_state="$HOME/.local/share/ermik-state-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+test ! -e "$rollback_state" && test -f "$backup_dir/state.sqlite3"
+install -d -m 0700 "$rollback_state"
+tar -C "$rollback_state" -xzf "$backup_dir/state-files.tar.gz"
+install -m 0600 "$backup_dir/state.sqlite3" "$rollback_state/state.sqlite3"
+python3 - "$rollback_state" <<'PY'
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+with sqlite3.connect(root / "state.sqlite3") as db:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    integrity = db.execute("PRAGMA quick_check").fetchone()[0]
+    print("restored schema version", version)
+    print("integrity", integrity)
+    if version != 0 or integrity != "ok":
+        raise RuntimeError("restored preview state failed validation")
+config = Path("config.json")
+data = json.loads(config.read_text(encoding="utf-8"))
+data["state_dir"] = str(root)
+temporary = config.with_name("config.json.rollback.tmp")
+with temporary.open("w", encoding="utf-8") as output:
+    os.chmod(temporary, 0o600)
+    json.dump(data, output, indent=2)
+    output.write("\n")
+os.replace(temporary, config)
+PY
+```
+
+Expect schema version `0` for an unversioned preview snapshot and integrity `ok`. Reconcile the restored ledger against GitHub once more, then repeat the systemd preflight and start only this polling unit. Retain the private post-upgrade state until its remote writes and local records have been accounted for.
