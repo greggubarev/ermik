@@ -11,6 +11,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 | Container cleanup | A host smoke removes only a stopped run's labelled container. |
 | Evidence file writes | Unit tests cover atomic replacement, malformed records, POSIX permissions, and a simulated failure before and after replacement. Interrupted-run recovery blocks a partial evidence file without creating another PR. The Linux suite passed; live process termination remains to be verified. |
 | Maintainer review records | Unit tests cover private atomic replacement, failed writes, malformed and oversized records, and legacy permission upgrades. Real process termination during a maintainer decision remains to be verified. |
+| Review policy identity | Merge checks the ordered check commands and resolved review image against the saved review before changing the PR. A policy or image change requires a new review. |
 | Image use during one attempt | Tests check that the worker and local checks receive one verified image ID, including provider fallback. The Docker host smoke passed a task, correction, and checks by image ID. Binding that ID across later corrections, recovery, and separate-host review remains open in Issue #8. |
 | Issue handoff | A private test repository completed admission, draft PR publication, requested changes on the same PR, local review, explicit merge, and a check on the resulting default branch. |
 | Provider routes | The two documented subscription routes each completed a live task and returned usage data. |
