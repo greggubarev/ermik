@@ -116,39 +116,48 @@ def _load(cfg: Config, number: int) -> dict:
 
 
 def review(cfg: Config, number: int) -> dict:
+    with state.exclusive(cfg.state_dir):
+        return _review_locked(cfg, number)
+
+
+def _review_locked(cfg: Config, number: int) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
+    record_path = cfg.state_dir / "reviews" / f"pr-{number}.json"
+    if record_path.exists() and _load(cfg, number).get("merge_attempt") is not None:
+        raise WorkflowError("review cannot replace a pending merge attempt")
     pr, issue_num, issue = _identity(cfg, gh, number)
     if pr["baseRefOid"] != main_sha(gh, cfg):
         raise WorkflowError("PR base is not current base branch")
     spec = parse_issue(issue["body"])
-    with state.exclusive(cfg.state_dir):
-        checkout = _checkout_pr(cfg, number, pr)
-        try:
-            if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
-                raise WorkflowError("review checkout HEAD differs")
-            actual = set(verify_changed_tree(checkout, pr["baseRefOid"],
-                                             pr["headRefOid"],
-                                             allowed_paths=spec.allowed_paths))
-            published = {row["path"] for row in pr["files"]}
-            if actual != published:
-                raise WorkflowError("published and fetched PR diffs differ")
-            validate_changed_paths(actual, spec.allowed_paths)
-            proof = local_checks(cfg, checkout)
-            image_id = proof.get("image_id") if isinstance(proof, dict) else None
-            if (not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id)
-                    or _resolve_image_id(cfg.image) != image_id):
-                raise WorkflowError("review checks did not use the configured image")
-        finally:
-            if checkout.exists():
-                git(cfg.workspace / "source", "worktree", "remove", str(checkout))
+    checkout = _checkout_pr(cfg, number, pr)
+    try:
+        if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
+            raise WorkflowError("review checkout HEAD differs")
+        actual = set(verify_changed_tree(checkout, pr["baseRefOid"],
+                                         pr["headRefOid"],
+                                         allowed_paths=spec.allowed_paths))
+        published = {row["path"] for row in pr["files"]}
+        if actual != published:
+            raise WorkflowError("published and fetched PR diffs differ")
+        validate_changed_paths(actual, spec.allowed_paths)
+        proof = local_checks(cfg, checkout)
+        image_id = proof.get("image_id") if isinstance(proof, dict) else None
+        if (not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id)
+                or _resolve_image_id(cfg.image) != image_id):
+            raise WorkflowError("review checks did not use the configured image")
+    finally:
+        if checkout.exists():
+            git(cfg.workspace / "source", "worktree", "remove", str(checkout))
     current = gh.pr(number)
     if current["headRefOid"] != pr["headRefOid"] or current["baseRefOid"] != pr["baseRefOid"]:
         raise WorkflowError("PR changed during local review")
     _, _, current_issue = _identity(cfg, gh, number)
     if parse_issue(current_issue["body"]).body_sha256 != spec.body_sha256:
         raise WorkflowError("issue changed during local review")
-    result = {"pr": number, "issue": issue_num, "base": pr["baseRefOid"],
+    result = {"pr": number, "issue": issue_num, "repo": cfg.repo,
+              "head_repository": cfg.publish_repo or cfg.repo,
+              "branch": pr["headRefName"], "base": pr["baseRefOid"],
               "head": pr["headRefOid"], "body_sha256": spec.body_sha256,
               "paths": sorted(actual), "reviewed_at": datetime.now(timezone.utc).isoformat(),
               "ci": proof, "checks_sha256": _checks_sha256(cfg),
@@ -158,10 +167,17 @@ def review(cfg: Config, number: int) -> dict:
 
 
 def request_changes(cfg: Config, number: int, note_file: Path) -> dict:
+    with state.exclusive(cfg.state_dir):
+        return _request_changes_locked(cfg, number, note_file)
+
+
+def _request_changes_locked(cfg: Config, number: int, note_file: Path) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
     pr, issue_num, issue = _identity(cfg, gh, number, allow_blocked=True)
     record = _load(cfg, number)
+    if record.get("merge_attempt") is not None:
+        raise WorkflowError("correction request cannot follow a pending merge attempt")
     if (record.get("head") != pr["headRefOid"] or record.get("base") != pr["baseRefOid"]
             or record.get("body_sha256") != parse_issue(issue["body"]).body_sha256
             or record.get("paths") != sorted(row["path"] for row in pr["files"])):
@@ -179,7 +195,98 @@ def request_changes(cfg: Config, number: int, note_file: Path) -> dict:
             "request": "already-present" if existing else "posted"}
 
 
+def _merged_identity(cfg: Config, gh: GitHub, number: int,
+                     record: dict, pr: dict) -> str:
+    """Bind a completed squash merge to the exact reviewed PR and base."""
+    if (record.get("pr") != number
+            or not isinstance(record.get("issue"), int)
+            or record["issue"] <= 0
+            or record.get("repo") != cfg.repo
+            or record.get("head_repository") != (cfg.publish_repo or cfg.repo)
+            or not isinstance(record.get("branch"), str)
+            or not _BRANCH.fullmatch(record["branch"])
+            or record.get("issue") != int(_BRANCH.fullmatch(record["branch"]).group(1))
+            or _CLOSES.findall(pr.get("body") or "") != [str(record["issue"])]):
+        raise WorkflowError("reviewed PR identity is missing or changed")
+    gh.validate_pr_identity(pr, branch=record["branch"],
+                            base_branch=cfg.base_branch, number=number,
+                            head_sha=record["head"], state="MERGED")
+    if pr.get("state") != "MERGED" or pr.get("headRefOid") != record["head"]:
+        raise WorkflowError("merge outcome not confirmed")
+    issue = gh.issue(record["issue"])
+    if parse_issue(issue.get("body") or "").body_sha256 != record.get("body_sha256"):
+        raise WorkflowError("reviewed issue changed after merge")
+    merge_commit = pr.get("mergeCommit")
+    oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+    if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}", oid):
+        raise WorkflowError("merge commit is not available yet; retry merge verification")
+    if record.get("merge_commit") is not None and record["merge_commit"] != oid:
+        raise WorkflowError("merge commit changed after confirmation")
+    parents = gh.api(f"git/commits/{oid}").get("parents")
+    if (not isinstance(parents, list) or len(parents) != 1
+            or not isinstance(parents[0], dict)
+            or parents[0].get("sha") != record.get("base")):
+        raise WorkflowError("merge commit is not based on reviewed base")
+    return oid
+
+
+def _incomplete(number: int, issue_num: int, reason: str,
+                merge_commit: str | None = None) -> dict:
+    result = {"pr": number, "issue": issue_num, "status": "incomplete",
+              "reason": reason}
+    if merge_commit is not None:
+        result.update(merge_commit=merge_commit, main_ci=None, issue_closed=None)
+    return result
+
+
+def _post_merge_verification(cfg: Config, gh: GitHub, number: int,
+                             record: dict, merge_commit: str) -> dict:
+    try:
+        image_id = _review_policy(cfg, record, check_reference=False)
+    except Exception:
+        raise WorkflowError("review policy unavailable after merge") from None
+    try:
+        new_main = main_sha(gh, cfg)
+    except Exception:
+        raise WorkflowError("base branch could not be verified") from None
+    if merge_commit != new_main:
+        raise WorkflowError("base branch moved after merge")
+    try:
+        source = mirror(cfg)
+        path = cfg.workspace / "reviews" / f"main-after-{number}"
+        if path.exists():
+            raise WorkflowError("existing main CI checkout requires inspection")
+        git(source, "worktree", "add", "--detach", str(path), new_main)
+    except Exception:
+        raise WorkflowError("post-merge checkout failed") from None
+    try:
+        try:
+            proof = local_checks(cfg, path, image_id=image_id)
+        except Exception:
+            raise WorkflowError("post-merge checks failed") from None
+    finally:
+        if path.exists():
+            try:
+                git(source, "worktree", "remove", str(path))
+            except Exception:
+                raise WorkflowError("post-merge checkout cleanup failed") from None
+    if not isinstance(proof, dict) or proof.get("result") != "passed":
+        raise WorkflowError("post-merge checks failed")
+    try:
+        issue_closed = gh.api(f"issues/{record['issue']}")["state"] == "closed"
+    except Exception:
+        raise WorkflowError("linked issue closure could not be verified") from None
+    if not issue_closed:
+        raise WorkflowError("linked issue is not closed")
+    return proof
+
+
 def merge(cfg: Config, number: int) -> dict:
+    with state.exclusive(cfg.state_dir):
+        return _merge_locked(cfg, number)
+
+
+def _merge_locked(cfg: Config, number: int) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
     record = _load(cfg, number)
@@ -187,9 +294,30 @@ def merge(cfg: Config, number: int) -> dict:
         raise WorkflowError("current GitHub account is not configured maintainer")
     pr = gh.pr(number)
     issue_num = record["issue"]
+    if (record.get("pr") != number
+            or not isinstance(issue_num, int) or issue_num <= 0
+            or record.get("repo") != cfg.repo
+            or record.get("head_repository") != (cfg.publish_repo or cfg.repo)
+            or not isinstance(record.get("branch"), str)):
+        raise WorkflowError("reviewed PR identity is missing")
     if pr["state"] == "OPEN":
+        if record.get("merge_attempt") is not None:
+            if record["merge_attempt"] != {"head": record["head"],
+                                           "base": record["base"],
+                                           "branch": record["branch"]}:
+                raise WorkflowError("merge attempt identity changed")
+            gh.validate_pr_identity(pr, branch=record["branch"],
+                                    base_branch=cfg.base_branch, number=number,
+                                    head_sha=record["head"], base_sha=record["base"],
+                                    state="OPEN")
+            result = _incomplete(number, issue_num, "merge outcome is unconfirmed")
+            if record.get("merge_pending") != result:
+                record["merge_pending"] = result
+                _save(cfg, number, record)
+            return result
         pr, issue_num, issue = _identity(cfg, gh, number)
-        if (record["head"] != pr["headRefOid"] or record["base"] != pr["baseRefOid"]
+        if (record["branch"] != pr["headRefName"]
+                or record["head"] != pr["headRefOid"] or record["base"] != pr["baseRefOid"]
                 or record["body_sha256"] != parse_issue(issue["body"]).body_sha256
                 or sorted(row["path"] for row in pr["files"]) != record["paths"]):
             raise WorkflowError("review record is stale")
@@ -205,48 +333,54 @@ def merge(cfg: Config, number: int) -> dict:
             pr = gh.pr(number)
             if pr["isDraft"]:
                 raise WorkflowError("PR did not become ready")
-        if pr["headRefOid"] != record["head"] or pr["baseRefOid"] != record["base"]:
-            raise WorkflowError("PR changed before merge")
+        gh.validate_pr_identity(pr, branch=record["branch"],
+                                base_branch=cfg.base_branch, number=number,
+                                head_sha=record["head"], base_sha=record["base"],
+                                state="OPEN")
         if main_sha(gh, cfg) != record["base"]:
             raise WorkflowError("base branch moved since review")
         _, _, current_issue = _identity(cfg, gh, number)
         if parse_issue(current_issue["body"]).body_sha256 != record["body_sha256"]:
             raise WorkflowError("issue changed before merge")
         _review_policy(cfg, record, check_reference=True)
+        record["merge_attempt"] = {"head": record["head"],
+                                   "base": record["base"],
+                                   "branch": record["branch"]}
+        _save(cfg, number, record)
         try:
             gh.command(["pr", "merge", str(number), "-R", cfg.repo,
                     "--squash", "--delete-branch", "--match-head-commit",
                     record["head"]], timeout=180)
         except GitHubError:
-            observed = gh.pr(number)
-            if observed["state"] != "MERGED" or observed["headRefOid"] != record["head"]:
-                raise
+            pass
     observed = gh.pr(number)
-    gh.validate_pr_identity(observed, branch=pr["headRefName"],
-                            base_branch=cfg.base_branch, number=number,
-                            head_sha=record["head"], state="MERGED")
-    if observed["state"] != "MERGED" or observed["headRefOid"] != record["head"]:
-        raise WorkflowError("merge outcome not confirmed")
-    merge_commit = observed.get("mergeCommit")
-    if not isinstance(merge_commit, dict) or not merge_commit.get("oid"):
-        raise WorkflowError("merge commit is not available yet; retry merge verification")
-    if "merged" in record and record["merged"].get("merge_commit") == merge_commit["oid"]:
-        return record["merged"]
-    image_id = _review_policy(cfg, record, check_reference=False)
-    new_main = main_sha(gh, cfg)
-    if merge_commit["oid"] != new_main:
-        raise WorkflowError("base branch moved after merge; inspect before checking")
-    source = mirror(cfg)
-    path = cfg.workspace / "reviews" / f"main-after-{number}"
-    if path.exists():
-        raise WorkflowError("existing main CI checkout requires inspection")
-    git(source, "worktree", "add", "--detach", str(path), new_main)
+    if observed["state"] == "OPEN" and record.get("merge_attempt") is not None:
+        gh.validate_pr_identity(observed, branch=record["branch"],
+                                base_branch=cfg.base_branch, number=number,
+                                head_sha=record["head"], base_sha=record["base"],
+                                state="OPEN")
+        result = _incomplete(number, issue_num, "merge outcome is unconfirmed")
+        record["merge_pending"] = result
+        _save(cfg, number, record)
+        return result
+    if observed["state"] != "MERGED":
+        raise WorkflowError("PR closed without a confirmed merge")
+    merge_commit = _merged_identity(cfg, gh, number, record, observed)
+    if record.get("merge_commit") != merge_commit or "merge_pending" in record:
+        record["merge_commit"] = merge_commit
+        record.pop("merge_pending", None)
+        _save(cfg, number, record)
+    completed = record.get("merged")
+    if (isinstance(completed, dict) and completed.get("merge_commit") == merge_commit
+            and completed.get("status", "complete") == "complete"):
+        return completed
     try:
-        proof = local_checks(cfg, path, image_id=image_id)
-    finally:
-        if path.exists():
-            git(source, "worktree", "remove", str(path))
-    result = {"pr": number, "issue": issue_num, "merge_commit": new_main,
-              "main_ci": proof, "issue_closed": gh.api(f"issues/{issue_num}")["state"] == "closed"}
+        proof = _post_merge_verification(cfg, gh, number, record, merge_commit)
+        result = {"pr": number, "issue": issue_num, "merge_commit": merge_commit,
+                  "main_ci": proof, "issue_closed": True,
+                  "status": "complete"}
+    except WorkflowError as exc:
+        result = _incomplete(number, issue_num, str(exc),
+                             merge_commit)
     _save(cfg, number, {**record, "merged": result})
     return result
