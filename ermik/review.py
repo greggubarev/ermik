@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 import re
 
@@ -12,13 +14,34 @@ from .github import GitHub, GitHubError
 from .git_tree import verify_changed_tree
 from .policy import parse_issue, validate_changed_paths
 from .runtime import (WorkflowError, _approved_on_github, git, local_checks,
-                      mirror, main_sha)
+                      mirror, main_sha, _resolve_image_id)
 from . import state
 
 
 _CLOSES = re.compile(r"(?im)\bCloses\s+#(\d+)\b")
 _BRANCH = re.compile(r"^work/issue-(\d+)-[a-z0-9-]+$")
 _MAX_REVIEW_BYTES = 20000
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def _checks_sha256(cfg: Config) -> str:
+    """Hash the configured commands as an ordered JSON array of argument arrays."""
+    encoded = json.dumps(cfg.checks, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _review_policy(cfg: Config, record: dict, *, check_reference: bool) -> str:
+    checks_hash = record.get("checks_sha256")
+    image_id = record.get("image_id")
+    if (not isinstance(checks_hash, str) or not _SHA256.fullmatch(checks_hash)
+            or checks_hash != _checks_sha256(cfg)):
+        raise WorkflowError("review check policy is missing or changed")
+    if not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id):
+        raise WorkflowError("review image ID is missing or malformed")
+    if check_reference and _resolve_image_id(cfg.image) != image_id:
+        raise WorkflowError("configured image changed since review")
+    return image_id
 
 
 def _identity(cfg: Config, gh: GitHub, number: int, *,
@@ -112,6 +135,10 @@ def review(cfg: Config, number: int) -> dict:
                 raise WorkflowError("published and fetched PR diffs differ")
             validate_changed_paths(actual, spec.allowed_paths)
             proof = local_checks(cfg, checkout)
+            image_id = proof.get("image_id") if isinstance(proof, dict) else None
+            if (not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id)
+                    or _resolve_image_id(cfg.image) != image_id):
+                raise WorkflowError("review checks did not use the configured image")
         finally:
             if checkout.exists():
                 git(cfg.workspace / "source", "worktree", "remove", str(checkout))
@@ -124,7 +151,8 @@ def review(cfg: Config, number: int) -> dict:
     result = {"pr": number, "issue": issue_num, "base": pr["baseRefOid"],
               "head": pr["headRefOid"], "body_sha256": spec.body_sha256,
               "paths": sorted(actual), "reviewed_at": datetime.now(timezone.utc).isoformat(),
-              "ci": proof, "decision": "reviewed"}
+              "ci": proof, "checks_sha256": _checks_sha256(cfg),
+              "image_id": image_id, "decision": "reviewed"}
     _save(cfg, number, result)
     return result
 
@@ -171,6 +199,7 @@ def merge(cfg: Config, number: int) -> dict:
                comment.get("user", {}).get("login") == cfg.maintainer
                for comment in gh.comments(number)):
             raise WorkflowError("PR has a pending exact-head correction request")
+        _review_policy(cfg, record, check_reference=True)
         if pr["isDraft"]:
             gh.command(["pr", "ready", str(number), "-R", cfg.repo])
             pr = gh.pr(number)
@@ -183,6 +212,7 @@ def merge(cfg: Config, number: int) -> dict:
         _, _, current_issue = _identity(cfg, gh, number)
         if parse_issue(current_issue["body"]).body_sha256 != record["body_sha256"]:
             raise WorkflowError("issue changed before merge")
+        _review_policy(cfg, record, check_reference=True)
         try:
             gh.command(["pr", "merge", str(number), "-R", cfg.repo,
                     "--squash", "--delete-branch", "--match-head-commit",
@@ -202,6 +232,7 @@ def merge(cfg: Config, number: int) -> dict:
         raise WorkflowError("merge commit is not available yet; retry merge verification")
     if "merged" in record and record["merged"].get("merge_commit") == merge_commit["oid"]:
         return record["merged"]
+    image_id = _review_policy(cfg, record, check_reference=False)
     new_main = main_sha(gh, cfg)
     if merge_commit["oid"] != new_main:
         raise WorkflowError("base branch moved after merge; inspect before checking")
@@ -211,7 +242,7 @@ def merge(cfg: Config, number: int) -> dict:
         raise WorkflowError("existing main CI checkout requires inspection")
     git(source, "worktree", "add", "--detach", str(path), new_main)
     try:
-        proof = local_checks(cfg, path)
+        proof = local_checks(cfg, path, image_id=image_id)
     finally:
         if path.exists():
             git(source, "worktree", "remove", str(path))
