@@ -336,7 +336,10 @@ class WorkflowTests(unittest.TestCase):
             def pr(self, number):
                 head = command("git", "--git-dir", str(remote), "rev-parse",
                                f"refs/heads/{branch}")
-                return {"state": "OPEN", "headRefName": branch, "headRefOid": head}
+                return {"number": number, "state": "OPEN", "isDraft": True,
+                        "headRefName": branch, "headRefOid": head,
+                        "baseRefName": "main", "baseRefOid": base,
+                        "body": "Closes #1"}
 
         def write_file(_cfg, checkout, _command, *, issue_file, network, timeout):
             target = checkout / "src" / "example.py"

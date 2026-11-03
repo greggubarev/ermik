@@ -333,6 +333,16 @@ def _require_pr(gh: GitHub, pr: dict, cfg: Config, *, branch: str,
         raise WorkflowError("PR identity changed") from exc
 
 
+def _require_initial_draft(gh: GitHub, pr: dict, cfg: Config, *, issue: int,
+                           branch: str, number: int, head: str, base: str) -> None:
+    """Accept a newly published PR only while its exact draft contract holds."""
+    _require_pr(gh, pr, cfg, branch=branch, number=number, head_sha=head)
+    links = re.findall(r"(?im)\bCloses\s+#(\d+)\b", pr.get("body") or "")
+    if (pr.get("state") != "OPEN" or pr.get("isDraft") is not True
+            or pr.get("baseRefOid") != base or links != [str(issue)]):
+        raise WorkflowError("initial PR is not the exact open draft")
+
+
 def mirror(cfg: Config) -> Path:
     """One cached clone; no per-issue full repository copy."""
     with _MIRROR_LOCK:
@@ -834,20 +844,27 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
         raise WorkflowError("orphan branch approval or base changed")
     if cfg.publish_repo:
         gh.validate_publish_access()
-    try:
-        number = _draft_pr(cfg, gh, issue=row["issue"], branch=row["branch"],
-                           head=head, base=row["base_sha"], paths=paths,
-                           proof=proof, model=row["last_model"],
-                           body_sha256=spec.body_sha256,
-                           title=f"Issue #{row['issue']}: {issue['title']}")
-    except GitHubError:
-        if cfg.draft_pr_socket is not None:
-            raise
-        number = gh.find_branch_pr(row["branch"], cfg.base_branch)
-        if number is None:
-            raise
+    number = (gh.find_branch_pr(row["branch"])
+              if cfg.draft_pr_socket is None else None)
+    if number is None:
+        try:
+            number = _draft_pr(cfg, gh, issue=row["issue"], branch=row["branch"],
+                               head=head, base=row["base_sha"], paths=paths,
+                               proof=proof, model=row["last_model"],
+                               body_sha256=spec.body_sha256,
+                               title=f"Issue #{row['issue']}: {issue['title']}")
+        except GitHubError:
+            if cfg.draft_pr_socket is not None:
+                raise
+            number = gh.find_branch_pr(row["branch"])
+            if number is None:
+                raise
     pr = gh.pr(number)
-    _require_pr(gh, pr, cfg, branch=row["branch"], number=number, head_sha=head)
+    if cfg.draft_pr_socket is None:
+        _require_initial_draft(gh, pr, cfg, issue=row["issue"], branch=row["branch"],
+                               number=number, head=head, base=row["base_sha"])
+    else:
+        _require_pr(gh, pr, cfg, branch=row["branch"], number=number, head_sha=head)
     if (not pr["isDraft"] or sorted(file["path"] for file in pr["files"]) != paths
             or pr["changedFiles"] != len(paths)):
         raise WorkflowError("orphan branch PR differs from checked commit")
@@ -893,11 +910,16 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     or "queue:worker" not in labels(issue)
                     or not ({"state:ready", "state:in-progress"} & labels(issue))):
                 raise WorkflowError("interrupted job identity changed")
-            pr_number = gh.find_branch_pr(row["branch"], cfg.base_branch)
+            pr_number = gh.find_branch_pr(row["branch"])
             if pr_number is not None:
                 pr = gh.pr(pr_number)
-                _require_pr(gh, pr, cfg, branch=row["branch"],
-                            number=pr_number)
+                if row["pr"] is None and cfg.draft_pr_socket is None:
+                    _require_initial_draft(
+                        gh, pr, cfg, issue=row["issue"], branch=row["branch"],
+                        number=pr_number, head=pr["headRefOid"], base=row["base_sha"])
+                else:
+                    _require_pr(gh, pr, cfg, branch=row["branch"],
+                                number=pr_number)
                 leftover = _verify_leftover_checkout(cfg, row, pr["headRefOid"])
                 if row["pr"] is not None and pr_number != row["pr"]:
                     raise WorkflowError("interrupted PR number changed")
@@ -1189,29 +1211,36 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         pushed = True
         creating_pr = pr_number is None
         if pr_number is None:
-            try:
-                pr_number = _draft_pr(cfg, gh, issue=issue, branch=branch,
-                                      head=head, base=base, paths=paths,
-                                      proof=proof,
-                                      model=used_model.ref if used_model else None,
-                                      body_sha256=spec.body_sha256,
-                                      title=f"Issue #{issue}: {current['title']}")
-            except GitHubError:
-                if cfg.draft_pr_socket is not None:
-                    raise
-                pr_number = gh.find_branch_pr(branch, cfg.base_branch)
-                if pr_number is None:
-                    raise
+            pr_number = (gh.find_branch_pr(branch)
+                         if cfg.draft_pr_socket is None else None)
+            if pr_number is None:
+                try:
+                    pr_number = _draft_pr(cfg, gh, issue=issue, branch=branch,
+                                          head=head, base=base, paths=paths,
+                                          proof=proof,
+                                          model=used_model.ref if used_model else None,
+                                          body_sha256=spec.body_sha256,
+                                          title=f"Issue #{issue}: {current['title']}")
+                except GitHubError:
+                    if cfg.draft_pr_socket is not None:
+                        raise
+                    pr_number = gh.find_branch_pr(branch)
+                    if pr_number is None:
+                        raise
         observed = None
         for _ in range(5):
             observed = gh.pr(pr_number)
             if observed["headRefOid"] == head:
                 break
             time.sleep(2)
-        _require_pr(gh, observed, cfg, branch=branch, number=pr_number,
-                    head_sha=head)
-        if cfg.draft_pr_socket is not None and creating_pr and observed.get("isDraft") is not True:
-            raise WorkflowError("initial PR is not a draft")
+        if creating_pr and cfg.draft_pr_socket is None:
+            _require_initial_draft(gh, observed, cfg, issue=issue, branch=branch,
+                                   number=pr_number, head=head, base=base)
+        else:
+            _require_pr(gh, observed, cfg, branch=branch, number=pr_number,
+                        head_sha=head)
+            if creating_pr and observed.get("isDraft") is not True:
+                raise WorkflowError("initial PR is not a draft")
         result = {"issue": issue, "pr": pr_number, "branch": branch, "head": head,
                   "base": base,
                   "paths": paths, "ci": proof,
