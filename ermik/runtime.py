@@ -334,7 +334,8 @@ def _route_provider(conn: sqlite3.Connection, cfg: Config, issue: dict,
 
 
 def _github(cfg: Config) -> GitHub:
-    return (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
+    return (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env,
+                   probe_state_dir=cfg.state_dir)
             if cfg.publish_repo else GitHub(cfg.repo))
 
 
@@ -1344,6 +1345,8 @@ def run_once(cfg: Config) -> list[dict]:
     """One bounded controller cycle. A correction has priority over new work."""
     gh = _github(cfg)
     with state.exclusive(cfg.state_dir):
+        if cfg.publish_repo:
+            gh.reconcile_probe_intents()
         _cleanup_containers(cfg)
         work: list[tuple[int, str, IssueSpec, str | None, int | None, RecoveryClaim | None]] = []
         reserved_providers: dict[str, int] = {}

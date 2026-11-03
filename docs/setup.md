@@ -206,7 +206,7 @@ python -m ermik --config config.json doctor
 python -m ermik --config config.json status
 ```
 
-Treat this as the dry run: inspect the reported repository, account, paths, Docker availability, image, commands, and current state. It does not execute a task, create a PR, or probe write permissions. `publish_write_capabilities: unverified` is deliberate: `doctor` checks the configured fork identity and parent using reads only. `run-once` and `poll` perform the separate write-capability checks, which may create and delete disposable probe refs; verify scoped permissions and use a disposable repository before starting them. Also inspect the exact issue body and allowed paths with `gh issue view NUMBER --repo example-org/example-project`. Do not continue if a prerequisite is uncertain.
+Treat this as the dry run: inspect the reported repository, account, paths, Docker availability, image, commands, and current state. It does not execute a task, create a PR, or probe write permissions. `publish_write_capabilities: unverified` is deliberate: `doctor` checks the configured fork identity and parent using reads only. `run-once` and `poll` perform the separate write-capability checks, which may create and delete disposable probe refs; verify scoped permissions and use a disposable repository before starting them. Keep the private `state_dir` across process restarts: its `probe-intents` records contain the exact repository, ref and SHA needed to reconcile a probe interrupted before or after a GitHub write. Retain the scoped credentials until those records have been resolved; changing a credential blocks automatic reconciliation. An invalid record, a record older than seven days, or more than 32 unresolved records also blocks it. If startup reports a probe recovery error, stop polling and follow [probe recovery](troubleshooting.md) before retrying; do not delete an unknown ref or clear state to bypass the block. Also inspect the exact issue body and allowed paths with `gh issue view NUMBER --repo example-org/example-project`. Do not continue if a prerequisite is uncertain.
 
 ## Run a disposable task
 
@@ -264,7 +264,7 @@ journalctl --user -u ermik.service -n 50 --no-pager
 systemctl --user show ermik.service -p MainPID -p ActiveState -p SubState
 ```
 
-`poll` checks the queue every `poll_seconds`; systemd restarts it on process failure. Verify after a logout or reboot that the unit is active and its journal has a fresh poll result. A successful process start does not prove a full task cycle. Run only one controller for the configured `state_dir` and do not add a second timer or cron job. This installation does not modify other projects' services or timers.
+`poll` checks the queue every `poll_seconds`; systemd restarts it on process failure. On restart, probe recovery must finish before publication work resumes. Verify after a logout or reboot that the unit is active, its journal has a fresh poll result, and no probe recovery error is pending. A successful process start does not prove a full task cycle. Run only one controller for the configured `state_dir` and do not add a second timer or cron job. A different state directory cannot be used to clean up this controller's outstanding probe intents. This installation does not modify other projects' services or timers.
 
 ## Review from a local computer
 
