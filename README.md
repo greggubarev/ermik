@@ -57,6 +57,8 @@ One trusted controller owns each state directory. Configuration allows up to eig
 
 The worker container receives no GitHub credential. The publishing controller remains trusted. For private repositories on GitHub Free, do not treat `main` branch protection as an enforced boundary. Passing checks establish only what those commands tested; manual or hardware gates remain maintainer decisions.
 
+Report security vulnerabilities through the [private reporting channel](SECURITY.md).
+
 ```sh
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q ermik
@@ -81,7 +83,7 @@ Ermik remains a preview while the v0.2 recovery and credential gates are open. S
 | --- | --- |
 | [Setup](docs/setup.md) and [first project](docs/first-project.md) | Installation and complete trial |
 | [Maintainer](docs/maintainer.md) and [worker](docs/worker.md) | Issue admission, execution, review, and merge |
-| [Security](docs/security.md) and [PR broker](docs/pr-broker.md) | Credentials and publication boundaries |
+| [Security policy](SECURITY.md), [security model](docs/security.md), and [PR broker](docs/pr-broker.md) | Private reporting, credentials, and publication boundaries |
 | [Local CI](docs/local-ci.md), [status](docs/status.md), and [dashboard](docs/dashboard.md) | Checks and observability |
 | [Providers](docs/providers.md) and [troubleshooting](docs/troubleshooting.md) | Model routing and recovery |
 | [Architecture](docs/architecture.md), [image continuity](docs/image-continuity.md), and [readiness](docs/readiness.md) | State machine, image identity, verified behavior, and open work |

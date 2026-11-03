@@ -1,5 +1,7 @@
 # Security model
 
+To report a vulnerability privately, follow the [security policy](../SECURITY.md). Repository maintainers triage reports through GitHub Security Advisories; public Issues are for nonsensitive work.
+
 The controller is trusted. It owns GitHub access, the state directory, workspace creation, checks, publication, and review records. The task command is untrusted and runs in a Docker container. The container receives the task checkout and the issue body, but no GitHub credential. It cannot authorize publication or merge by writing text into a file. The controller must validate the issue identity, permitted paths, changed files, check results, branch, and head commit before each external write.
 
 ## Credentials and permissions
