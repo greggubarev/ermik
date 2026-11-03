@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import time
 import uuid
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -14,6 +16,41 @@ from urllib.request import Request, urlopen
 
 class GitHubError(RuntimeError):
     pass
+
+
+def _read_api_command(args: list[str]) -> bool:
+    """Only an unambiguously read-only gh api invocation may be repeated."""
+    if not args or args[0] != "api":
+        return False
+    method = "GET"
+    for index, arg in enumerate(args[1:], 1):
+        if arg in ("--method", "-X"):
+            if index + 1 >= len(args):
+                return False
+            method = args[index + 1].upper()
+        elif arg.startswith("--method="):
+            method = arg.partition("=")[2].upper()
+        elif arg.startswith("-X") and len(arg) > 2:
+            method = arg[2:].upper()
+        elif (arg in ("-f", "-F", "--field", "--raw-field", "--input")
+              or arg.startswith(("-f", "-F", "--field=", "--raw-field=", "--input="))):
+            # gh api sends POST by default when fields or input are supplied.
+            return False
+        elif arg == "graphql" or arg.endswith("/graphql"):
+            return False
+        if method != "GET":
+            return False
+    return method == "GET"
+
+
+_TRANSIENT_GH_ERROR = re.compile(
+    r"\b(?:HTTP(?:/\d(?:\.\d)?)?\s*[: ]\s*5\d\d\b"
+    r"|(?:50[0234]\s+(?:Bad Gateway|Service Unavailable|Gateway Timeout))\b"
+    r"|(?:connection (?:reset|refused|timed out|closed)|context deadline exceeded"
+    r"|TLS handshake timeout|temporary failure in name resolution|no such host"
+    r"|network is unreachable|i/o timeout|unexpected EOF)\b)",
+    re.IGNORECASE,
+)
 
 
 class GitHub:
@@ -252,16 +289,36 @@ class GitHub:
             env = os.environ.copy()
             env["GH_TOKEN"] = token
             env.pop("GITHUB_TOKEN", None)
-        try:
-            result = subprocess.run(["gh", *args], text=True, encoding="utf-8",
-                                    errors="replace", capture_output=True,
-                                    timeout=timeout, check=False, env=env)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise GitHubError("GitHub command unavailable or timed out") from exc
-        if result.returncode:
-            # CLI errors can contain endpoint details; do not echo credentials.
-            raise GitHubError(f"GitHub command failed (exit {result.returncode})")
-        return result.stdout
+        read_api = _read_api_command(args)
+        attempts = 3 if read_api else 1
+        for attempt in range(attempts):
+            try:
+                result = subprocess.run(["gh", *args], text=True, encoding="utf-8",
+                                        errors="replace", capture_output=True,
+                                        timeout=timeout, check=False, env=env)
+            except subprocess.TimeoutExpired:
+                if attempt + 1 < attempts:
+                    time.sleep(0.25 * (2 ** attempt))
+                    continue
+                # TimeoutExpired can retain the command and captured output.
+                raise GitHubError("GitHub command unavailable or timed out") from None
+            except OSError as exc:
+                # A failed launch may be transient; a missing or inaccessible gh
+                # executable cannot be fixed by repeating the same command.
+                if (attempt + 1 < attempts
+                        and not isinstance(exc, (FileNotFoundError, PermissionError))):
+                    time.sleep(0.25 * (2 ** attempt))
+                    continue
+                raise GitHubError("GitHub command unavailable or timed out") from None
+            if result.returncode:
+                # Inspect stderr only for retry classification; never expose it.
+                if (attempt + 1 < attempts and
+                        _TRANSIENT_GH_ERROR.search(result.stderr or "")):
+                    time.sleep(0.25 * (2 ** attempt))
+                    continue
+                raise GitHubError(f"GitHub command failed (exit {result.returncode})")
+            return result.stdout
+        raise GitHubError("GitHub command unavailable or timed out")
 
     def api(self, endpoint: str) -> Any:
         return json.loads(self.command(["api", f"repos/{self.repo}/{endpoint}"]))
