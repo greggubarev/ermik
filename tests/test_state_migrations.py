@@ -73,11 +73,12 @@ PUBLICATION = {"issue": 7, "branch": "work/issue-7-preview",
                "ci": {"result": "passed", "image_id": "sha256:" + "d" * 64}}
 
 
-def create_preview(root: Path, *, with_image: bool = False) -> Path:
+def create_preview(root: Path, *, with_image: bool = False,
+                   schema: str = PREVIEW_SCHEMA) -> Path:
     root.mkdir(parents=True)
     db = root / "state.sqlite3"
     with closing(sqlite3.connect(db)) as conn:
-        conn.executescript(PREVIEW_SCHEMA)
+        conn.executescript(schema)
         if with_image:
             conn.execute("ALTER TABLE jobs ADD COLUMN image_id TEXT")
         conn.execute("INSERT INTO admissions VALUES(7,?,?,?)",
@@ -201,6 +202,51 @@ class StateMigrationTests(unittest.TestCase):
         self.assertEqual(self.version(), state.SCHEMA_VERSION + 1)
         self.assertEqual(ledger(self.root), self.before)
         self.assertEqual(evidence(self.root), self.before_evidence)
+
+    def test_same_columns_without_preview_constraints_are_rejected(self):
+        variants = {
+            "branch uniqueness": ("branch TEXT NOT NULL UNIQUE", "branch TEXT NOT NULL"),
+            "retry foreign key": ("issue INTEGER PRIMARY KEY REFERENCES jobs(issue)",
+                                  "issue INTEGER PRIMARY KEY"),
+            "retry attempts check": ("attempts INTEGER NOT NULL CHECK(attempts >= 1)",
+                                     "attempts INTEGER NOT NULL"),
+            "retry lease check":
+                ("CHECK ((lease_token IS NULL) = (lease_expires_at IS NULL))",
+                 "CHECK (1)"),
+            "usage completeness check":
+                ("complete INTEGER NOT NULL CHECK(complete IN (0,1))",
+                 "complete INTEGER NOT NULL"),
+        }
+        for label, (old, new) in variants.items():
+            with self.subTest(label=label):
+                self.assertIn(old, PREVIEW_SCHEMA)
+                root = self.base / label.replace(" ", "-")
+                create_preview(root, schema=PREVIEW_SCHEMA.replace(old, new))
+                before = ledger(root)
+                with self.assertRaisesRegex(ValueError, "schema"):
+                    state.initialize(root)
+                self.assertEqual(self.version(root), 0)
+                self.assertEqual(ledger(root), before)
+
+    def test_preview_with_provider_tables_preserves_provider_state(self):
+        with closing(sqlite3.connect(self.root / "state.sqlite3")) as conn:
+            conn.execute("CREATE TABLE provider_cooldowns ("
+                         "provider_id TEXT PRIMARY KEY, retry_at INTEGER NOT NULL, "
+                         "reason TEXT NOT NULL CHECK(reason IN ('quota')))")
+            conn.execute("CREATE TABLE provider_leases ("
+                         "lease_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, "
+                         "model_id TEXT NOT NULL, expires_at INTEGER NOT NULL)")
+            conn.execute("INSERT INTO provider_cooldowns VALUES('provider',1735900300,'quota')")
+            conn.execute("INSERT INTO provider_leases VALUES('lease-1','provider','second',"
+                         "1735900400)")
+            conn.commit()
+            before = {name: conn.execute(f"SELECT * FROM {name}").fetchall()
+                      for name in ("provider_cooldowns", "provider_leases")}
+        state.initialize(self.root)
+        with closing(sqlite3.connect(self.root / "state.sqlite3")) as conn:
+            for name, rows in before.items():
+                self.assertEqual(conn.execute(f"SELECT * FROM {name}").fetchall(), rows)
+        self.assertEqual(ledger(self.root), self.before)
 
     def test_backup_restores_preview_state_after_upgrade(self):
         backup = self.base / "backup"

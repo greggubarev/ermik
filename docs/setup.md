@@ -365,25 +365,61 @@ install -m 0644 "$backup_dir/ermik.service" "$HOME/.config/systemd/user/"
 install -m 0644 "$backup_dir/ermik-preflight.service" "$HOME/.config/systemd/user/"
 docker image inspect "$(cat "$backup_dir/image-id")" --format '{{.Id}}'
 systemctl --user daemon-reload
-systemctl --user start ermik-preflight.service
 ```
 
-Inspect the preflight result and reconcile remote state before `systemctl --user start ermik.service`. If reverting to the preview commit, use the pre-upgrade database and other state files **only after** that reconciliation confirms the snapshot can safely replace the current state. Keep the post-upgrade state intact for investigation. Restore into a new private directory and point the rollback config there, so the two versions cannot open the same database:
+Reconcile remote state before running any command from the old checkout against the local state. If reverting to the preview commit, use the pre-upgrade database and other state files **only after** that reconciliation confirms the snapshot can safely replace the current state. Restore at the same configured `state_dir`: the container cleanup namespace includes its absolute path, so moving the state to a new path invalidates the saved marker and can leave containers behind. The commands below preserve the post-upgrade files in the private backup directory and stop on a marker mismatch. They do not delete any state or containers:
 
 ```sh
-rollback_state="$HOME/.local/share/ermik-state-rollback-$(date -u +%Y%m%dT%H%M%SZ)"
-test ! -e "$rollback_state" && test -f "$backup_dir/state.sqlite3"
-install -d -m 0700 "$rollback_state"
-tar -C "$rollback_state" -xzf "$backup_dir/state-files.tar.gz"
-install -m 0600 "$backup_dir/state.sqlite3" "$rollback_state/state.sqlite3"
-python3 - "$rollback_state" <<'PY'
+set -e
+state_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["state_dir"])')"
+post_upgrade_state="$backup_dir/post-upgrade-state"
+test -d "$state_dir" && test ! -e "$post_upgrade_state"
+test -f "$backup_dir/state.sqlite3" && test -f "$backup_dir/state-files.tar.gz"
+python3 - "$state_dir" "$post_upgrade_state" "$backup_dir/state-files.tar.gz" <<'PY'
+import json
+import hashlib
+import shutil
+import sys
+from pathlib import Path
+import tarfile
+
+root = Path(sys.argv[1]).resolve(strict=True)
+saved = Path(sys.argv[2]).resolve()
+if not root.is_dir() or saved == root or root in saved.parents or saved.exists():
+    raise RuntimeError("invalid post-upgrade state destination")
+config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+namespace = hashlib.sha256(f"{config['repo']}\n{root}".encode("utf-8")).hexdigest()[:32]
+marker = root / "container-namespace"
+if marker.is_symlink() or (marker.exists() and marker.read_text(encoding="ascii").strip() != namespace):
+    raise RuntimeError("current container namespace marker differs")
+with tarfile.open(sys.argv[3], "r:gz") as archive:
+    for entry in archive:
+        if entry.name.removeprefix("./") == "container-namespace":
+            if not entry.isfile() or archive.extractfile(entry).read().decode("ascii").strip() != namespace:
+                raise RuntimeError("backed-up container namespace marker differs")
+saved.mkdir(mode=0o700)
+for entry in root.iterdir():
+    shutil.move(str(entry), str(saved / entry.name))
+PY
+tar -C "$state_dir" -xzf "$backup_dir/state-files.tar.gz"
+install -m 0600 "$backup_dir/state.sqlite3" "$state_dir/state.sqlite3"
+python3 - "$state_dir" <<'PY'
+import hashlib
 import json
 import os
 import sqlite3
 import sys
 from pathlib import Path
 
-root = Path(sys.argv[1])
+root = Path(sys.argv[1]).resolve(strict=True)
+config = json.loads(Path("config.json").read_text(encoding="utf-8"))
+namespace = hashlib.sha256(f"{config['repo']}\n{root}".encode("utf-8")).hexdigest()[:32]
+marker = root / "container-namespace"
+if marker.is_symlink() or (marker.exists() and marker.read_text(encoding="ascii").strip() != namespace):
+    raise RuntimeError("restored container namespace marker differs")
+if not marker.exists():
+    marker.write_text(namespace + "\n", encoding="ascii")
+    os.chmod(marker, 0o600)
 with sqlite3.connect(root / "state.sqlite3") as db:
     version = db.execute("PRAGMA user_version").fetchone()[0]
     integrity = db.execute("PRAGMA quick_check").fetchone()[0]
@@ -391,16 +427,7 @@ with sqlite3.connect(root / "state.sqlite3") as db:
     print("integrity", integrity)
     if version != 0 or integrity != "ok":
         raise RuntimeError("restored preview state failed validation")
-config = Path("config.json")
-data = json.loads(config.read_text(encoding="utf-8"))
-data["state_dir"] = str(root)
-temporary = config.with_name("config.json.rollback.tmp")
-with temporary.open("w", encoding="utf-8") as output:
-    os.chmod(temporary, 0o600)
-    json.dump(data, output, indent=2)
-    output.write("\n")
-os.replace(temporary, config)
 PY
 ```
 
-Expect schema version `0` for an unversioned preview snapshot and integrity `ok`. Reconcile the restored ledger against GitHub once more, then repeat the systemd preflight and start only this polling unit. Retain the private post-upgrade state until its remote writes and local records have been accounted for.
+Expect schema version `0` for an unversioned preview snapshot and integrity `ok`. Inspect `docker ps --all --filter "label=ermik.namespace=$(cat "$state_dir/container-namespace")"` before polling. Startup cleanup removes only containers with that exact label; investigate an unexpected container or cleanup failure before retrying. Reconcile the restored ledger against GitHub once more, then run `systemctl --user start ermik-preflight.service`, inspect its journal, and start only this polling unit. For a rollback that does not require restoring the preview snapshot, run that preflight after selecting the compatible state. Retain `$post_upgrade_state` until its remote writes and local records have been accounted for.

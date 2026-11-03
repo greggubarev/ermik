@@ -117,10 +117,37 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False) -> None
                 raise ValueError("unknown or incomplete SQLite state schema")
         elif {row[1] for row in actual} != _PROVIDER_COLUMNS[table]:
             raise ValueError("unknown or incomplete SQLite state schema")
-    for index, columns in (("events_issue_id", ("issue", "id")),
-                           ("usage_events_issue", ("issue", "created_at"))):
+    for index, table, columns in (("events_issue_id", "events", ("issue", "id")),
+                                  ("usage_events_issue", "usage_events",
+                                   ("issue", "created_at"))):
         actual = tuple(row[2] for row in conn.execute(f"PRAGMA index_info({index})"))
-        if actual != columns:
+        owner = conn.execute("SELECT tbl_name FROM sqlite_master WHERE name=?",
+                             (index,)).fetchone()
+        if actual != columns or owner[0] != table:
+            raise ValueError("unknown or incomplete SQLite state schema")
+    unique_branch = any(
+        row[2] and not row[4] and
+        tuple(column[2] for column in conn.execute(f"PRAGMA index_info({row[1]})"))
+        == ("branch",)
+        for row in conn.execute("PRAGMA index_list(jobs)"))
+    if not unique_branch:
+        raise ValueError("unknown or incomplete SQLite state schema")
+    foreign_keys = [tuple(row[2:5]) for row in conn.execute(
+        "PRAGMA foreign_key_list(retry_state)")]
+    if foreign_keys != [("jobs", "issue", "issue")]:
+        raise ValueError("unknown or incomplete SQLite state schema")
+    checks = {
+        "retry_state": ("CHECK(attempts>=1)",
+                        "CHECK(resume_statusIN('running','correcting'))",
+                        "CHECK((lease_tokenISNULL)=(lease_expires_atISNULL))"),
+        "usage_events": ("CHECK(completeIN(0,1))",),
+    }
+    if "provider_cooldowns" in tables:
+        checks["provider_cooldowns"] = ("CHECK(reasonIN('quota'))",)
+    for table, required in checks.items():
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (table,)).fetchone()[0]
+        normalized = re.sub(r"\s+", "", sql).upper()
+        if any(expression.upper() not in normalized for expression in required):
             raise ValueError("unknown or incomplete SQLite state schema")
 
 
