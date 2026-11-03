@@ -19,6 +19,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 
 ## Not yet verified
 
+- The source release gate on a reviewed candidate archive, including its content inventory, history scan, checksums, and a deliberate rejection case.
 - Recovery from a real process kill in every remote-write window.
 - Reboot of the execution host while a task is active.
 - Setup on a clean host by an unrelated operator.

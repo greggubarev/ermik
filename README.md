@@ -57,7 +57,7 @@ One trusted controller owns each state directory. Configuration allows up to eig
 
 The worker container receives no GitHub credential. The publishing controller remains trusted. For private repositories on GitHub Free, do not treat `main` branch protection as an enforced boundary. Passing checks establish only what those commands tested; manual or hardware gates remain maintainer decisions.
 
-Report security vulnerabilities through the [private reporting channel](SECURITY.md).
+Report security vulnerabilities through the [private reporting channel](SECURITY.md). Run the [source release gate](docs/release.md) on each reviewed release commit before publishing an archive.
 
 ```sh
 python3 -m unittest discover -s tests -v
@@ -88,5 +88,6 @@ Ermik remains a preview while the v0.2 recovery and credential gates are open. S
 | [Providers](docs/providers.md) and [troubleshooting](docs/troubleshooting.md) | Model routing and recovery |
 | [Architecture](docs/architecture.md), [image continuity](docs/image-continuity.md), and [readiness](docs/readiness.md) | State machine, image identity, verified behavior, and open work |
 | [Roadmap](docs/roadmap.md) | Phases and acceptance criteria |
+| [Source release](docs/release.md) | Archive, privacy scan, notices, and secret response |
 
 Source code is available under the [MIT License](LICENSE). Components added to a custom task image retain their own licenses and terms.
