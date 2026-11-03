@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 
@@ -31,7 +32,7 @@ sys.path.insert(0, str(ROOT))
 
 from ermik import review as review_module  # noqa: E402
 from ermik.config import load_config  # noqa: E402
-from ermik.github import GitHub  # noqa: E402
+from ermik.github import GitHub, GitHubError  # noqa: E402
 from ermik.runtime import WorkflowError, admit  # noqa: E402
 
 
@@ -100,6 +101,18 @@ def remote_identity(repo: str, number: int, branch: str, head: str,
 
 def result_record(cfg, number: int) -> dict:
     return review_module._load(cfg, number)
+
+
+def review_with_read_retry(cfg, number: int) -> dict:
+    """Retry only local review, whose GitHub operations are reads."""
+    for attempt in range(3):
+        try:
+            return review_module.review(cfg, number)
+        except GitHubError:
+            if attempt == 2:
+                raise
+            time.sleep(attempt + 1)
+    raise AssertionError("unreachable")
 
 
 def cli_merge(config: Path, number: int) -> tuple[int, dict | None]:
@@ -244,7 +257,7 @@ def prepare_case(repo: str, base: str, image: str, root: Path,
         config.write_text(json.dumps(data), encoding="utf-8")
         config.chmod(0o600)
         cfg = load_config(config)
-    record = review_module.review(cfg, pr)
+    record = review_with_read_retry(cfg, pr)
     require(record["head"] == head and record["base"] == before
             and record["issue"] == issue and record["repo"] == repo,
             "review identity differs")
