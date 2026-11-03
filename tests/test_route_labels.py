@@ -19,6 +19,7 @@ from ermik.providers import ModelCandidate, choose_model, claim_model, record_ex
 KIMI = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY")
 GO = ModelCandidate("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY")
 BODY = "## Goal\nChange one file.\n\n## Allowed paths\nfile.txt\n\n## Acceptance\nThe file changes.\n"
+IMAGE = "sha256:" + "a" * 64
 
 
 class StopAttempt(RuntimeError):
@@ -40,7 +41,8 @@ class Hub:
                 "labels": [{"name": label} for label in self.route_labels]}
 
     def pr(self, number):
-        return {"number": number}
+        return {"number": number,
+                "body": f"Closes #1\n\nExecution image: `{IMAGE}`"}
 
 
 class QueueHub:
@@ -98,6 +100,10 @@ class RouteLabelTests(unittest.TestCase):
         selected = []
         checkout = self.cfg.workspace / "checkout"
         checkout.mkdir(parents=True, exist_ok=True)
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT OR IGNORE INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                         "image_id) VALUES(?,?,?,?,?,?)",
+                         (1, "work/issue-1", "a" * 40, "running", '["file.txt"]', IMAGE))
 
         def docker(cfg, path, command, *, selected_model, **kwargs):
             selected.append(selected_model.ref)
@@ -205,6 +211,10 @@ class RouteLabelTests(unittest.TestCase):
     def test_preferred_auto_route_passes_unchanged_pre_push_gate(self):
         checkout = self.cfg.workspace / "checkout"
         checkout.mkdir(parents=True)
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(?,?,?,'running',?)",
+                         (1, "work/issue-1", "a" * 40, '["file.txt"]'))
         selected = []
         pushed = []
 
@@ -246,6 +256,8 @@ class RouteLabelTests(unittest.TestCase):
                                  preferred_provider="opencode-go")
         self.assertEqual(selected, [GO.ref])
         self.assertEqual(len(pushed), 1)
+        with state.connect(self.cfg.state_dir) as conn:
+            self.assertEqual(state.job(conn, 1)["image_id"], IMAGE)
 
     def test_unconfigured_requested_provider_is_blocked(self):
         cfg = self.cfg

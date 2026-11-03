@@ -12,6 +12,7 @@ from ermik import review, runtime
 BODY = "## Allowed paths\nsrc/a.py\n\n## Goal\nFix a\n\n## Acceptance\nWorks\n"
 HEAD = "a" * 40
 BASE = "b" * 40
+IMAGE = "sha256:" + "c" * 64
 
 
 class Hub:
@@ -39,7 +40,8 @@ class Hub:
         return {"number": 19, "state": "OPEN", "baseRefName": "main",
                 "baseRefOid": BASE, "headRefName": "work/issue-7-delivery",
                 "headRefOid": HEAD, "changedFiles": 1,
-                "files": [{"path": "src/a.py"}], "body": "Closes #7",
+                "files": [{"path": "src/a.py"}],
+                "body": f"Closes #7\n\nExecution image: `{IMAGE}`",
                 "isDraft": True}
 
     def validate_pr_identity(self, *_args, **_kwargs):
@@ -94,7 +96,7 @@ class ReviewAdmissionTests(unittest.TestCase):
                   "head_repository": self.cfg.repo,
                   "branch": "work/issue-7-delivery", "head": HEAD, "base": BASE,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
-                  "paths": ["src/a.py"]}
+                  "paths": ["src/a.py"], "image_id": IMAGE}
         with patch.object(review, "GitHub", return_value=self.gh), patch.object(
                 review, "_load", return_value=record):
             with self.assertRaisesRegex(runtime.WorkflowError, "admission"):

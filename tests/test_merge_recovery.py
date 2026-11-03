@@ -52,7 +52,7 @@ class MergeHub(GitHub):
                 "headRefName": self.branch, "headRefOid": self.head,
                 "headRepository": {"nameWithOwner": self.head_repo},
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
-                "body": "Closes #7",
+                "body": f"Closes #7\n\nExecution image: `{IMAGE}`",
                 "mergeCommit": {"oid": MERGED} if self.state == "MERGED" else None}
 
     def comments(self, number):
