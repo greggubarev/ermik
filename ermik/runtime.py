@@ -852,6 +852,29 @@ def _rebuild_published_evidence(cfg: Config, row, pr: dict) -> dict:
             "model": row["last_model"]}
 
 
+def _published_evidence_matches(proof: dict, row, pr: dict,
+                                spec: IssueSpec, *, rebuilt: bool = False) -> bool:
+    """Bind a saved record to the current admission and complete live PR."""
+    if (pr.get("changedFiles") != len(pr.get("files", []))
+            or not pr.get("files") or pr["changedFiles"] > 100):
+        return False
+    paths = sorted(file["path"] for file in pr["files"])
+    validate_changed_paths(paths, spec.allowed_paths)
+    return (proof.get("issue") == row["issue"]
+            and proof.get("pr") == pr["number"]
+            and proof.get("branch") == row["branch"]
+            and proof.get("head") == pr["headRefOid"]
+            and proof.get("base") in (row["base_sha"], pr["baseRefOid"])
+            and proof.get("paths") == paths
+            and proof.get("body_sha256") == spec.body_sha256
+            and (proof.get("model") in (None, row["last_model"])
+                 or rebuilt and isinstance(proof.get("model"), str))
+            and isinstance(proof.get("ci"), dict)
+            and proof["ci"].get("result") == "passed"
+            and row["image_id"] is not None
+            and proof["ci"].get("image_id") == row["image_id"])
+
+
 def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
                                  issue: dict, spec: IssueSpec, remote: str) -> dict:
     """Publish a checked local commit when push succeeded but its reply was lost."""
@@ -921,7 +944,8 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
         raise WorkflowError("orphan branch PR image differs from recorded execution image")
     return {"issue": row["issue"], "pr": number, "branch": row["branch"],
             "head": head, "base": row["base_sha"], "paths": paths,
-            "ci": proof, "model": row["last_model"]}
+            "ci": proof, "model": row["last_model"],
+            "body_sha256": spec.body_sha256}
 
 
 def _verify_leftover_checkout(cfg: Config, row, remote_head: str) -> Path | None:
@@ -971,10 +995,33 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 else:
                     _require_pr(gh, pr, cfg, branch=row["branch"],
                                 number=pr_number)
-                leftover = _verify_leftover_checkout(cfg, row, pr["headRefOid"])
                 if row["pr"] is not None and pr_number != row["pr"]:
                     raise WorkflowError("interrupted PR number changed")
                 if row["pr"] is not None and pr["headRefOid"] == row["head_sha"]:
+                    if row["status"] in ("correcting", "retry_wait"):
+                        # The branch may have advanced while GitHub's PR read still
+                        # reports the old head. Never rerun the worker until the
+                        # exact remote ref establishes the push outcome.
+                        source = mirror(cfg)
+                        remote = (_publish_git(cfg, source, "ls-remote", "--heads",
+                                               row["branch"], timeout=60)
+                                  if cfg.publish_repo else
+                                  git(source, "ls-remote", "--heads", "origin",
+                                      row["branch"], timeout=60))
+                        match = re.fullmatch(
+                            r"([0-9a-f]{40})\s+refs/heads/" + re.escape(row["branch"]),
+                            remote.strip())
+                        if match is None:
+                            raise WorkflowError("correction remote branch requires inspection")
+                        if match.group(1) != row["head_sha"]:
+                            if git(source, "rev-parse", f"refs/heads/{row['branch']}") != match.group(1):
+                                raise WorkflowError("correction remote head lacks local commit")
+                            _verify_leftover_checkout(cfg, row, match.group(1))
+                            if row["status"] == "retry_wait":
+                                conn.execute("UPDATE retry_state SET next_retry_at=? WHERE issue=?",
+                                             (int(time.time()) + 60, row["issue"]))
+                            continue
+                    leftover = _verify_leftover_checkout(cfg, row, pr["headRefOid"])
                     if row["status"] == "retry_wait":
                         if leftover is not None:
                             _remove_checkout(cfg, leftover)
@@ -992,21 +1039,20 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     state.event(conn, row["issue"], "retry_scheduled"
                                 if decision.status == "retry_wait" else "blocked")
                     continue
+                leftover = _verify_leftover_checkout(cfg, row, pr["headRefOid"])
                 evidence = (cfg.state_dir / "evidence" / str(row["issue"])
                             / f"{pr['headRefOid']}.json")
                 if evidence.is_file():
                     proof = read_evidence(evidence)
-                if not evidence.is_file() or proof.get("pr") != pr_number:
+                if not evidence.is_file() or not _published_evidence_matches(
+                        proof, row, pr, spec):
                     proof = _rebuild_published_evidence(cfg, row, pr)
+                    proof["body_sha256"] = spec.body_sha256
+                    if not _published_evidence_matches(proof, row, pr, spec,
+                                                       rebuilt=True):
+                        raise WorkflowError("published branch lacks matching evidence")
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     write_evidence(evidence, proof)
-                if (proof.get("issue") != row["issue"] or proof.get("pr") != pr_number
-                        or proof.get("branch") != row["branch"]
-                        or proof.get("head") != pr["headRefOid"]
-                        or proof.get("ci", {}).get("result") != "passed"
-                        or not row["image_id"]
-                        or proof.get("ci", {}).get("image_id") != row["image_id"]):
-                    raise WorkflowError("published branch lacks matching evidence")
                 if published_image_id(pr.get("body") or "") != row["image_id"]:
                     raise WorkflowError("published PR image differs from recorded execution image")
                 if cfg.draft_pr_socket is not None and row["pr"] is None:
@@ -1322,7 +1368,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         result = {"issue": issue, "pr": pr_number, "branch": branch, "head": head,
                   "base": base,
                   "paths": paths, "ci": proof,
-                  "model": used_model.ref if used_model else None}
+                  "model": used_model.ref if used_model else None,
+                  "body_sha256": spec.body_sha256}
         evidence = cfg.state_dir / "evidence" / str(issue)
         evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
         write_evidence(evidence / f"{head}.json", result)
