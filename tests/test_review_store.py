@@ -45,6 +45,36 @@ class ReviewStoreTests(unittest.TestCase):
         self.assertEqual(_load(self.cfg, 29), prior)
         self.assertEqual(list(self.path.parent.iterdir()), [self.path])
 
+    def test_partial_temporary_write_preserves_complete_prior_record(self):
+        prior = {"pr": 29, "head": "a" * 40}
+        _save(self.cfg, 29, prior)
+        original = self.path.read_bytes()
+        real_fdopen = os.fdopen
+
+        class PartialStream:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                self.stream.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def write(self, data):
+                self.stream.write(data[:len(data) // 2])
+                self.stream.flush()
+                raise OSError("partial temporary write")
+
+        with patch("ermik.evidence_store.os.fdopen",
+                   side_effect=lambda fd, mode: PartialStream(real_fdopen(fd, mode))):
+            with self.assertRaisesRegex(OSError, "partial temporary write"):
+                _save(self.cfg, 29, {"pr": 29, "head": "b" * 40})
+        self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(_load(self.cfg, 29), prior)
+        self.assertEqual(list(self.path.parent.iterdir()), [self.path])
+
     def test_directory_sync_failure_leaves_complete_new_record(self):
         _save(self.cfg, 29, {"pr": 29, "head": "a" * 40})
         updated = {"pr": 29, "head": "b" * 40}
