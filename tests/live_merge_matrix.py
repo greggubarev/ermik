@@ -6,7 +6,7 @@ Run with an existing disposable private repository and a scoped GH_TOKEN::
         --image ermik-demo:latest --report /private/merge-matrix.json
 
 The named repository must have an initial commit, allow squash merges, and have
-the queue:worker, state:proposed, state:ready and state:in-progress labels.
+the queue:worker, state:ready and state:in-progress labels.
 Each case creates an issue, branch and PR. Remote history and negative-case PRs
 are intentionally left for inspection. Local state is temporary. This script
 never reads, prints or stores the token value.
@@ -33,7 +33,8 @@ sys.path.insert(0, str(ROOT))
 from ermik import review as review_module  # noqa: E402
 from ermik.config import load_config  # noqa: E402
 from ermik.github import GitHub, GitHubError  # noqa: E402
-from ermik.runtime import WorkflowError, admit  # noqa: E402
+from ermik.policy import parse_issue  # noqa: E402
+from ermik.runtime import WorkflowError, _admission_marker, admit  # noqa: E402
 
 
 CASES = (
@@ -255,10 +256,11 @@ def prepare_case(repo: str, base: str, image: str, root: Path,
     body = (f"## Goal\n\nAdd the unique marker for {case}.\n\n"
             f"## Allowed paths\n\n{path}\n\n"
             f"## Acceptance\n\nThe marker is exactly {suffix}.\n")
-    issue_url = command(["gh", "issue", "create", "-R", repo, "--title",
-                         f"Merge recovery {case} {suffix}", "--body", body,
-                         "--label", "queue:worker", "--label", "state:proposed"])
-    issue = int(issue_url.rstrip("/").split("/")[-1])
+    issue = json.loads(command(
+        ["gh", "api", "--method", "POST", f"repos/{repo}/issues", "--input", "-"],
+        input_text=json.dumps({"title": f"Merge recovery {case} {suffix}",
+                               "body": body,
+                               "labels": ["queue:worker", "state:ready"]})))['number']
     branch = f"work/issue-{issue}-merge-{suffix}"
     config = case_root / "config.json"
     check = ("from pathlib import Path; "
@@ -271,9 +273,15 @@ def prepare_case(repo: str, base: str, image: str, root: Path,
     config.write_text(json.dumps(data), encoding="utf-8")
     config.chmod(0o600)
     cfg = load_config(config)
+    marker = _admission_marker(issue, parse_issue(body))
+    command(["gh", "api", "--method", "POST",
+             f"repos/{repo}/issues/{issue}/comments", "--input", "-"],
+            input_text=json.dumps({"body": marker +
+                                   "\n\nApproved for the scoped worker queue."}))
     admit(cfg, issue)
-    command(["gh", "issue", "edit", str(issue), "-R", repo,
-             "--remove-label", "state:ready", "--add-label", "state:in-progress"])
+    command(["gh", "api", "--method", "PUT",
+             f"repos/{repo}/issues/{issue}/labels", "--input", "-"],
+            input_text=json.dumps({"labels": ["queue:worker", "state:in-progress"]}))
     before = base_sha(repo, base)
     command(["git", "clone", "--quiet", "--single-branch", "--branch", base,
              f"https://github.com/{repo}.git", str(checkout)])
@@ -290,10 +298,11 @@ def prepare_case(repo: str, base: str, image: str, root: Path,
              f"Add merge marker {suffix}"], cwd=checkout)
     head = command(["git", "rev-parse", "HEAD"], cwd=checkout)
     command(["git", "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"], cwd=checkout)
-    pr_url = command(["gh", "pr", "create", "-R", repo, "--base", base,
-                      "--head", branch, "--draft", "--title",
-                      f"Merge recovery {case} {suffix}", "--body", f"Closes #{issue}"])
-    pr = int(pr_url.rstrip("/").split("/")[-1])
+    pr = json.loads(command(
+        ["gh", "api", "--method", "POST", f"repos/{repo}/pulls", "--input", "-"],
+        input_text=json.dumps({"title": f"Merge recovery {case} {suffix}",
+                               "head": branch, "base": base,
+                               "draft": True, "body": f"Closes #{issue}"})))['number']
     remote_identity(repo, pr, branch, head, base, issue, state="open")
     if case == "failed_postcheck":
         # The CI snapshot exposes ci-head in both PR and main checkouts. This
@@ -390,7 +399,8 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
         row.update(status="passed", outcome="rejected_changed_head")
         return row
     if case == "closed_unmerged":
-        command(["gh", "pr", "close", str(number), "-R", repo])
+        command(["gh", "api", "--method", "PATCH", f"repos/{repo}/pulls/{number}",
+                 "--input", "-"], input_text=json.dumps({"state": "closed"}))
         code, result = cli_merge(config, number)
         require(code == 1 and result is None, "closed PR was accepted")
         remote_identity(repo, number, branch, head, base, issue, state="closed")
@@ -431,10 +441,11 @@ def main() -> int:
         return 1
     report = {"repository": args.repo, "cases": [], "status": "failed",
               "command_sequence": [
-                  "gh issue create -R OWNER/REPO",
+                  "gh api POST repos/OWNER/REPO/issues",
+                  "gh api POST repos/OWNER/REPO/issues/ISSUE/comments",
                   "ermik admit ISSUE",
                   "git push origin HEAD:refs/heads/BRANCH",
-                  "gh pr create -R OWNER/REPO --draft",
+                  "gh api POST repos/OWNER/REPO/pulls (draft)",
                   "ermik review PR",
                   "ermik merge PR",
                   "gh api repos/OWNER/REPO/pulls/PR",
@@ -456,7 +467,7 @@ def main() -> int:
         command(["git", "--version"])
         labels = gh_json_list("api", f"repos/{args.repo}/labels?per_page=100")
         names = {item["name"] for item in labels}
-        require({"queue:worker", "state:proposed", "state:ready",
+        require({"queue:worker", "state:ready",
                  "state:in-progress"} <= names, "required labels absent")
         # Scope git auth to this process tree; no global Git configuration changes.
         os.environ["GIT_CONFIG_COUNT"] = "1"
