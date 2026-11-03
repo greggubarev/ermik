@@ -61,7 +61,8 @@ def command(args: list[str], *, cwd: Path | None = None,
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise MatrixFailure(f"{args[0]} unavailable or timed out") from exc
     if done.returncode:
-        raise MatrixFailure(f"{args[0]} exited {done.returncode}")
+        operation = " ".join(args[:2]) if args else "command"
+        raise MatrixFailure(f"{operation} exited {done.returncode}")
     return done.stdout.strip()
 
 
