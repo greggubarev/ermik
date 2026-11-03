@@ -194,7 +194,7 @@ class FaultWindowTests(unittest.TestCase):
         self.assertIsNone(self._claim())
 
     def _perform_with_fake_git(self, *, lose_push=False, lose_pr=False,
-                               push_exit_error=False):
+                               push_exit_error=False, proof=None):
         self._approved()
         self.gh.names = {"queue:worker", "state:in-progress"}
         self.gh.pr_loss = lose_pr
@@ -222,7 +222,7 @@ class FaultWindowTests(unittest.TestCase):
                 runtime, "_docker"), patch.object(
                 runtime, "_check_scope", return_value=["src/example.py"]), patch.object(
                 runtime, "git", side_effect=git), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}), patch.object(
+                runtime, "local_checks", return_value=proof or {"result": "passed"}), patch.object(
                 runtime, "main_sha", return_value=BASE):
             return runtime._perform(self.cfg, 1, BRANCH, self.spec,
                                     correction_note=None, pr_number=None,
@@ -246,6 +246,14 @@ class FaultWindowTests(unittest.TestCase):
         with self.assertRaises(runtime.TransientFailure):
             self._perform_with_fake_git(push_exit_error=True)
         self.assertEqual(self.gh.remote_head, HEAD)
+        self.assertEqual(self.gh.open_calls, 0)
+
+    def test_oversized_broker_evidence_blocks_before_branch_push(self):
+        self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
+        proof = {"result": "passed", "checks": [{"command": ["x" * 65536]}]}
+        with self.assertRaisesRegex(ValueError, "evidence is too large"):
+            self._perform_with_fake_git(proof=proof)
+        self.assertIsNone(self.gh.remote_head)
         self.assertEqual(self.gh.open_calls, 0)
 
     def test_unacknowledged_push_rebuilds_proof_and_opens_one_pr(self):

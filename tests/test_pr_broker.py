@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from ermik.evidence_store import MAX_BROKER_EVIDENCE_BYTES
 from ermik.policy import parse_issue
 from ermik.pr_broker import Broker, BrokerError, handle_connection
 
@@ -128,6 +129,23 @@ class BrokerTests(unittest.TestCase):
     def test_evidence_mismatch_refuses_before_post(self):
         self.record["ci"]["result"] = "failed"
         self.write_evidence()
+        with self.assertRaises(BrokerError):
+            self.broker.create_draft(self.request)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_evidence_at_broker_limit_allows_draft(self):
+        content = json.dumps(self.record).encode("utf-8")
+        self.evidence.write_bytes(content + b" " * (MAX_BROKER_EVIDENCE_BYTES - len(content)))
+        self.assertEqual(self.evidence.stat().st_size, MAX_BROKER_EVIDENCE_BYTES)
+        self.assertEqual(self.broker.create_draft(self.request),
+                         {"pr": 19, "created": True})
+        self.assertEqual(sum(method == "POST" for method, _, _ in self.api.calls), 1)
+
+    def test_oversized_evidence_refuses_before_post(self):
+        content = json.dumps(self.record).encode("utf-8")
+        self.evidence.write_bytes(content + b" " * (MAX_BROKER_EVIDENCE_BYTES + 1
+                                                     - len(content)))
+        self.assertEqual(self.evidence.stat().st_size, MAX_BROKER_EVIDENCE_BYTES + 1)
         with self.assertRaises(BrokerError):
             self.broker.create_draft(self.request)
         self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))

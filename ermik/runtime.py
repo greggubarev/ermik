@@ -24,7 +24,8 @@ from .github import GitHub, GitHubError
 from .policy import IssueSpec, parse_issue, validate_changed_paths
 from .observability import resource_guard
 from .resources import recover_stale_worktrees
-from .evidence_store import read_evidence, write_evidence
+from .evidence_store import (MAX_BROKER_EVIDENCE_BYTES, read_evidence,
+                             validate_evidence_size, write_evidence)
 from .providers import (available_capacity, claim_model, choose_model, model_spec,
                         record_exhaustion, release_model)
 from .recovery import (RecoveryClaim, activate_claim, claim_due, complete_claim,
@@ -41,6 +42,14 @@ _CLEANED_NAMESPACES: set[str] = set()
 _CONTAINER_LOCK = threading.Lock()
 _PUBLISH_HELPER_LOCK = threading.Lock()
 _MIRROR_LOCK = threading.RLock()
+
+
+def _prepublication_record(*, issue: int, branch: str, head: str, base: str,
+                           paths: list[str], proof: dict, model: str | None,
+                           body_sha256: str) -> dict:
+    return {"issue": issue, "branch": branch, "head": head,
+            "base": base, "body_sha256": body_sha256,
+            "paths": sorted(paths), "ci": proof, "model": model}
 
 
 def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
@@ -72,11 +81,12 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
     path = evidence / f"{head}.json"
     if path.is_symlink():
         raise WorkflowError("PR evidence file is a symlink")
-    prepublication = {"issue": issue, "branch": branch, "head": head,
-                      "base": base, "body_sha256": body_sha256,
-                      "paths": sorted(paths), "ci": proof, "model": model}
+    prepublication = _prepublication_record(
+        issue=issue, branch=branch, head=head, base=base, paths=paths,
+        proof=proof, model=model, body_sha256=body_sha256)
     write_evidence(path, prepublication,
-                   mode=0o640 if cfg.draft_pr_evidence_dir else 0o600)
+                   mode=0o640 if cfg.draft_pr_evidence_dir else 0o600,
+                   max_bytes=MAX_BROKER_EVIDENCE_BYTES)
     request = {"op": "create_draft", "issue": issue, "branch": branch,
                "head_sha": head, "base_sha": base}
     try:
@@ -1178,6 +1188,12 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
             raise WorkflowError("worker produced no changed files")
         head = git(checkout, "rev-parse", "HEAD")
         proof = local_checks(cfg, checkout)
+        if pr_number is None and cfg.draft_pr_socket is not None:
+            validate_evidence_size(_prepublication_record(
+                issue=issue, branch=branch, head=head, base=base, paths=paths,
+                proof=proof, model=used_model.ref if used_model else None,
+                body_sha256=spec.body_sha256),
+                max_bytes=MAX_BROKER_EVIDENCE_BYTES)
         with state.connect(cfg.state_dir) as conn:
             state.event(conn, issue, "checks_passed",
                         model=used_model.ref if used_model else None, head_sha=head)
