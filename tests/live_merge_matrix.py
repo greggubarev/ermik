@@ -124,6 +124,20 @@ def result_record(cfg, number: int) -> dict:
     return review_module._load(cfg, number)
 
 
+def verify_merged_remote(repo: str, base: str, issue: int,
+                         merge_oid: str, reviewed_base: str) -> None:
+    require(base_sha(repo, base) == merge_oid,
+            "base is not exact merge commit")
+    commit = gh_json("api", f"repos/{repo}/git/commits/{merge_oid}")
+    parents = commit.get("parents")
+    require(isinstance(parents, list) and len(parents) == 1
+            and isinstance(parents[0], dict)
+            and parents[0].get("sha") == reviewed_base,
+            "merge commit parent differs from reviewed base")
+    require(gh_json("api", f"repos/{repo}/issues/{issue}").get("state") == "closed",
+            "linked issue is not closed remotely")
+
+
 def review_with_read_retry(cfg, number: int) -> dict:
     """Retry only local review, whose GitHub operations are reads."""
     for attempt in range(5):
@@ -148,6 +162,23 @@ def cli_merge(config: Path, number: int) -> tuple[int, dict | None]:
     except ValueError:
         result = None
     return done.returncode, result
+
+
+def cli_merge_rejected(config: Path, number: int, expected_reason: str) -> None:
+    """Require the intended validation failure, not an unrelated CLI error."""
+    for attempt in range(5):
+        done = subprocess.run([sys.executable, "-m", "ermik", "--config", str(config),
+                               "merge", str(number)], cwd=ROOT, text=True,
+                              capture_output=True, timeout=1200, check=False)
+        last_line = done.stderr.strip().splitlines()[-1:] or [""]
+        if (done.returncode == 1 and not done.stdout
+                and last_line[0] == f"WorkflowError: {expected_reason}"):
+            return
+        if done.returncode == 1 and last_line[0].startswith("GitHubError:"):
+            time.sleep(attempt + 1)
+            continue
+        break
+    raise MatrixFailure("merge rejection did not match the expected reason")
 
 
 def cli_merge_with_read_retry(config: Path, number: int) -> tuple[int, dict | None]:
@@ -222,6 +253,8 @@ def child(boundary: str, config: Path, number: int) -> None:
             if args[:2] == ["pr", "merge"]:
                 observed = self.pr(number)
                 if observed["state"] == "MERGED":
+                    # The child CLI finished, but merge() has not received
+                    # the command result or persisted the remote outcome.
                     kill()
             return answer
 
@@ -329,6 +362,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
         observed = remote_identity(repo, number, branch, head, base, issue,
                                    state="merged")
         oid = observed["merge_commit_sha"]
+        verify_merged_remote(repo, base, issue, oid, before)
         require(code == 0 and result is not None and result.get("status") == "complete"
                 and result.get("merge_commit") == oid
                 and result.get("main_ci", {}).get("result") == "passed"
@@ -362,9 +396,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
         merge_oid = observed.get("merge_commit_sha")
         require(isinstance(merge_oid, str) and len(merge_oid) == 40,
                 "merge commit absent")
-        require(base_sha(repo, base) == merge_oid, "base is not exact merge commit")
-        require(gh_json("api", f"repos/{repo}/git/commits/{merge_oid}")["parents"][0]["sha"] == before,
-                "merge commit parent differs from reviewed base")
+        verify_merged_remote(repo, base, issue, merge_oid, before)
         code, result = cli_merge_with_read_retry(config, number)
         require(code == 0 and result is not None and result.get("status") == "complete"
                 and result.get("merge_commit") == merge_oid
@@ -390,8 +422,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
                  "Change reviewed marker"], cwd=checkout)
         changed = command(["git", "rev-parse", "HEAD"], cwd=checkout)
         command(["git", "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"], cwd=checkout)
-        code, result = cli_merge_with_read_retry(config, number)
-        require(code == 1 and result is None, "changed HEAD was accepted")
+        cli_merge_rejected(config, number, "review record is stale")
         require(pr_remote(repo, number)["head"]["sha"] == changed
                 and pr_remote(repo, number).get("merged_at") is None
                 and "merge_attempt" not in result_record(cfg, number),
@@ -401,8 +432,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
     if case == "closed_unmerged":
         command(["gh", "api", "--method", "PATCH", f"repos/{repo}/pulls/{number}",
                  "--input", "-"], input_text=json.dumps({"state": "closed"}))
-        code, result = cli_merge(config, number)
-        require(code == 1 and result is None, "closed PR was accepted")
+        cli_merge_rejected(config, number, "PR closed without a confirmed merge")
         remote_identity(repo, number, branch, head, base, issue, state="closed")
         require("merge_attempt" not in result_record(cfg, number),
                 "closed PR created merge attempt")
@@ -415,7 +445,8 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
             "failed postcheck claimed success")
     observed = remote_identity(repo, number, branch, head, base, issue, state="merged")
     oid = observed["merge_commit_sha"]
-    require(result.get("merge_commit") == oid and base_sha(repo, base) == oid,
+    verify_merged_remote(repo, base, issue, oid, before)
+    require(result.get("merge_commit") == oid,
             "failed postcheck lost merge identity")
     again = guarded_repeat(cfg, number)
     require(again == result
@@ -487,7 +518,8 @@ def main() -> int:
                 else:
                     report["cases"].append(row)
         report["status"] = "passed"
-    except (MatrixFailure, KeyError, ValueError, OSError, WorkflowError) as exc:
+    except (MatrixFailure, GitHubError, KeyError, ValueError, OSError,
+            WorkflowError, TypeError, StopIteration) as exc:
         # Only fixed error classes and messages from this file enter the report.
         report["error"] = str(exc) if isinstance(exc, (MatrixFailure, WorkflowError)) else type(exc).__name__
     if args.report:
