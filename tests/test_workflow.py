@@ -278,6 +278,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_pending_rework_prevents_merge_of_old_review(self):
         FakeHub.issues[1]["names"] = {"queue:worker", "state:in-progress"}
+        spec = runtime.parse_issue(BODY)
+        FakeHub.notes[1] = [{"id": 1, "body": runtime._admission_marker(1, spec),
+                             "user": {"login": "owner"}}]
         FakeHub.prs[10] = {"state": "OPEN", "headRefName": "work/issue-1-delivery",
                             "headRefOid": SHA_B, "baseRefOid": SHA_A,
                             "baseRefName": "main", "isDraft": True,

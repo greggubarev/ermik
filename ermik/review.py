@@ -9,8 +9,10 @@ import re
 
 from .config import Config
 from .github import GitHub, GitHubError
+from .git_tree import verify_changed_tree
 from .policy import parse_issue, validate_changed_paths
-from .runtime import WorkflowError, git, local_checks, mirror, main_sha
+from .runtime import (WorkflowError, _approved_on_github, git, local_checks,
+                      mirror, main_sha)
 from . import state
 
 
@@ -43,6 +45,8 @@ def _identity(cfg: Config, gh: GitHub, number: int, *,
     if "queue:worker" not in names or not names.intersection(valid_states):
         raise WorkflowError("issue queue or state changed")
     spec = parse_issue(issue.get("body") or "")
+    if not _approved_on_github(gh, cfg, issue_num, spec):
+        raise WorkflowError("issue lacks current maintainer admission")
     validate_changed_paths((row["path"] for row in pr["files"]), spec.allowed_paths)
     return pr, issue_num, issue
 
@@ -87,7 +91,9 @@ def review(cfg: Config, number: int) -> dict:
         try:
             if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
                 raise WorkflowError("review checkout HEAD differs")
-            actual = set(git(checkout, "diff", "--name-only", pr["baseRefOid"] + "...HEAD").splitlines())
+            actual = set(verify_changed_tree(checkout, pr["baseRefOid"],
+                                             pr["headRefOid"],
+                                             allowed_paths=spec.allowed_paths))
             published = {row["path"] for row in pr["files"]}
             if actual != published:
                 raise WorkflowError("published and fetched PR diffs differ")
@@ -99,6 +105,9 @@ def review(cfg: Config, number: int) -> dict:
     current = gh.pr(number)
     if current["headRefOid"] != pr["headRefOid"] or current["baseRefOid"] != pr["baseRefOid"]:
         raise WorkflowError("PR changed during local review")
+    _, _, current_issue = _identity(cfg, gh, number)
+    if parse_issue(current_issue["body"]).body_sha256 != spec.body_sha256:
+        raise WorkflowError("issue changed during local review")
     result = {"pr": number, "issue": issue_num, "base": pr["baseRefOid"],
               "head": pr["headRefOid"], "body_sha256": spec.body_sha256,
               "paths": sorted(actual), "reviewed_at": datetime.now(timezone.utc).isoformat(),
@@ -110,9 +119,11 @@ def review(cfg: Config, number: int) -> dict:
 def request_changes(cfg: Config, number: int, note_file: Path) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
-    pr, issue_num, _issue = _identity(cfg, gh, number, allow_blocked=True)
+    pr, issue_num, issue = _identity(cfg, gh, number, allow_blocked=True)
     record = _load(cfg, number)
-    if record["head"] != pr["headRefOid"] or record["base"] != pr["baseRefOid"]:
+    if (record.get("head") != pr["headRefOid"] or record.get("base") != pr["baseRefOid"]
+            or record.get("body_sha256") != parse_issue(issue["body"]).body_sha256
+            or record.get("paths") != sorted(row["path"] for row in pr["files"])):
         raise WorkflowError("review record is stale")
     note = note_file.read_text(encoding="utf-8").strip()
     if not 10 <= len(note) <= 4000:
@@ -156,6 +167,9 @@ def merge(cfg: Config, number: int) -> dict:
             raise WorkflowError("PR changed before merge")
         if main_sha(gh, cfg) != record["base"]:
             raise WorkflowError("base branch moved since review")
+        _, _, current_issue = _identity(cfg, gh, number)
+        if parse_issue(current_issue["body"]).body_sha256 != record["body_sha256"]:
+            raise WorkflowError("issue changed before merge")
         try:
             gh.command(["pr", "merge", str(number), "-R", cfg.repo,
                     "--squash", "--delete-branch", "--match-head-commit",
