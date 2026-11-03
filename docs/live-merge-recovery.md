@@ -1,6 +1,6 @@
 # Live merge recovery exercise
 
-On 2026-11-03, the [merge recovery matrix](../tests/live_merge_matrix.py) completed in an existing private test repository. The tested Ermik revision was `c13827b1df0322eb018913d719627e5ae365864d`, which includes the closed-Issue fix and bounded read-only GitHub retries. The test used a local Docker image built from `examples/Dockerfile.demo` and an isolated state directory for each case. No repository credential was passed to a container.
+On 2026-11-03, the [merge recovery matrix](../tests/live_merge_matrix.py) completed in an existing private test repository. The final run used Ermik revision `073e710c701c23960ff093b610a3949eebca5fc3`, which includes the closed-Issue fix and bounded read-only GitHub retries. The test used a local Docker image built from `examples/Dockerfile.demo` and an isolated state directory for each case. No repository credential was passed to a container.
 
 The command sequence for each case was: create a scoped Issue and admission comment through GitHub REST, push one task branch, open a draft PR, run `review` on its exact HEAD, run `merge` with the selected process interruption, then read the PR, Issue, merge commit and default branch through GitHub REST. The script requires an explicitly named private repository and a maintainer credential in the environment; it does not print or save that credential.
 
