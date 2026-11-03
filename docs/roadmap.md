@@ -4,7 +4,7 @@ Ermik is a preview. Its immediate goal is a verifiable handoff: an admitted, pat
 
 Phases below are ordered by evidence needed, not by release date. The v0.2 reliability gates remain open; v0.3 through v0.5 describe proposed differentiation after those gates. Completion requires the stated observations in a disposable repository and relevant automated tests. A passing test or check establishes only the behavior it exercises.
 
-The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks reliability and release gates, including the [admission check](https://github.com/greggubarev/ermik/issues/12), [Git object validation](https://github.com/greggubarev/ermik/issues/13), and [draft PR reconciliation](https://github.com/greggubarev/ermik/issues/14). The [v0.3.0](https://github.com/greggubarev/ermik/milestone/2), [v0.4.0](https://github.com/greggubarev/ermik/milestone/3), and [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) milestones track the proposed later phases. Listing work here does not mark it complete.
+The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks recovery, credential isolation, image identity, upgrades and release gates. [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) tracks portable evidence and review handoff; [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) tracks measured routing; [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) tracks optional operator experience and adoption trials. Closed Issues remain in their milestone as evidence of completed steps. Listing work here does not mark it complete.
 
 ## 0. Verified handoff baseline
 
@@ -18,6 +18,8 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 **Acceptance:** In a disposable repository, stop the controller at each issue claim, branch push, draft PR creation, correction push, and merge response boundary. Restart it and verify the same issue, branch, and PR identities are reconciled before any retry. Repeated commands must not create a second PR, repeat a merge, or treat an unverified HEAD as reviewed. A changed issue body, base commit, or PR HEAD must block the stale decision. Run the same exercise across an execution-host reboot while a task is active.
 
+[Execution recovery](https://github.com/greggubarev/ermik/issues/1), [explicit merge recovery](https://github.com/greggubarev/ermik/issues/27), [atomic review records](https://github.com/greggubarev/ermik/issues/29), and [orphan probe cleanup](https://github.com/greggubarev/ermik/issues/30) separate the write boundaries so each can be tested without claiming the others are complete.
+
 ## 2. v0.2: Clean-host operation and credential separation
 
 **Goal:** Let an operator reproduce the workflow on a fresh host with an auditable publication boundary.
@@ -30,9 +32,11 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 **Acceptance:** Pin and inspect the task and check image by immutable identifier. Upgrade a populated local SQLite state through a documented migration, restart, and verify that pending and completed jobs retain their identities; test rollback from a saved state and reconcile remote writes before resuming. Publish a vulnerability-reporting path and check the source release for credentials, local state, and required third-party notices. Repeat the complete handoff on the release candidate after upgrade.
 
+[Image continuity](https://github.com/greggubarev/ermik/issues/8), [review check-policy identity](https://github.com/greggubarev/ermik/issues/28), [state upgrades](https://github.com/greggubarev/ermik/issues/10), and [owned artifact retention](https://github.com/greggubarev/ermik/issues/31) are separate gates. The first image-ID execution slice is merged, but correction, recovery and separate-host review remain open.
+
 ## 4. v0.3: Portable evidence and reviewer decision support (planned)
 
-**Goal:** Let a maintainer understand and preserve the basis for a decision without relying on one controller's local SQLite state. [Portable evidence](https://github.com/greggubarev/ermik/issues/11) and a [review packet](https://github.com/greggubarev/ermik/issues/15) track the two deliverables.
+**Goal:** Let a maintainer understand and preserve the basis for a decision without relying on one controller's local SQLite state. [Portable evidence](https://github.com/greggubarev/ermik/issues/11), [cross-host delivery](https://github.com/greggubarev/ermik/issues/32), and a [review packet](https://github.com/greggubarev/ermik/issues/15) track the handoff; [version fixtures](https://github.com/greggubarev/ermik/issues/33) and a [decision trail](https://github.com/greggubarev/ermik/issues/34) protect it across upgrades and corrections.
 
 **Acceptance:** Export a versioned, portable evidence record for one issue and PR that identifies the repository, admission and allowed-path hashes, base and reviewed HEAD commits, changed paths, check commands and outcomes, image identifier, and private-log digests. Verify the exported record against the current GitHub issue and PR from a separate maintainer installation. Present the exact diff and check evidence with a clear stale or missing-evidence state; a changed HEAD or base must invalidate the prior review decision. The record must contain no credentials, private logs, or full issue body. The maintainer still decides whether to request changes or merge.
 
@@ -40,7 +44,7 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 **Goal:** Compare configured routes using observed outcomes and resource use over complete PR cycles.
 
-The [outcome ledger](https://github.com/greggubarev/ermik/issues/16) must precede any [measured routing policy](https://github.com/greggubarev/ermik/issues/17).
+The [outcome ledger](https://github.com/greggubarev/ermik/issues/16) must precede any [measured routing policy](https://github.com/greggubarev/ermik/issues/17). [Quota observations](https://github.com/greggubarev/ermik/issues/35) and [context-efficiency measures](https://github.com/greggubarev/ermik/issues/36) must distinguish verified counters from estimates and missing data.
 
 **Acceptance:** Record attempts, retries, rate limits, elapsed time, usage observations, and accepted PR outcomes against issue and PR identities without mixing separate tasks. Report cost per accepted PR for a stated period and route, including failed and retried attempts in the numerator; report the measure as unavailable when no PR was accepted. Separate estimated usage or cost from billed amounts and show missing data explicitly. Compare at least two configured routes on the same documented task set, including a failure and a retry, before using the results to change routing defaults. A routing choice must not bypass admission, scope, checks, or maintainer review.
 
@@ -48,7 +52,7 @@ The [outcome ledger](https://github.com/greggubarev/ermik/issues/16) must preced
 
 **Goal:** Make queue state and review evidence easier to inspect while retaining the existing command workflow.
 
-The [optional maintainer view](https://github.com/greggubarev/ermik/issues/18) depends on the evidence and review packet.
+The [optional maintainer view](https://github.com/greggubarev/ermik/issues/18) depends on the evidence and review packet. [Actionable diagnostics](https://github.com/greggubarev/ermik/issues/37), [two non-demo integrations](https://github.com/greggubarev/ermik/issues/38), and [opt-in event digests](https://github.com/greggubarev/ermik/issues/39) extend the CLI and adoption path without moving the merge decision to the execution host.
 
 **Acceptance:** Provide an optional interface that shows each issue's verified identity, current state, PR and HEAD, check result, and next available maintainer action from the same underlying records as the commands. In a trial, compare the interface and command output for an admitted task, blocked task, correction, and stale review; they must agree. An unavailable interface must leave admission, review, and explicit merge usable through the documented commands. No interface action may weaken the checks or grant the execution host merge authority.
 

@@ -1,8 +1,16 @@
 # Ermik
 
-Ermik is a self-hosted handoff from scoped GitHub Issues to draft pull requests. A maintainer admits an issue; a trusted controller runs the configured task command in a separate Docker container, validates the changed paths, and runs local checks without requiring GitHub Actions. The maintainer reviews the exact PR commit and is the only party that initiates a merge. This is a preview: the documented end-to-end trial verifies one disposable repository and its configuration, not every project or failure mode.
+Ermik is a coined name inspired by the [ermine](https://www.nature.scot/plants-animals-and-fungi/mammals/land-mammals/other-carnivores/stoat-and-weasel): the stoat in its white winter coat. It is not an acronym.
+
+Ermik is a self-hosted path from scoped GitHub Issues to draft pull requests. A maintainer admits an issue; a trusted controller runs the configured task command in a separate Docker container, validates the changed paths, and runs local checks without requiring GitHub Actions. The maintainer reviews the exact PR commit and is the only party that initiates a merge. This is a preview: the documented end-to-end trial verifies one disposable repository and its configuration, not every project or failure mode.
 
 ![Workflow: issue admission, server execution, review, correction or merge](assets/workflow.svg)
+
+## What we are building
+
+The goal is a reusable execution queue that can work through admitted Issues while the maintainer is away. Each task gets an isolated checkout, a configured runner and local checks. The controller publishes one draft PR per Issue and sends requested changes back to the same PR. Safe resumption after interruptions is a v0.2 goal still under test. A separate maintainer installation verifies the current HEAD and decides when to merge. The execution loop does not merge; the [security model](docs/security.md) explains the credentials needed to enforce that boundary.
+
+Later releases aim to carry a portable record of checks and task identity to the maintainer, compare provider routes by accepted PR outcomes and cost, and explain blocked or waiting work through optional local views. These are tracked goals, not claims about the preview. The [release status](docs/readiness.md) lists what has actually been verified.
 
 ## Current capabilities
 
@@ -56,7 +64,16 @@ python3 -m compileall -q ermik
 
 ## Roadmap
 
-The [phased roadmap](docs/roadmap.md) keeps v0.2 focused on interruption recovery, clean-host operation, and release maintenance. After those reliability gates, planned v0.3 work covers portable evidence and reviewer decision support ([evidence-manifest issue](https://github.com/greggubarev/ermik/issues/11)); v0.4 covers measured routing and cost per accepted PR; v0.5 covers an optional interface. The [v0.3.0 milestone](https://github.com/greggubarev/ermik/milestone/2) tracks related work. [Release readiness](docs/readiness.md) records verified behavior and remaining gaps. These later phases are plans, not current capabilities.
+The [phased roadmap](docs/roadmap.md) defines the acceptance gates. The milestones group concrete Issues; they are not release dates.
+
+| Milestone | Planned result |
+| --- | --- |
+| [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Recover interrupted writes and merge decisions, prove separated credentials, pin execution identity, and validate upgrades and a clean installation. |
+| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Deliver portable evidence to a separate maintainer installation and make stale review decisions visible. |
+| [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measure provider outcomes, quota observations, context use and cost per accepted PR before changing routing policy. |
+| [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Add optional diagnostics and views, and validate the setup on unrelated projects. |
+
+Ermik remains a preview while the v0.2 recovery and credential gates are open. See [release status](docs/readiness.md) for verified trials and [Releases](https://github.com/greggubarev/ermik/releases) when a version is published.
 
 ## Documentation
 
