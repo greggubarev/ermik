@@ -276,7 +276,7 @@ gh pr view PR -R example-org/example-project
 gh pr diff PR -R example-org/example-project
 ```
 
-For independent review, clone this repository on the local computer, copy the same configuration with **local** absolute `state_dir` and `workspace` paths, build the configured check image, and authenticate `gh` as the configured maintainer. The local review record stays on that computer. Then run:
+For independent review, clone this repository on the local computer, copy the same configuration with **local** absolute `state_dir` and `workspace` paths, build the configured check image, and authenticate `gh` as the configured maintainer. The local review record stays on that computer. Its private JSON file is replaced atomically; older `0644` records inside an owner-only reviews directory remain readable and are rewritten as `0600` on the next save. Keep the state directory when upgrading, and inspect malformed records rather than removing them. Then run:
 
 ```sh
 python3 -m ermik --config config.json review PR
