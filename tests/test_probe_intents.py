@@ -168,6 +168,7 @@ class ProbeIntentTests(unittest.TestCase):
         release_post = threading.Event()
         reconcile_started = threading.Event()
         reconcile_done = threading.Event()
+        reconcile_read = threading.Event()
         remote = {"sha": None}
         failures = []
         first = self.github
@@ -193,6 +194,8 @@ class ProbeIntentTests(unittest.TestCase):
                 remote["sha"] = None
                 return Response(204)
             if url.endswith("/git/ref/heads/ermik-access-probe-" + PROBE_ID):
+                if threading.current_thread() is thread_b:
+                    reconcile_read.set()
                 return Response(body=ref_row()) if remote["sha"] else missing()
             if url == f"https://api.github.com/repos/{REPO}":
                 return Response(body={"full_name": REPO, "default_branch": "main"})
@@ -231,6 +234,8 @@ class ProbeIntentTests(unittest.TestCase):
                 self.assertEqual(len(self._intents()), 1)
                 thread_b.start()
                 self.assertTrue(reconcile_started.wait(3), "B did not start")
+                self.assertFalse(reconcile_read.wait(0.2),
+                                 "B inspected A's ref before A sent POST")
                 if reconcile_done.wait(0.2):
                     self.assertEqual(len(self._intents()), 1,
                                      "B erased A's intent before its POST")
