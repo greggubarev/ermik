@@ -19,6 +19,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 | Image continuity | Unit tests cover durable image binding before the first container, provider fallback, retry, correction, interrupted publication recovery, broker evidence, and maintainer review against the published ID. A changed or missing ID is rejected. The [Linux trial](image-continuity.md) replaced a mutable tag between real Docker checks, then verified rejection and acceptance of the same PR in an independent maintainer installation. The two installations shared a host; physical cross-host evidence delivery remains open. |
 | Source release gate | At commit `7d84f5a`, the Linux suite passed 298 tests. The gate scanned that reviewed commit's reachable history, packaged 101 tracked files, verified archive members against Git blobs, and produced a matching SHA-256 checksum and dependency inventory. Negative tests reject historical credentials, unsafe paths, symlinks, and dirty or mismatched checkouts; Git replacement objects cannot change the selected commit. See the [release guide](release.md); built container images require a separate license and content review. |
 | Issue handoff | A private test repository completed admission, draft PR publication, requested changes on the same PR, local review, explicit merge, and a check on the resulting default branch. |
+| Split private credentials | In a [disposable cross-owner trial](https://github.com/greggubarev/ermik/issues/2), separate upstream and fork tokens passed active capability probes. A GitHub App user token with `Contents: read`, `Issues: read`, and `Pull requests: write` created [draft PR #67](https://github.com/greggubarev/semiauto-e2e-smoke/pull/67) across the two private owners. Its upstream ref creation and ready PR merge attempts returned 403. The controller corrected the same PR; the old review was rejected as stale; an independent review of the new HEAD preceded explicit merge. The resulting `main` check passed and the issue closed. The App token expires after eight hours; unattended renewal has not been verified. |
 | Provider routes | The two documented subscription routes each completed a live task and returned usage data. |
 
 ## Not yet verified
@@ -28,6 +29,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 - A live upgrade and rollback of an existing controller installation; the SQLite migration and backup/restore evidence above uses synthetic preview-shaped state.
 - Every compatible provider endpoint and its authentication, quota, and timeout responses.
 - More than one controller host sharing a queue or state database; this configuration is unsupported.
+- Unattended renewal and broker restart for an expiring cross-owner GitHub App user token.
 - Application correctness beyond each project's configured checks and maintainer review.
 
 Run the [first-project exercise](first-project.md) in a disposable repository before using Ermik on production code. The [security guide](security.md) describes the credential boundary. Usage estimates are observations, not a provider balance.
