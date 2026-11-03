@@ -374,6 +374,19 @@ class FaultWindowTests(unittest.TestCase):
         checks.assert_called_once()
         self.assertFalse(checkout.exists())
 
+    def test_partial_evidence_blocks_reconciliation_without_second_pr(self):
+        _source, _checkout, _base, head = self._published_leftover()
+        evidence = self.cfg.state_dir / "evidence" / "1" / f"{head}.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_bytes(b'{"issue":1,"pr":')
+        evidence.chmod(0o600)
+        before = self.gh.open_calls
+        with state.connect(self.cfg.state_dir) as conn:
+            runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+            self.assertEqual(state.job(conn, 1)["status"], "blocked")
+        self.assertEqual(self.gh.open_calls, before)
+        self.assertEqual(evidence.read_bytes(), b'{"issue":1,"pr":')
+
     def test_crash_after_push_recovers_leftover_and_opens_one_pr(self):
         source, checkout, base, head = self._published_leftover()
         self.gh.prs.clear()

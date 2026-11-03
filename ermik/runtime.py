@@ -24,6 +24,7 @@ from .github import GitHub, GitHubError
 from .policy import IssueSpec, parse_issue, validate_changed_paths
 from .observability import resource_guard
 from .resources import recover_stale_worktrees
+from .evidence_store import read_evidence, write_evidence
 from .providers import (available_capacity, claim_model, choose_model, model_spec,
                         record_exhaustion, release_model)
 from .recovery import (RecoveryClaim, activate_claim, claim_due, complete_claim,
@@ -74,9 +75,8 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
     prepublication = {"issue": issue, "branch": branch, "head": head,
                       "base": base, "body_sha256": body_sha256,
                       "paths": sorted(paths), "ci": proof, "model": model}
-    path.write_text(json.dumps(prepublication, sort_keys=True, indent=2) + "\n",
-                    encoding="utf-8")
-    path.chmod(0o640 if cfg.draft_pr_evidence_dir else 0o600)
+    write_evidence(path, prepublication,
+                   mode=0o640 if cfg.draft_pr_evidence_dir else 0o600)
     request = {"op": "create_draft", "issue": issue, "branch": branch,
                "head_sha": head, "base_sha": base}
     try:
@@ -944,12 +944,11 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 evidence = (cfg.state_dir / "evidence" / str(row["issue"])
                             / f"{pr['headRefOid']}.json")
                 if evidence.is_file():
-                    proof = json.loads(evidence.read_text(encoding="utf-8"))
+                    proof = read_evidence(evidence)
                 if not evidence.is_file() or proof.get("pr") != pr_number:
                     proof = _rebuild_published_evidence(cfg, row, pr)
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    evidence.write_text(json.dumps(proof, sort_keys=True, indent=2) + "\n",
-                                        encoding="utf-8")
+                    write_evidence(evidence, proof)
                 if (proof.get("issue") != row["issue"] or proof.get("pr") != pr_number
                         or proof.get("branch") != row["branch"]
                         or proof.get("head") != pr["headRefOid"]
@@ -968,8 +967,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                         raise WorkflowError("broker returned a different PR")
                     # _draft_pr writes prepublication evidence for the broker.
                     # Restore the complete record used by subsequent review.
-                    evidence.write_text(json.dumps(proof, sort_keys=True, indent=2) + "\n",
-                                        encoding="utf-8")
+                    write_evidence(evidence, proof)
                 if leftover is not None:
                     _remove_checkout(cfg, leftover)
                 conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,"
@@ -1017,8 +1015,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     evidence = (cfg.state_dir / "evidence" / str(row["issue"])
                                 / f"{proof['head']}.json")
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    evidence.write_text(json.dumps(proof, sort_keys=True, indent=2) + "\n",
-                                        encoding="utf-8")
+                    write_evidence(evidence, proof)
                     if leftover is not None:
                         _remove_checkout(cfg, leftover)
                     conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,"
@@ -1052,7 +1049,8 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
         except (GitHubError, TransientFailure):
             # A transport failure says nothing about remote state. Try again next poll.
             continue
-        except (WorkflowError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        except (WorkflowError, ValueError, TypeError, KeyError,
+                json.JSONDecodeError, OSError):
             pass
         conn.execute("UPDATE jobs SET status='blocked',error='Interrupted run requires inspection',"
                      "updated_at=CURRENT_TIMESTAMP WHERE issue=?", (row["issue"],))
@@ -1247,8 +1245,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                   "model": used_model.ref if used_model else None}
         evidence = cfg.state_dir / "evidence" / str(issue)
         evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (evidence / f"{head}.json").write_text(
-            json.dumps(result, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        write_evidence(evidence / f"{head}.json", result)
         with state.connect(cfg.state_dir) as conn:
             state.event(conn, issue, "pr_published",
                         model=used_model.ref if used_model else None, head_sha=head)
