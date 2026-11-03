@@ -437,9 +437,24 @@ def _check_git_snapshot(cfg: Config, checkout: Path, directory: Path) -> tuple[P
     return snapshot / ".git", git_file
 
 
+def _resolve_image_id(image: str) -> str:
+    """Resolve a local Docker image to the exact image ID used for execution."""
+    image_id = checked(["docker", "image", "inspect", "--format", "{{.Id}}",
+                        image], timeout=20)
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise WorkflowError("Docker image has no valid immutable ID")
+    return image_id
+
+
 def _docker(cfg: Config, checkout: Path, command: tuple[str, ...], *,
             issue_file: Path | None, network: bool, timeout: int,
-            log_path: Path | None = None, selected_model=None) -> dict | None:
+            log_path: Path | None = None, selected_model=None,
+            image_id: str | None = None) -> dict | None:
+    if image_id is None:
+        image_id = _resolve_image_id(cfg.image)
+    elif (not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+          or _resolve_image_id(image_id) != image_id):
+        raise WorkflowError("expected Docker image is unavailable")
     _cleanup_containers(cfg, mark=True)
     namespace = _container_namespace(cfg)
     container_name = f"ermik-{namespace[:12]}-{uuid.uuid4().hex[:16]}"
@@ -477,7 +492,7 @@ def _docker(cfg: Config, checkout: Path, command: tuple[str, ...], *,
             if selected_model:
                 args += ["--env", f"ERMIK_MODEL_REF={selected_model.ref}"]
                 args += ["--env", f"ERMIK_MODEL_SPEC={model_spec(selected_model)}"]
-        args += [cfg.image, *command]
+        args += [image_id, *command]
         try:
             returncode, output = _run_capped(args, timeout)
         except (TransientFailure, WorkflowError):
@@ -497,18 +512,21 @@ def _docker(cfg: Config, checkout: Path, command: tuple[str, ...], *,
     return parse_worker_usage(output) if issue_file else None
 
 
-def local_checks(cfg: Config, checkout: Path) -> dict:
+def local_checks(cfg: Config, checkout: Path, *, image_id: str | None = None) -> dict:
     started = datetime.now(timezone.utc).isoformat()
     sha = git(checkout, "rev-parse", "HEAD")
     base = git(checkout, "merge-base", sha, f"origin/{cfg.base_branch}")
     git(checkout, "diff", "--check", f"{base}...{sha}")
-    image_id = checked(["docker", "image", "inspect", "--format", "{{.Id}}",
-                        cfg.image], timeout=20)
+    if image_id is None:
+        image_id = _resolve_image_id(cfg.image)
+    elif (not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
+          or _resolve_image_id(image_id) != image_id):
+        raise WorkflowError("expected Docker image is unavailable")
     logs = []
     for index, command in enumerate(cfg.checks, start=1):
         log_path = cfg.state_dir / "ci-logs" / sha / f"check-{index}.log"
         _docker(cfg, checkout, command, issue_file=None, network=False,
-                timeout=900, log_path=log_path)
+                timeout=900, log_path=log_path, image_id=image_id)
         logs.append({"command": list(command), "exit_code": 0,
                      "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
                      "log": str(log_path)})
@@ -1119,6 +1137,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                 except WorkflowError as exc:
                     git(checkout, "rebase", "--abort")
                     raise WorkflowError("task branch conflicts with advanced base") from exc
+        image_id = _resolve_image_id(cfg.image)
         used_model = None
         if not rebase_only:
             task = _task_file(cfg, issue, current["body"], correction_note)
@@ -1135,7 +1154,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                             conn.execute("UPDATE jobs SET last_model=?,attempts_count=attempts_count+1 "
                                          "WHERE issue=?", (candidate.ref, issue))
                         usage = _docker(cfg, checkout, cfg.worker_command, issue_file=task,
-                                        network=True, timeout=3600, selected_model=candidate)
+                                        network=True, timeout=3600, selected_model=candidate,
+                                        image_id=image_id)
                         with state.connect(cfg.state_dir) as conn:
                             state.record_usage(conn, lease_id, issue, candidate.provider_id,
                                                candidate.model_id, usage, 0)
@@ -1168,7 +1188,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                     conn.execute("UPDATE jobs SET attempts_count=attempts_count+1 WHERE issue=?",
                                  (issue,))
                 _docker(cfg, checkout, cfg.worker_command, issue_file=task,
-                        network=True, timeout=3600)
+                        network=True, timeout=3600, image_id=image_id)
         if pr_number is None:
             base = git(checkout, "merge-base", "HEAD", f"origin/{cfg.base_branch}")
         if rebase_only and _changed(checkout):
@@ -1187,7 +1207,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         else:
             raise WorkflowError("worker produced no changed files")
         head = git(checkout, "rev-parse", "HEAD")
-        proof = local_checks(cfg, checkout)
+        proof = local_checks(cfg, checkout, image_id=image_id)
         if pr_number is None and cfg.draft_pr_socket is not None:
             validate_evidence_size(_prepublication_record(
                 issue=issue, branch=branch, head=head, base=base, paths=paths,

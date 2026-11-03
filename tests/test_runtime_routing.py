@@ -21,6 +21,7 @@ KIMI = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY")
 GO = ModelCandidate("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY")
 BODY = "## Goal\nChange one file.\n\n## Allowed paths\nfile.txt\n\n## Acceptance\nThe file changes.\n"
 BASE = "a" * 40
+IMAGE_ID = "sha256:" + "b" * 64
 
 
 class StopAttempt(RuntimeError):
@@ -45,6 +46,9 @@ class RoutingTests(unittest.TestCase):
                           "main", (KIMI, GO))
         state.initialize(self.cfg.state_dir)
         self.spec = parse_issue(BODY)
+        resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE_ID)
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -80,6 +84,8 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(forwarded[3].startswith("ERMIK_MODEL_SPEC={"))
         self.assertNotIn("secret-a", args)
         self.assertNotIn("secret-b", args)
+        self.assertIn(IMAGE_ID, args)
+        self.assertNotIn(self.cfg.image, args)
 
     def test_concurrent_attempts_claim_different_accounts(self):
         gate = threading.Barrier(2, timeout=5)
@@ -118,9 +124,11 @@ class RoutingTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(checkout), "commit", "-m", "Baseline"],
                        check=True, capture_output=True)
         selected = []
+        image_ids = []
 
         def fake_docker(cfg, path, command, *, selected_model, **kwargs):
             selected.append(selected_model.ref)
+            image_ids.append(kwargs["image_id"])
             if len(selected) == 1:
                 (path / "file.txt").write_text("partial\n", encoding="utf-8")
                 (path / "extra.txt").write_text("untracked\n", encoding="utf-8")
@@ -136,6 +144,7 @@ class RoutingTests(unittest.TestCase):
             with self.assertRaises(StopAttempt):
                 self._perform(1)
         self.assertEqual(selected, [KIMI.ref, GO.ref])
+        self.assertEqual(image_ids, [IMAGE_ID, IMAGE_ID])
         with state.connect(self.cfg.state_dir) as conn:
             self.assertEqual(choose_model(conn, (KIMI, GO)), GO)
             count = conn.execute("SELECT count(*) FROM provider_leases").fetchone()[0]
