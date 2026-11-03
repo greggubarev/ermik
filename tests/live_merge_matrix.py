@@ -67,9 +67,9 @@ def command(args: list[str], *, cwd: Path | None = None,
     return done.stdout.strip()
 
 
-def gh_json(*args: str) -> dict:
+def gh_read_json(*args: str):
     if not args or args[0] != "api":
-        raise MatrixFailure("gh_json requires a read-only API call")
+        raise MatrixFailure("GitHub read requires an API call")
     for attempt in range(5):
         try:
             raw = command(["gh", *args])
@@ -78,8 +78,18 @@ def gh_json(*args: str) -> dict:
             if attempt == 4:
                 raise
             time.sleep(attempt + 1)
-    value = json.loads(raw)
+    return json.loads(raw)
+
+
+def gh_json(*args: str) -> dict:
+    value = gh_read_json(*args)
     require(isinstance(value, dict), "GitHub response is not an object")
+    return value
+
+
+def gh_json_list(*args: str) -> list:
+    value = gh_read_json(*args)
+    require(isinstance(value, list), "GitHub response is not an array")
     return value
 
 
@@ -444,8 +454,7 @@ def main() -> int:
         command(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30)
         command(["docker", "image", "inspect", args.image], timeout=30)
         command(["git", "--version"])
-        labels = json.loads(command(["gh", "label", "list", "-R", args.repo,
-                                     "--json", "name", "--limit", "1000"]))
+        labels = gh_json_list("api", f"repos/{args.repo}/labels?per_page=100")
         names = {item["name"] for item in labels}
         require({"queue:worker", "state:proposed", "state:ready",
                  "state:in-progress"} <= names, "required labels absent")
