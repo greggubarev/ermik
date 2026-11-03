@@ -59,6 +59,9 @@ def draft(**changes):
 
 class ExactDraftTests(unittest.TestCase):
     def setUp(self):
+        resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "f" * 64)
+        resolver.start()
+        self.addCleanup(resolver.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)

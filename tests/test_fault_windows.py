@@ -105,6 +105,9 @@ class FaultWindowTests(unittest.TestCase):
                           1, 60, (), "main", (), 0)
         self.gh = FaultHub(self.cfg.repo)
         self.spec = runtime.parse_issue(BODY)
+        resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "c" * 64)
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def tearDown(self):
         self.temp.cleanup()

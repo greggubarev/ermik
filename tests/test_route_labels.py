@@ -77,6 +77,9 @@ class CorrectionHub(QueueHub):
 
 class RouteLabelTests(unittest.TestCase):
     def setUp(self):
+        resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "a" * 64)
+        resolver.start()
+        self.addCleanup(resolver.stop)
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.cfg = Config("owner/repo", "owner", root / "state", root / "work",

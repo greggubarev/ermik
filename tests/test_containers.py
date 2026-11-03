@@ -10,6 +10,8 @@ from unittest.mock import patch
 from ermik import runtime
 from ermik.config import Config
 
+IMAGE_ID = "sha256:" + "a" * 64
+
 
 class ContainerCleanupTests(unittest.TestCase):
     def setUp(self):
@@ -20,6 +22,9 @@ class ContainerCleanupTests(unittest.TestCase):
                           (), "main", (), 0)
         (self.cfg.workspace / "source" / ".git").mkdir(parents=True)
         self.namespace = runtime._container_namespace(self.cfg)
+        resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE_ID)
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def tearDown(self):
         runtime._CLEANED_NAMESPACES.discard(self.namespace)
@@ -107,6 +112,8 @@ class ContainerCleanupTests(unittest.TestCase):
                              for arg in command))
         self.assertIn("target=/ci-git,readonly", " ".join(command))
         self.assertIn("GIT_OPTIONAL_LOCKS=0", command)
+        self.assertIn(IMAGE_ID, command)
+        self.assertNotIn(self.cfg.image, command)
         remove.assert_called_once_with(self.cfg, name)
         self.assertEqual(list(self.cfg.state_dir.glob("check-git-*")), [])
 
@@ -151,6 +158,57 @@ class ContainerCleanupTests(unittest.TestCase):
                             network=False, timeout=1)
         self.assertEqual(len(inspected), 1)
         self.assertFalse(inspected[0].exists())
+
+    def test_two_checks_share_one_image_id_in_proof(self):
+        from dataclasses import replace
+
+        checkout = self.cfg.workspace / "job"
+        checkout.mkdir(parents=True)
+        cfg = replace(self.cfg, checks=(("first",), ("second",)))
+        head, base = "b" * 40, "a" * 40
+        launches = []
+
+        def git(_path, *args, **_kwargs):
+            if args[:2] == ("rev-parse", "HEAD"):
+                return head
+            if args[:1] == ("merge-base",):
+                return base
+            return ""
+
+        def run_check(_cfg, _checkout, _command, *, log_path, image_id, **_kwargs):
+            launches.append(image_id)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(b"passed\n")
+
+        with patch.object(runtime, "git", side_effect=git), patch.object(
+                runtime, "_docker", side_effect=run_check):
+            proof = runtime.local_checks(cfg, checkout)
+        self.assertEqual(launches, [IMAGE_ID, IMAGE_ID])
+        self.assertEqual(proof["image_id"], IMAGE_ID)
+
+
+class ImageIdentityTests(unittest.TestCase):
+    def test_resolver_accepts_exact_id_and_rejects_malformed_output(self):
+        with patch.object(runtime, "checked", return_value=IMAGE_ID):
+            self.assertEqual(runtime._resolve_image_id("demo:latest"), IMAGE_ID)
+        for invalid in ("", "sha256:" + "a" * 63, "sha256:" + "A" * 64,
+                        "demo:latest", IMAGE_ID + "\nextra"):
+            with self.subTest(invalid=invalid), patch.object(
+                    runtime, "checked", return_value=invalid):
+                with self.assertRaisesRegex(runtime.WorkflowError, "immutable ID"):
+                    runtime._resolve_image_id("demo:latest")
+
+    def test_unavailable_expected_image_never_launches_container(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg = Config("example/project", "owner", root / "state", root / "work",
+                         "demo:latest", ("true",), (("true",),), 1, 60, (), "main")
+            with patch.object(runtime, "_resolve_image_id", side_effect=runtime.WorkflowError(
+                    "image unavailable")), patch.object(runtime, "_run_capped") as launched:
+                with self.assertRaisesRegex(runtime.WorkflowError, "unavailable"):
+                    runtime._docker(cfg, root, ("true",), issue_file=None,
+                                    network=False, timeout=1, image_id=IMAGE_ID)
+            launched.assert_not_called()
 
 
 if __name__ == "__main__":

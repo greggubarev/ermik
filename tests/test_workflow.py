@@ -97,6 +97,9 @@ class WorkflowTests(unittest.TestCase):
         FakeHub.prs = {}
         FakeHub.notes = {}
         FakeHub.calls = []
+        resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "d" * 64)
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -341,7 +344,9 @@ class WorkflowTests(unittest.TestCase):
                         "baseRefName": "main", "baseRefOid": base,
                         "body": "Closes #1"}
 
-        def write_file(_cfg, checkout, _command, *, issue_file, network, timeout):
+        def write_file(_cfg, checkout, _command, *, issue_file, network, timeout,
+                       image_id):
+            self.assertEqual(image_id, "sha256:" + "d" * 64)
             target = checkout / "src" / "example.py"
             target.parent.mkdir(exist_ok=True)
             target.write_text("value = 1\n" if not target.exists() else "value = 2\n",
