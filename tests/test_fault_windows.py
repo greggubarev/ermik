@@ -34,6 +34,7 @@ class FaultHub:
         self.label_loss = False
         self.comment_loss = False
         self.pr_loss = False
+        self.base_sha = BASE
         self.open_calls = 0
         self.label_calls = 0
 
@@ -86,6 +87,7 @@ class FaultHub:
         self.open_calls += 1
         self.prs[10] = {"number": 10, "state": "OPEN", "headRefName": branch,
                         "headRefOid": self.remote_head, "baseRefName": base,
+                        "baseRefOid": self.base_sha,
                         "isDraft": True, "changedFiles": 1,
                         "files": [{"path": "src/example.py"}], "body": body}
         if self.pr_loss:
@@ -135,6 +137,7 @@ class FaultWindowTests(unittest.TestCase):
         command("-C", str(source), "add", "-A")
         command("-C", str(source), "commit", "-m", "Base")
         base = command("-C", str(source), "rev-parse", "HEAD")
+        self.gh.base_sha = base
         command("-C", str(source), "update-ref", "refs/remotes/origin/main", base)
         checkout = self.cfg.workspace / "jobs" / "issue-1"
         checkout.parent.mkdir()
