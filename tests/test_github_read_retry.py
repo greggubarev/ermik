@@ -67,6 +67,17 @@ class GitHubReadRetryTests(unittest.TestCase):
                 run.assert_called_once()
                 sleep.assert_not_called()
 
+    def test_http_status_overrides_transport_phrase(self):
+        for status in (429, 403, 501):
+            with self.subTest(status=status), patch(
+                    "ermik.github.subprocess.run",
+                    return_value=self.completed(1, stderr=f"gh: HTTP {status}: connection reset")) as run, patch(
+                    "ermik.github.time.sleep") as sleep:
+                with self.assertRaises(GitHubError):
+                    self.github.command(self.read)
+                run.assert_called_once()
+                sleep.assert_not_called()
+
     def test_mutating_commands_never_retry_transient_http_error(self):
         commands = (
             ["api", "--method", "POST", "repos/example/project/issues/42/comments"],

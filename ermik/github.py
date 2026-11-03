@@ -43,14 +43,27 @@ def _read_api_command(args: list[str]) -> bool:
     return method == "GET"
 
 
-_TRANSIENT_GH_ERROR = re.compile(
-    r"\b(?:HTTP(?:/\d(?:\.\d)?)?\s*[: ]\s*5\d\d\b"
-    r"|(?:50[0234]\s+(?:Bad Gateway|Service Unavailable|Gateway Timeout))\b"
-    r"|(?:connection (?:reset|refused|timed out|closed)|context deadline exceeded"
+_GH_HTTP_STATUS = re.compile(
+    r"\bHTTP(?:/\d(?:\.\d)?)?\s*[: ]\s*(\d{3})\b", re.IGNORECASE,
+)
+_GH_SERVER_ERROR = re.compile(
+    r"\b(?:500\s+Internal Server Error|502\s+Bad Gateway"
+    r"|503\s+Service Unavailable|504\s+Gateway Timeout)\b", re.IGNORECASE,
+)
+_GH_TRANSPORT_ERROR = re.compile(
+    r"\b(?:connection (?:reset|refused|timed out|closed)|context deadline exceeded"
     r"|TLS handshake timeout|temporary failure in name resolution|no such host"
-    r"|network is unreachable|i/o timeout|unexpected EOF)\b)",
+    r"|network is unreachable|i/o timeout|unexpected EOF)\b",
     re.IGNORECASE,
 )
+
+
+def _retryable_gh_error(stderr: str) -> bool:
+    """An HTTP response takes precedence over transport text in the same error."""
+    statuses = _GH_HTTP_STATUS.findall(stderr)
+    if statuses:
+        return all(int(status) in (500, 502, 503, 504) for status in statuses)
+    return bool(_GH_SERVER_ERROR.search(stderr) or _GH_TRANSPORT_ERROR.search(stderr))
 
 
 class GitHub:
@@ -313,7 +326,7 @@ class GitHub:
             if result.returncode:
                 # Inspect stderr only for retry classification; never expose it.
                 if (attempt + 1 < attempts and
-                        _TRANSIENT_GH_ERROR.search(result.stderr or "")):
+                        _retryable_gh_error(result.stderr or "")):
                     time.sleep(0.25 * (2 ** attempt))
                     continue
                 raise GitHubError(f"GitHub command failed (exit {result.returncode})")
