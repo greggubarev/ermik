@@ -6,13 +6,13 @@ The controller keeps task artifacts in its private `state_dir` and `workspace`. 
 python3 -m ermik --config config.json storage
 ```
 
-The JSON inventory reports byte and age totals for controller-owned task worktrees, check logs, and publication evidence. It also reports whether their total crosses `artifact_warn_mb`. The default warning threshold is 1024 MiB; set `"artifact_warn_mb": 0` to disable the warning. `"retention_days": 30` is the default minimum age for cleanup. Both are optional settings in `config.json`. The warning is an observation, not a reason to delete an active artifact. The existing `min_free_gb` guard still refuses to claim new work when free space is too low.
+The JSON inventory reports byte and age totals for controller-owned task worktrees, check logs, and publication evidence. It also reports whether their total crosses `artifact_warn_mb`. The default warning threshold is 1024 MiB; set `"artifact_warn_mb": 0` to disable the warning. `"retention_days": 30` is the default minimum age for cleanup. Both are optional settings in `config.json`. The warning is an observation, not a reason to delete an active artifact. The `min_free_gb` guard refuses to claim new work when checked storage is too low. If `state_dir` and `workspace` are on separate filesystems, monitor free space on both.
 
 ## Preview and apply cleanup
 
 The inventory command above is read-only and can run while polling is active. Before either cleanup preview or application, stop only this installation's poll service; cleanup takes the exclusive state lock. Review the result, then restart that service.
 
-Preview the eligible set before removing anything:
+Preview the eligible set before removing anything. This step is recommended; the command does not require a prior preview before `--apply`:
 
 ```sh
 python3 -m ermik --config config.json storage --cleanup
