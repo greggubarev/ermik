@@ -121,10 +121,12 @@ class RetentionTests(unittest.TestCase):
             artifacts["log"] = path
         if evidence:
             path = self.state_dir / "evidence" / str(issue) / f"{head}.json"
-            path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.parent.chmod(0o700)
             path.write_text(json.dumps({"issue": issue, "pr": pr,
                                         "head": head, "branch": branch,
                                         "base": "a" * 40}), encoding="utf-8")
+            path.chmod(0o600)
             self.age(path, age)
             self.age(path.parent, age)
             artifacts["evidence"] = path
@@ -301,11 +303,22 @@ class RetentionTests(unittest.TestCase):
         self.assertTrue(mismatch["evidence"].exists())
         self.assertFalse(any(item["kind"] == "evidence" for item in result["removed"]))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX file modes only")
+    def test_world_readable_evidence_in_public_parent_remains(self):
+        paths = self.job(1, pr=101, evidence=True)
+        paths["evidence"].parent.chmod(0o755)
+        paths["evidence"].chmod(0o644)
+        result = cleanup(self.cfg, gh=self.hub, dry_run=False,
+                         max_bytes=1 << 30, now=NOW)
+        self.assertTrue(paths["evidence"].exists())
+        self.assertFalse(any(item["kind"] == "evidence" for item in result["removed"]))
+
     def test_incomplete_or_uncertain_local_merge_preserves_artifacts(self):
         paths = self.job(1, pr=101, log=True, evidence=True)
         head = self.git("rev-parse", "HEAD", cwd=paths["worktree"])
         record_path = self.state_dir / "reviews" / "pr-101.json"
-        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        record_path.parent.chmod(0o700)
         identity = {"repo": self.cfg.repo, "pr": 101, "issue": 1,
                     "head": head, "base": "a" * 40,
                     "branch": "work/issue-1-delivery"}
