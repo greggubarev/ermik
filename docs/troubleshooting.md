@@ -8,6 +8,7 @@ First identify the issue number, saved base and HEAD SHAs, branch, PR, and last 
 | Missing `Goal`, `Allowed paths`, or `Acceptance`, or no maintainer admission comment | Correct the body and rerun `admit` under the configured maintainer account. Keep `state:proposed` until readmission. |
 | Two processes claim an issue or overlapping files | Pause new claims and inspect saved reservations and comments. Use one dispatcher without a shared lock. |
 | GitHub response lost after a label, comment, or publication write | Read remote state and exact SHAs and PR. Retry only when the previous result is proven absent. A timeout must not create a second PR. |
+| GitHub read request returns a transient server or transport error | Read-only REST calls make at most three short attempts, then stop. A rate-limit response does not trigger rapid retries; wait for the limit to reset before trying again. GitHub writes are never retried by this mechanism. |
 | Network or provider failure before claim | Pause the queue and retry reads within limits. Do not block an arbitrary issue for a general outage. |
 | Insufficient space, test environment, or access | Stop new execution and record the needed resource and actual state. Do not remove another checkout or substitute a test environment. |
 | Check failure | Preserve the command, environment, and failure. Fix within issue scope and repeat affected checks. Do not call an unverified result passing. |
