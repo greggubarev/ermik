@@ -146,13 +146,22 @@ def guarded_repeat(cfg, number: int) -> dict:
 
 
 def killed_merge(config: Path, number: int, boundary: str) -> None:
-    done = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child",
-                           boundary, "--repo", load_config(config).repo,
-                           "--config", str(config), "--pr", str(number)],
-                          cwd=ROOT, text=True, capture_output=True, timeout=1200,
-                          check=False)
-    require(done.returncode == -signal.SIGKILL,
-            f"fault boundary {boundary} was not reached")
+    cfg = load_config(config)
+    for attempt in range(3):
+        done = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child",
+                               boundary, "--repo", cfg.repo,
+                               "--config", str(config), "--pr", str(number)],
+                              cwd=ROOT, text=True, capture_output=True, timeout=1200,
+                              check=False)
+        if done.returncode == -signal.SIGKILL:
+            return
+        # Only an unattempted, still-open PR can be retried after a read or
+        # draft-ready failure. Never reissue a possibly sent merge request.
+        if (result_record(cfg, number).get("merge_attempt") is not None
+                or pr_remote(cfg.repo, number).get("state") != "open"):
+            break
+        time.sleep(attempt + 1)
+    require(False, f"fault boundary {boundary} was not reached")
 
 
 def child(boundary: str, config: Path, number: int) -> None:
