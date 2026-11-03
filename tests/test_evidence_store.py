@@ -77,6 +77,27 @@ class EvidenceStoreTests(unittest.TestCase):
             write_evidence(self.path, {"x": 1})
 
     @unittest.skipUnless(os.name == "posix", "POSIX permissions")
+    def test_read_and_replace_legacy_0644_in_private_directory(self):
+        self.root.chmod(0o700)
+        self.path.write_text('{"legacy": true}\n', encoding="utf-8")
+        self.path.chmod(0o644)
+        self.assertEqual(read_evidence(self.path), {"legacy": True})
+        write_evidence(self.path, {"legacy": False})
+        self.assertEqual(read_evidence(self.path), {"legacy": False})
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permissions")
+    def test_reject_legacy_0644_in_group_accessible_directory(self):
+        self.root.chmod(0o750)
+        self.path.write_text('{"legacy": true}\n', encoding="utf-8")
+        self.path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            read_evidence(self.path)
+        with self.assertRaises(ValueError):
+            write_evidence(self.path, {"legacy": False})
+        self.assertEqual(self.path.read_text(encoding="utf-8"), '{"legacy": true}\n')
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permissions")
     def test_reject_unsafe_parent_directory(self):
         self.root.chmod(0o777)
         with self.assertRaises(ValueError):

@@ -13,6 +13,18 @@ import tempfile
 MAX_EVIDENCE_BYTES = 1024 * 1024
 
 
+def _check_existing_file(info: os.stat_result, parent: os.stat_result) -> None:
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("evidence path must be a regular file")
+    if os.name != "posix":
+        return
+    permissions = stat.S_IMODE(info.st_mode)
+    legacy_private = permissions == 0o644 and not parent.st_mode & 0o077
+    if (info.st_uid != os.geteuid() or info.st_nlink != 1
+            or (permissions not in (0o600, 0o640) and not legacy_private)):
+        raise ValueError("evidence file has unsafe ownership or permissions")
+
+
 def _check_path(path: Path) -> None:
     """Reject links and existing files that are unsuitable for evidence."""
     parent = path.parent.lstat()
@@ -24,10 +36,7 @@ def _check_path(path: Path) -> None:
         info = path.lstat()
     except FileNotFoundError:
         return
-    if not stat.S_ISREG(info.st_mode):
-        raise ValueError("evidence path must be a regular file")
-    if os.name == "posix" and (info.st_uid != os.geteuid() or info.st_mode & 0o137):
-        raise ValueError("evidence file has unsafe ownership or permissions")
+    _check_existing_file(info, parent)
 
 
 def _unique_pairs(pairs: list[tuple[str, object]]) -> dict:
@@ -117,10 +126,7 @@ def read_evidence(path: Path) -> dict:
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError("evidence path must be a regular file")
-        if os.name == "posix" and (info.st_uid != os.geteuid() or info.st_mode & 0o137):
-            raise ValueError("evidence file has unsafe ownership or permissions")
+        _check_existing_file(info, path.parent.lstat())
         if info.st_size > MAX_EVIDENCE_BYTES:
             raise ValueError("evidence is too large")
         with os.fdopen(fd, "rb") as stream:
