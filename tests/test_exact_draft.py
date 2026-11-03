@@ -5,13 +5,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ermik import runtime
+from ermik import runtime, state
 from ermik.config import Config
 
 
 BASE = "a" * 40
 HEAD = "b" * 40
 BRANCH = "work/issue-7-delivery"
+IMAGE = "sha256:" + "f" * 64
 BODY = "## Allowed paths\nsrc/a.py\n\n## Goal\nFix a\n\n## Acceptance\nWorks\n"
 
 
@@ -53,7 +54,7 @@ def draft(**changes):
     return {"number": 19, "state": "OPEN", "isDraft": True,
             "headRefName": BRANCH, "headRefOid": HEAD,
             "baseRefName": "main", "baseRefOid": BASE,
-            "body": "Closes #7\n\nLocal checks passed.",
+            "body": f"Closes #7\n\nExecution image: `{IMAGE}`\nLocal checks passed.",
             "changedFiles": 1, "files": [{"path": "src/a.py"}], **changes}
 
 
@@ -70,6 +71,9 @@ class ExactDraftTests(unittest.TestCase):
         self.spec = runtime.parse_issue(BODY)
         self.checkout = root / "work" / "jobs" / "issue-7"
         self.checkout.mkdir(parents=True)
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(?,?,?,?,?)", (7, BRANCH, BASE, "running", '["src/a.py"]'))
 
     def perform(self, hub):
         def git(_path, *args, **_kwargs):
@@ -87,7 +91,7 @@ class ExactDraftTests(unittest.TestCase):
                 runtime, "_docker"), patch.object(
                 runtime, "_check_scope", return_value=["src/a.py"]), patch.object(
                 runtime, "git", side_effect=git), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}), patch.object(
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}), patch.object(
                 runtime, "main_sha", return_value=BASE), patch.object(
                 runtime, "_approved_on_github", return_value=True):
             return runtime._perform(self.cfg, 7, BRANCH, self.spec,

@@ -46,6 +46,11 @@ class RoutingTests(unittest.TestCase):
                           "main", (KIMI, GO))
         state.initialize(self.cfg.state_dir)
         self.spec = parse_issue(BODY)
+        with state.connect(self.cfg.state_dir) as conn:
+            for issue in (1, 2):
+                conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                             "VALUES(?,?,?,'running',?)",
+                             (issue, f"work/issue-{issue}", BASE, '["file.txt"]'))
         resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE_ID)
         resolver.start()
         self.addCleanup(resolver.stop)
@@ -112,6 +117,9 @@ class RoutingTests(unittest.TestCase):
                     with self.assertRaises(StopAttempt):
                         future.result(timeout=10)
         self.assertCountEqual(selected, [KIMI.ref, GO.ref])
+        with state.connect(self.cfg.state_dir) as conn:
+            self.assertEqual([state.job(conn, issue)["image_id"] for issue in (1, 2)],
+                             [IMAGE_ID, IMAGE_ID])
 
     def test_quota_falls_back_after_resetting_partial_edit(self):
         checkout = self.cfg.workspace / "repo"

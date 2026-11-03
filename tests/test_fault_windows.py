@@ -23,6 +23,8 @@ The file contains a greeting.
 BASE = "a" * 40
 HEAD = "b" * 40
 BRANCH = "work/issue-1-delivery"
+IMAGE = "sha256:" + "c" * 64
+PR_BODY = f"Closes #1\n\nExecution image: `{IMAGE}`"
 
 
 class FaultHub:
@@ -105,7 +107,7 @@ class FaultWindowTests(unittest.TestCase):
                           1, 60, (), "main", (), 0)
         self.gh = FaultHub(self.cfg.repo)
         self.spec = runtime.parse_issue(BODY)
-        resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "c" * 64)
+        resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE)
         resolver.start()
         self.addCleanup(resolver.stop)
 
@@ -152,13 +154,13 @@ class FaultWindowTests(unittest.TestCase):
         self._approved()
         self.gh.names = {"queue:worker", "state:in-progress"}
         self.gh.remote_head = head
-        self.gh.open_pr(BRANCH, "Closes #1", "Example", "main")
+        self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
-                         "VALUES(?,?,?,'running',?)",
-                         (1, BRANCH, base, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id) "
+                         "VALUES(?,?,?,'running',?,?)",
+                         (1, BRANCH, base, '["src/example.py"]', IMAGE))
         return source, checkout, base, head
 
     def test_admission_comment_response_loss_is_idempotent_on_retry(self):
@@ -203,6 +205,10 @@ class FaultWindowTests(unittest.TestCase):
         self.gh.pr_loss = lose_pr
         checkout = self.cfg.workspace / "jobs" / "issue-1"
         checkout.mkdir(parents=True)
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(?,?,?,'running',?)",
+                         (1, BRANCH, BASE, '["src/example.py"]'))
 
         def git(_path, *args, **_kwargs):
             if args[:2] == ("merge-base", "HEAD"):
@@ -225,7 +231,7 @@ class FaultWindowTests(unittest.TestCase):
                 runtime, "_docker"), patch.object(
                 runtime, "_check_scope", return_value=["src/example.py"]), patch.object(
                 runtime, "git", side_effect=git), patch.object(
-                runtime, "local_checks", return_value=proof or {"result": "passed"}), patch.object(
+                runtime, "local_checks", return_value=proof or {"result": "passed", "image_id": IMAGE}), patch.object(
                 runtime, "main_sha", return_value=BASE):
             return runtime._perform(self.cfg, 1, BRANCH, self.spec,
                                     correction_note=None, pr_number=None,
@@ -253,7 +259,8 @@ class FaultWindowTests(unittest.TestCase):
 
     def test_oversized_broker_evidence_blocks_before_branch_push(self):
         self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
-        proof = {"result": "passed", "checks": [{"command": ["x" * 65536]}]}
+        proof = {"result": "passed", "image_id": IMAGE,
+                 "checks": [{"command": ["x" * 65536]}]}
         with self.assertRaisesRegex(ValueError, "evidence is too large"):
             self._perform_with_fake_git(proof=proof)
         self.assertIsNone(self.gh.remote_head)
@@ -264,7 +271,8 @@ class FaultWindowTests(unittest.TestCase):
         self.gh.names = {"queue:worker", "state:in-progress"}
         self.gh.remote_head = HEAD
         row = {"issue": 1, "branch": BRANCH, "status": "running",
-               "pr": None, "base_sha": BASE, "last_model": "kimi"}
+               "pr": None, "base_sha": BASE, "last_model": "kimi",
+               "image_id": IMAGE}
 
         def fake_git(_path, *args, **_kwargs):
             if args[:2] == ("rev-parse", f"refs/heads/{BRANCH}"):
@@ -281,7 +289,7 @@ class FaultWindowTests(unittest.TestCase):
         with patch.object(runtime, "mirror", return_value=self.cfg.workspace), patch.object(
                 runtime, "git", side_effect=fake_git), patch.object(
                 runtime, "_remove_checkout"), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}), patch.object(
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}), patch.object(
                 runtime, "main_sha", return_value=BASE):
             result = runtime._recover_unacknowledged_push(
                 self.gh, self.cfg, row, self.gh.issue(1), self.spec, remote)
@@ -306,12 +314,12 @@ class FaultWindowTests(unittest.TestCase):
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
-                         "VALUES(?,?,?,'retry_wait',?)",
-                         (1, BRANCH, BASE, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id) "
+                         "VALUES(?,?,?,'retry_wait',?,?)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
-                 "ci": {"result": "passed"}, "model": "kimi"}
+                 "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
         (self.cfg.workspace / "source").mkdir(parents=True)
         with patch.object(self.gh, "find_branch_pr", return_value=None), patch.object(
                 runtime, "checked", return_value=f"{HEAD}\trefs/heads/{BRANCH}"), patch.object(
@@ -330,16 +338,16 @@ class FaultWindowTests(unittest.TestCase):
         self._approved()
         self.gh.names = {"queue:worker", "state:in-progress"}
         self.gh.remote_head = HEAD
-        self.gh.open_pr(BRANCH, "Closes #1", "Example", "main")
+        self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
-                 "ci": {"result": "passed"}, "model": "kimi"}
+                 "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
-                         "VALUES(?,?,?,'running',?)",
-                         (1, BRANCH, BASE, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id) "
+                         "VALUES(?,?,?,'running',?,?)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
             with patch.object(runtime, "_rebuild_published_evidence", return_value=proof), \
                     patch.object(runtime, "_draft_pr", side_effect=runtime.GitHubError(
                         "broker refused")) as broker:
@@ -355,16 +363,16 @@ class FaultWindowTests(unittest.TestCase):
         self._approved()
         self.gh.names = {"queue:worker", "state:in-progress"}
         self.gh.remote_head = HEAD
-        self.gh.open_pr(BRANCH, "Closes #1", "Example", "main")
+        self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
-                 "ci": {"result": "passed"}, "model": "kimi"}
+                 "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
-                         "VALUES(?,?,?,'running',?)",
-                         (1, BRANCH, BASE, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id) "
+                         "VALUES(?,?,?,'running',?,?)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
             with patch.object(runtime, "_rebuild_published_evidence", return_value=proof), \
                     patch.object(runtime, "_draft_pr", return_value=10) as broker:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
@@ -376,7 +384,7 @@ class FaultWindowTests(unittest.TestCase):
     def test_crash_leftover_clean_exact_head_recovers_with_fresh_checks(self):
         source, checkout, base, head = self._published_leftover()
         with patch.object(runtime, "mirror", return_value=source), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}) as checks:
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks:
             with state.connect(self.cfg.state_dir) as conn:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
                 row = state.job(conn, 1)
@@ -411,7 +419,7 @@ class FaultWindowTests(unittest.TestCase):
         with patch.object(runtime, "mirror", return_value=source), patch.object(
                 runtime, "checked", side_effect=checked), patch.object(
                 runtime, "main_sha", return_value=base), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}) as checks:
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks:
             with state.connect(self.cfg.state_dir) as conn:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
                 row = state.job(conn, 1)
@@ -463,7 +471,7 @@ class FaultWindowTests(unittest.TestCase):
         source, checkout, _base, _head = self._published_leftover()
         self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
         with patch.object(runtime, "mirror", return_value=source), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}) as checks, \
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks, \
                 patch.object(runtime, "_draft_pr", side_effect=runtime.GitHubError(
                     "broker refused")) as broker:
             with state.connect(self.cfg.state_dir) as conn:

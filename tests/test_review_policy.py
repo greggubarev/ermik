@@ -27,6 +27,7 @@ class Hub:
         self.head = HEAD
         self.writes = []
         self.on_ready = None
+        self.body = f"Closes #7\n\nExecution image: `{IMAGE}`"
 
     def identity(self):
         return "maintainer"
@@ -42,7 +43,7 @@ class Hub:
                 "baseRefName": "main", "baseRefOid": BASE,
                 "headRefName": "work/issue-7-delivery", "headRefOid": self.head,
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
-                "body": "Closes #7",
+                "body": self.body,
                 "mergeCommit": {"oid": MERGED} if self.pr_state == "MERGED" else None}
 
     def validate_pr_identity(self, *_args, **_kwargs):
@@ -139,6 +140,54 @@ class ReviewPolicyTests(unittest.TestCase):
         self.assertEqual([write[1] for write in self.gh.writes],
                          ["ready", "merge"])
         self.assertEqual(self.local_calls[-1], {"image_id": IMAGE})
+
+    def test_published_image_mismatch_blocks_review_before_checks(self):
+        self.image = OTHER_IMAGE
+        with self.assertRaisesRegex(runtime.WorkflowError, "published execution image"):
+            self._review()
+        self.assertEqual(self.local_calls, [])
+
+    def test_missing_published_image_blocks_review(self):
+        original = self.gh.pr
+        self.gh.pr = lambda number: {**original(number), "body": "Closes #7"}
+        with self.assertRaisesRegex(runtime.WorkflowError, "execution image ID"):
+            self._review()
+        self.assertEqual(self.local_calls, [])
+
+    def test_second_malformed_image_declaration_blocks_review(self):
+        self.gh.body += "\nExecution image: `demo:latest`"
+        with self.assertRaisesRegex(runtime.WorkflowError, "execution image ID"):
+            self._review()
+        self.assertEqual(self.local_calls, [])
+
+    def test_body_change_during_checks_blocks_review_record(self):
+        checks = self._local_checks
+
+        def change_body(*args, **kwargs):
+            proof = checks(*args, **kwargs)
+            self.gh.body = f"Closes #7\n\nExecution image: `{OTHER_IMAGE}`"
+            return proof
+
+        with patch.object(review, "local_checks", side_effect=change_body):
+            with self.assertRaisesRegex(runtime.WorkflowError, "during local review"):
+                self._review()
+        self.assertFalse((self.cfg.state_dir / "reviews" / "pr-19.json").exists())
+
+    def test_body_change_at_final_premerge_fetch_blocks_merge(self):
+        self._review()
+        original = self.gh.pr
+        count = [0]
+
+        def changed_on_final_fetch(number):
+            count[0] += 1
+            if count[0] == 4:
+                self.gh.body = f"Closes #7\n\nExecution image: `{OTHER_IMAGE}`"
+            return original(number)
+
+        self.gh.pr = changed_on_final_fetch
+        with self.assertRaisesRegex(runtime.WorkflowError, "before merge"):
+            self._merge()
+        self.assertEqual([write[1] for write in self.gh.writes], ["ready"])
 
     def test_added_removed_and_reordered_checks_invalidate_review(self):
         self._review()

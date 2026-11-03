@@ -25,6 +25,7 @@ src/example.py
 The example is updated.
 """
 BRANCH = "work/issue-1-delivery"
+IMAGE = "sha256:" + "e" * 64
 
 
 def command(*args):
@@ -79,6 +80,11 @@ class BaseAdvanceTests(unittest.TestCase):
     def perform(self, *, mutate_remote=False, rebase_only=False, bad_files=False,
                 no_edit=False):
         outer = self
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,head_sha,pr,status,"
+                         "allowed_json,image_id) VALUES(?,?,?,?,?,?,?,?)",
+                         (1, BRANCH, self.base, self.head, 10, "awaiting_review",
+                          '["src/example.py"]', IMAGE))
 
         class Hub:
             def __init__(self, repo):
@@ -95,6 +101,7 @@ class BaseAdvanceTests(unittest.TestCase):
                         "baseRefName": "main",
                         "changedFiles": 1,
                         "files": [{"path": "src/other.py" if bad_files else "src/example.py"}],
+                        "body": f"Closes #1\n\nExecution image: `{IMAGE}`",
                         "headRepository": {"nameWithOwner": "owner/repo"}}
 
             validate_pr_identity = GitHub.validate_pr_identity
@@ -116,7 +123,7 @@ class BaseAdvanceTests(unittest.TestCase):
                 runtime, "main_sha", side_effect=lambda gh, cfg: command(
                     "git", "--git-dir", str(self.remote), "rev-parse", "refs/heads/main")), patch.object(
                 runtime, "_docker", side_effect=worker) as docker_run, patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}) as checks, patch.object(
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks, patch.object(
                 runtime, "_approved_on_github", return_value=True):
             result = runtime._perform(self.cfg, 1, BRANCH, runtime.parse_issue(BODY),
                                       correction_note=("SEMI_REBASE_ONLY" if rebase_only else "Improve it"),

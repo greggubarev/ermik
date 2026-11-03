@@ -14,7 +14,7 @@ from .github import GitHub, GitHubError
 from .git_tree import verify_changed_tree
 from .policy import parse_issue, validate_changed_paths
 from .runtime import (WorkflowError, _approved_on_github, git, local_checks,
-                      mirror, main_sha, _resolve_image_id)
+                      mirror, main_sha, _resolve_image_id, published_image_id)
 from . import state
 
 
@@ -130,6 +130,9 @@ def _review_locked(cfg: Config, number: int) -> dict:
     if pr["baseRefOid"] != main_sha(gh, cfg):
         raise WorkflowError("PR base is not current base branch")
     spec = parse_issue(issue["body"])
+    image_id = published_image_id(pr.get("body") or "")
+    if _resolve_image_id(cfg.image) != image_id:
+        raise WorkflowError("published execution image differs from configured image")
     checkout = _checkout_pr(cfg, number, pr)
     try:
         if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
@@ -141,17 +144,18 @@ def _review_locked(cfg: Config, number: int) -> dict:
         if actual != published:
             raise WorkflowError("published and fetched PR diffs differ")
         validate_changed_paths(actual, spec.allowed_paths)
-        proof = local_checks(cfg, checkout)
-        image_id = proof.get("image_id") if isinstance(proof, dict) else None
-        if (not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id)
-                or _resolve_image_id(cfg.image) != image_id):
-            raise WorkflowError("review checks did not use the configured image")
+        proof = local_checks(cfg, checkout, image_id=image_id)
+        actual_image = proof.get("image_id") if isinstance(proof, dict) else None
+        if actual_image != image_id:
+            raise WorkflowError("review checks did not use the published execution image")
     finally:
         if checkout.exists():
             git(cfg.workspace / "source", "worktree", "remove", str(checkout))
     current = gh.pr(number)
     if current["headRefOid"] != pr["headRefOid"] or current["baseRefOid"] != pr["baseRefOid"]:
         raise WorkflowError("PR changed during local review")
+    if published_image_id(current.get("body") or "") != image_id:
+        raise WorkflowError("published execution image changed during local review")
     _, _, current_issue = _identity(cfg, gh, number)
     if parse_issue(current_issue["body"]).body_sha256 != spec.body_sha256:
         raise WorkflowError("issue changed during local review")
@@ -300,6 +304,8 @@ def _merge_locked(cfg: Config, number: int) -> dict:
             or record.get("head_repository") != (cfg.publish_repo or cfg.repo)
             or not isinstance(record.get("branch"), str)):
         raise WorkflowError("reviewed PR identity is missing")
+    if published_image_id(pr.get("body") or "") != record.get("image_id"):
+        raise WorkflowError("published execution image changed since review")
     if pr["state"] == "OPEN":
         if record.get("merge_attempt") is not None:
             if record["merge_attempt"] != {"head": record["head"],
@@ -327,10 +333,14 @@ def _merge_locked(cfg: Config, number: int) -> dict:
                comment.get("user", {}).get("login") == cfg.maintainer
                for comment in gh.comments(number)):
             raise WorkflowError("PR has a pending exact-head correction request")
-        _review_policy(cfg, record, check_reference=True)
+        if published_image_id(pr.get("body") or "") != _review_policy(
+                cfg, record, check_reference=True):
+            raise WorkflowError("published execution image changed since review")
         if pr["isDraft"]:
             gh.command(["pr", "ready", str(number), "-R", cfg.repo])
             pr = gh.pr(number)
+            if published_image_id(pr.get("body") or "") != record["image_id"]:
+                raise WorkflowError("published execution image changed while making PR ready")
             if pr["isDraft"]:
                 raise WorkflowError("PR did not become ready")
         gh.validate_pr_identity(pr, branch=record["branch"],
@@ -339,9 +349,11 @@ def _merge_locked(cfg: Config, number: int) -> dict:
                                 state="OPEN")
         if main_sha(gh, cfg) != record["base"]:
             raise WorkflowError("base branch moved since review")
-        _, _, current_issue = _identity(cfg, gh, number)
+        current_pr, _, current_issue = _identity(cfg, gh, number)
         if parse_issue(current_issue["body"]).body_sha256 != record["body_sha256"]:
             raise WorkflowError("issue changed before merge")
+        if published_image_id(current_pr.get("body") or "") != record["image_id"]:
+            raise WorkflowError("published execution image changed before merge")
         _review_policy(cfg, record, check_reference=True)
         record["merge_attempt"] = {"head": record["head"],
                                    "base": record["base"],

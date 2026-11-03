@@ -42,6 +42,16 @@ _CLEANED_NAMESPACES: set[str] = set()
 _CONTAINER_LOCK = threading.Lock()
 _PUBLISH_HELPER_LOCK = threading.Lock()
 _MIRROR_LOCK = threading.RLock()
+_PUBLISHED_IMAGE = re.compile(r"Execution image: `(sha256:[0-9a-f]{64})`\Z")
+
+
+def published_image_id(body: str) -> str:
+    if not isinstance(body, str):
+        raise WorkflowError("PR lacks one valid execution image ID")
+    lines = [line for line in body.splitlines() if line.startswith("Execution image:")]
+    if len(lines) != 1 or (match := _PUBLISHED_IMAGE.fullmatch(lines[0])) is None:
+        raise WorkflowError("PR lacks one valid execution image ID")
+    return match.group(1)
 
 
 def _prepublication_record(*, issue: int, branch: str, head: str, base: str,
@@ -57,7 +67,11 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
               model: str | None, body_sha256: str, title: str) -> int:
     """Publish only a checked commit; the broker validates remote identity again."""
     if cfg.draft_pr_socket is None:
+        image_id = proof.get("image_id")
+        if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+            raise WorkflowError("draft evidence lacks a valid execution image ID")
         body = (f"Closes #{issue}\n\nAllowed paths: {', '.join(paths)}\n"
+                f"Execution image: `{image_id}`\n"
                 f"Local checks passed on `{head}`.\nReview the full diff and acceptance criteria.")
         return gh.open_pr(branch, body, title, cfg.base_branch)
     root = cfg.draft_pr_evidence_dir or cfg.state_dir / "evidence"
@@ -801,6 +815,8 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
 
 def _rebuild_published_evidence(cfg: Config, row, pr: dict) -> dict:
     """Rerun checks on an exact local commit after an acknowledged PR write was lost."""
+    if not row["image_id"] or published_image_id(pr.get("body") or "") != row["image_id"]:
+        raise WorkflowError("published PR image differs from recorded execution image")
     if (not pr.get("isDraft") or pr.get("changedFiles") != len(pr.get("files", []))
             or not pr["files"] or pr["changedFiles"] > 100
             or re.findall(r"(?im)\bCloses\s+#(\d+)\b", pr.get("body") or "") !=
@@ -824,7 +840,9 @@ def _rebuild_published_evidence(cfg: Config, row, pr: dict) -> dict:
                          base + "...HEAD").splitlines())
         if actual != set(paths):
             raise WorkflowError("published PR paths differ from local commit")
-        proof = local_checks(cfg, checkout)
+        if not row["image_id"]:
+            raise WorkflowError("interrupted job has no recorded image ID")
+        proof = local_checks(cfg, checkout, image_id=row["image_id"])
     finally:
         if checkout.exists():
             _remove_checkout(cfg, checkout)
@@ -862,7 +880,9 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
             if target.is_symlink() or any(parent.is_symlink() for parent in target.parents
                                           if parent != checkout and checkout in parent.parents):
                 raise WorkflowError("orphan branch contains a symlink")
-        proof = local_checks(cfg, checkout)
+        if not row["image_id"]:
+            raise WorkflowError("interrupted job has no recorded image ID")
+        proof = local_checks(cfg, checkout, image_id=row["image_id"])
     finally:
         if checkout.exists():
             _remove_checkout(cfg, checkout)
@@ -896,6 +916,8 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
     if (not pr["isDraft"] or sorted(file["path"] for file in pr["files"]) != paths
             or pr["changedFiles"] != len(paths)):
         raise WorkflowError("orphan branch PR differs from checked commit")
+    if published_image_id(pr.get("body") or "") != row["image_id"]:
+        raise WorkflowError("orphan branch PR image differs from recorded execution image")
     return {"issue": row["issue"], "pr": number, "branch": row["branch"],
             "head": head, "base": row["base_sha"], "paths": paths,
             "ci": proof, "model": row["last_model"]}
@@ -980,8 +1002,12 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 if (proof.get("issue") != row["issue"] or proof.get("pr") != pr_number
                         or proof.get("branch") != row["branch"]
                         or proof.get("head") != pr["headRefOid"]
-                        or proof.get("ci", {}).get("result") != "passed"):
+                        or proof.get("ci", {}).get("result") != "passed"
+                        or not row["image_id"]
+                        or proof.get("ci", {}).get("image_id") != row["image_id"]):
                     raise WorkflowError("published branch lacks matching evidence")
+                if published_image_id(pr.get("body") or "") != row["image_id"]:
+                    raise WorkflowError("published PR image differs from recorded execution image")
                 if cfg.draft_pr_socket is not None and row["pr"] is None:
                     # A lost PR response must pass the same broker gate as a new PR.
                     # The broker rechecks the live upstream, fork, scope, and evidence.
@@ -1120,6 +1146,11 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         original = gh.pr(pr_number)
         _require_pr(gh, original, cfg, branch=branch, number=pr_number,
                     head_sha=expected_head)
+        with state.connect(cfg.state_dir) as conn:
+            prior = state.job(conn, issue)
+        if prior is None or not prior["image_id"] or published_image_id(
+                original.get("body") or "") != prior["image_id"]:
+            raise WorkflowError("correction PR image differs from recorded execution image")
     base = main_sha(gh, cfg) if pr_number is not None else expected_base
     checkout = _checkout(cfg, issue, branch, correction=pr_number is not None)
     pushed = False
@@ -1137,7 +1168,17 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                 except WorkflowError as exc:
                     git(checkout, "rebase", "--abort")
                     raise WorkflowError("task branch conflicts with advanced base") from exc
-        image_id = _resolve_image_id(cfg.image)
+        with state.connect(cfg.state_dir) as conn:
+            job = state.job(conn, issue)
+            if job is None:
+                raise WorkflowError("task has no durable job record")
+            image_id = job["image_id"]
+            if image_id is None:
+                if job["attempts_count"] != 0 or pr_number is not None:
+                    raise WorkflowError("previous attempt has no recorded image ID")
+                image_id = state.bind_image(conn, issue, _resolve_image_id(cfg.image))
+        if _resolve_image_id(image_id) != image_id:
+            raise WorkflowError("recorded Docker image is unavailable")
         used_model = None
         if not rebase_only:
             task = _task_file(cfg, issue, current["body"], correction_note)
@@ -1275,6 +1316,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         head_sha=head)
             if creating_pr and observed.get("isDraft") is not True:
                 raise WorkflowError("initial PR is not a draft")
+        if published_image_id(observed.get("body") or "") != image_id:
+            raise WorkflowError("published PR image differs from recorded execution image")
         result = {"issue": issue, "pr": pr_number, "branch": branch, "head": head,
                   "base": base,
                   "paths": paths, "ci": proof,

@@ -16,6 +16,7 @@ from ermik.pr_broker import Broker, BrokerError, handle_connection
 
 HEAD = "a" * 40
 BASE = "b" * 40
+IMAGE_ID = "sha256:" + "c" * 64
 BRANCH = "work/issue-7-delivery"
 BODY = "## Allowed paths\nsrc/file.py\n\n## Goal\nFix it\n\n## Acceptance\nIt works\n"
 
@@ -26,10 +27,12 @@ class FakeApi:
         self.existing = None
         self.fail_post = False
         self.branch_sha = HEAD
+        self.pr_body = f"Execution image: `{IMAGE_ID}`"
         self.issue_labels = [{"name": "queue:worker"}, {"name": "state:in-progress"}]
 
     def pr(self):
         return {"number": 19, "state": "open", "draft": True, "merged_at": None,
+                "body": self.pr_body,
                 "head": {"ref": BRANCH, "sha": HEAD,
                          "repo": {"full_name": "person/fork"}},
                 "base": {"ref": "main", "sha": BASE,
@@ -38,6 +41,7 @@ class FakeApi:
     def call(self, method, path, payload=None):
         self.calls.append((method, path, payload))
         if method == "POST":
+            self.pr_body = payload["body"]
             self.existing = self.pr()
             if self.fail_post:
                 raise BrokerError("ambiguous response")
@@ -89,7 +93,8 @@ class BrokerTests(unittest.TestCase):
         self.evidence = issue_dir / (HEAD + ".json")
         self.record = {"issue": 7, "branch": BRANCH, "head": HEAD, "base": BASE,
                        "body_sha256": parse_issue(BODY).body_sha256,
-                       "paths": ["src/file.py"], "ci": {"result": "passed"}}
+                       "paths": ["src/file.py"],
+                       "ci": {"result": "passed", "image_id": IMAGE_ID}}
         self.write_evidence()
         self.api = FakeApi()
         self.broker = Broker(repo="org/upstream", fork="person/fork",
@@ -113,6 +118,7 @@ class BrokerTests(unittest.TestCase):
         post = next(payload for method, _, payload in self.api.calls if method == "POST")
         self.assertTrue(post["draft"])
         self.assertEqual(post["head"], "person:" + BRANCH)
+        self.assertIn(f"Execution image: `{IMAGE_ID}`\n", post["body"])
 
     def test_uncertain_post_reconciles_same_pr(self):
         self.api.fail_post = True
@@ -131,6 +137,28 @@ class BrokerTests(unittest.TestCase):
         self.write_evidence()
         with self.assertRaises(BrokerError):
             self.broker.create_draft(self.request)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_missing_or_invalid_image_id_refuses_before_post(self):
+        for image_id in (None, "demo:latest", "sha256:" + "A" * 64):
+            with self.subTest(image_id=image_id):
+                if image_id is None:
+                    self.record["ci"].pop("image_id", None)
+                else:
+                    self.record["ci"]["image_id"] = image_id
+                self.write_evidence()
+                with self.assertRaises(BrokerError):
+                    self.broker.create_draft(self.request)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_existing_pr_requires_matching_image_id(self):
+        self.api.existing = self.api.pr()
+        for body in ("No execution image", "Execution image: `sha256:" + "d" * 64 + "`",
+                     f"Execution image: `{IMAGE_ID}`\nExecution image: `{IMAGE_ID}`"):
+            with self.subTest(body=body):
+                self.api.pr_body = body
+                with self.assertRaises(BrokerError):
+                    self.broker.create_draft(self.request)
         self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
 
     def test_evidence_at_broker_limit_allows_draft(self):

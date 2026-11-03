@@ -288,7 +288,7 @@ class WorkflowTests(unittest.TestCase):
                             "headRefOid": SHA_B, "baseRefOid": SHA_A,
                             "baseRefName": "main", "isDraft": True,
                             "changedFiles": 1, "files": [{"path": "src/example.py"}],
-                            "body": "Closes #1"}
+                            "body": f"Closes #1\n\nExecution image: `sha256:{'d' * 64}`"}
         FakeHub.notes[10] = [{"id": 99,
             "body": f"SEMI_REWORK issue=1 head={SHA_B}\n\nPlease fix it",
             "user": {"login": "owner"}}]
@@ -296,7 +296,7 @@ class WorkflowTests(unittest.TestCase):
                   "head_repository": self.cfg.repo,
                   "branch": "work/issue-1-delivery", "head": SHA_B, "base": SHA_A,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
-                  "paths": ["src/example.py"]}
+                  "paths": ["src/example.py"], "image_id": "sha256:" + "d" * 64}
         review_module._save(self.cfg, 10, record)
         with patch.object(review_module, "GitHub", FakeHub), patch.object(
                 review_module, "main_sha", return_value=SHA_A):
@@ -328,6 +328,10 @@ class WorkflowTests(unittest.TestCase):
         command("git", "-C", str(mirror), "config", "user.name", "Repository owner")
         command("git", "-C", str(mirror), "config", "user.email", "owner@example.invalid")
         branch = "work/issue-1-delivery"
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(?,?,?,?,?)", (1, branch, base, "running",
+                                                '["src/example.py"]'))
         FakeHub.issues[1]["names"] = {"queue:worker", "state:in-progress"}
         FakeHub.notes[1] = [{"id": 1,
             "body": runtime._admission_marker(1, runtime.parse_issue(BODY)),
@@ -344,7 +348,7 @@ class WorkflowTests(unittest.TestCase):
                 return {"number": number, "state": "OPEN", "isDraft": True,
                         "headRefName": branch, "headRefOid": head,
                         "baseRefName": "main", "baseRefOid": base,
-                        "body": "Closes #1"}
+                        "body": f"Closes #1\n\nExecution image: `sha256:{'d' * 64}`"}
 
         def write_file(_cfg, checkout, _command, *, issue_file, network, timeout,
                        image_id):
@@ -357,7 +361,8 @@ class WorkflowTests(unittest.TestCase):
         with patch.object(runtime, "GitHub", GitHubWithBranch), patch.object(
                 runtime, "mirror", return_value=mirror), patch.object(
                 runtime, "_docker", side_effect=write_file), patch.object(
-                runtime, "local_checks", return_value={"result": "passed"}), patch.object(
+                runtime, "local_checks", return_value={"result": "passed",
+                                                      "image_id": "sha256:" + "d" * 64}), patch.object(
                 runtime, "main_sha", return_value=base):
             spec = runtime.parse_issue(BODY)
             first = runtime._perform(self.cfg, 1, branch, spec,

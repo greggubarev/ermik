@@ -186,6 +186,39 @@ class ContainerCleanupTests(unittest.TestCase):
         self.assertEqual(launches, [IMAGE_ID, IMAGE_ID])
         self.assertEqual(proof["image_id"], IMAGE_ID)
 
+    def test_retag_between_checks_does_not_change_launched_image(self):
+        from dataclasses import replace
+
+        checkout = self.cfg.workspace / "job"
+        checkout.mkdir(parents=True)
+        cfg = replace(self.cfg, checks=(("first",), ("second",)))
+        tag_image = [IMAGE_ID]
+        launches = []
+
+        def resolve(reference):
+            return tag_image[0] if reference == cfg.image else IMAGE_ID
+
+        def git(_path, *args, **_kwargs):
+            if args[:2] == ("rev-parse", "HEAD"):
+                return "b" * 40
+            if args[:1] == ("merge-base",):
+                return "a" * 40
+            return ""
+
+        def run_check(_cfg, _checkout, _command, *, log_path, image_id, **_kwargs):
+            launches.append(image_id)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_bytes(b"passed\n")
+            tag_image[0] = "sha256:" + "b" * 64
+
+        with patch.object(runtime, "_resolve_image_id", side_effect=resolve), patch.object(
+                runtime, "git", side_effect=git), patch.object(
+                runtime, "_docker", side_effect=run_check):
+            proof = runtime.local_checks(cfg, checkout)
+        self.assertEqual(launches, [IMAGE_ID, IMAGE_ID])
+        self.assertEqual(proof["image_id"], IMAGE_ID)
+        self.assertNotEqual(tag_image[0], IMAGE_ID)
+
 
 class ImageIdentityTests(unittest.TestCase):
     def test_resolver_accepts_exact_id_and_rejects_malformed_output(self):

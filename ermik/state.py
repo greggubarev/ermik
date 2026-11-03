@@ -6,6 +6,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Iterator
 
@@ -22,7 +23,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_request INTEGER NOT NULL DEFAULT 0,
   error TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
   last_model TEXT, result_model TEXT, attempts_count INTEGER NOT NULL DEFAULT 0,
-  review_next_check_at INTEGER NOT NULL DEFAULT 0
+  review_next_check_at INTEGER NOT NULL DEFAULT 0,
+  image_id TEXT
 );
 CREATE TABLE IF NOT EXISTS retry_state (
   issue INTEGER PRIMARY KEY REFERENCES jobs(issue),
@@ -80,7 +82,8 @@ def initialize(root: Path) -> Path:
         for name, definition in (("last_model", "TEXT"),
                                  ("result_model", "TEXT"),
                                  ("attempts_count", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("review_next_check_at", "INTEGER NOT NULL DEFAULT 0")):
+                                 ("review_next_check_at", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("image_id", "TEXT")):
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
         conn.commit()
@@ -137,6 +140,21 @@ def admission(conn: sqlite3.Connection, issue: int) -> sqlite3.Row | None:
 
 def job(conn: sqlite3.Connection, issue: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM jobs WHERE issue=?", (issue,)).fetchone()
+
+
+def bind_image(conn: sqlite3.Connection, issue: int, image_id: str) -> str:
+    """Persist one immutable image identity for a job before container execution."""
+    if (type(issue) is not int or issue <= 0 or type(image_id) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None):
+        raise ValueError("invalid job image identity")
+    conn.execute("UPDATE jobs SET image_id=? WHERE issue=? AND image_id IS NULL",
+                 (image_id, issue))
+    row = conn.execute("SELECT image_id FROM jobs WHERE issue=?", (issue,)).fetchone()
+    if row is None:
+        raise ValueError("job does not exist")
+    if row[0] != image_id:
+        raise ValueError("job image identity changed")
+    return image_id
 
 
 def jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
