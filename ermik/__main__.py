@@ -29,7 +29,7 @@ def doctor(cfg) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
     if cfg.publish_repo:
-        gh.validate_publish_access()
+        gh.inspect_publish_identity()
     repo = gh.command(["repo", "view", cfg.repo, "--json", "nameWithOwner,defaultBranchRef"])
     details = json.loads(repo)
     if details["nameWithOwner"].casefold() != cfg.repo.casefold():
@@ -54,6 +54,7 @@ def doctor(cfg) -> dict:
     return {"repo": cfg.repo, "publish_repo": cfg.publish_repo,
             "base": main_sha(gh, cfg), "github_account": account,
             "github_permission": permission,
+            "publish_write_capabilities": "unverified",
             "docker_image": cfg.image, "state_dir_exists": cfg.state_dir.exists(),
             "workspace_exists": cfg.workspace.exists(),
             "models": [{"ref": model.ref,

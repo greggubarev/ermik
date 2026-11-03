@@ -17,7 +17,7 @@ The [documented trial](docs/readiness.md) completed admission, a draft PR, corre
 
 1. Follow the [first-project walkthrough](docs/first-project.md) for a disposable repository. For separate server and maintainer hosts, follow [setup](docs/setup.md) and [security](docs/security.md).
 2. Copy [the example configuration](examples/config.example.json) to `config.json` on each host. Set the same `owner/repo`, maintainer, image, worker command, and checks. Give each host its own private `state_dir` and `workspace`. Keep secrets outside JSON.
-3. Build the demo image, then inspect the read-only preflight:
+3. Build the demo image, then inspect the read-only preflight. It verifies identity and prerequisites; publication write capability remains unverified until `run-once` or `poll`:
 
    ```sh
    docker build -f examples/Dockerfile.demo -t ermik-demo:latest .
