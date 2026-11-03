@@ -68,7 +68,17 @@ def command(args: list[str], *, cwd: Path | None = None,
 
 
 def gh_json(*args: str) -> dict:
-    value = json.loads(command(["gh", *args]))
+    if not args or args[0] != "api":
+        raise MatrixFailure("gh_json requires a read-only API call")
+    for attempt in range(5):
+        try:
+            raw = command(["gh", *args])
+            break
+        except MatrixFailure:
+            if attempt == 4:
+                raise
+            time.sleep(attempt + 1)
+    value = json.loads(raw)
     require(isinstance(value, dict), "GitHub response is not an object")
     return value
 
@@ -105,11 +115,11 @@ def result_record(cfg, number: int) -> dict:
 
 def review_with_read_retry(cfg, number: int) -> dict:
     """Retry only local review, whose GitHub operations are reads."""
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             return review_module.review(cfg, number)
         except GitHubError:
-            if attempt == 2:
+            if attempt == 4:
                 raise
             time.sleep(attempt + 1)
     raise AssertionError("unreachable")
@@ -129,6 +139,16 @@ def cli_merge(config: Path, number: int) -> tuple[int, dict | None]:
     return done.returncode, result
 
 
+def cli_merge_with_read_retry(config: Path, number: int) -> tuple[int, dict | None]:
+    """Repeat after an error; the durable attempt makes an uncertain retry safe."""
+    for attempt in range(5):
+        code, result = cli_merge(config, number)
+        if code != 1:
+            return code, result
+        time.sleep(attempt + 1)
+    return code, result
+
+
 def guarded_repeat(cfg, number: int) -> dict:
     """Use real remote reads but fail if a second merge request is attempted."""
     original = GitHub.command
@@ -140,7 +160,14 @@ def guarded_repeat(cfg, number: int) -> dict:
 
     GitHub.command = guard
     try:
-        return review_module.merge(cfg, number)
+        for attempt in range(5):
+            try:
+                return review_module.merge(cfg, number)
+            except GitHubError:
+                if attempt == 4:
+                    raise
+                time.sleep(attempt + 1)
+        raise AssertionError("unreachable")
     finally:
         GitHub.command = original
 
@@ -279,7 +306,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
     row = {"case": case, "issue": issue, "pr": number, "head": head,
            "reviewed_base": before, "status": "failed"}
     if case == "same_head":
-        code, result = cli_merge(config, number)
+        code, result = cli_merge_with_read_retry(config, number)
         observed = remote_identity(repo, number, branch, head, base, issue,
                                    state="merged")
         oid = observed["merge_commit_sha"]
@@ -319,7 +346,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
         require(base_sha(repo, base) == merge_oid, "base is not exact merge commit")
         require(gh_json("api", f"repos/{repo}/git/commits/{merge_oid}")["parents"][0]["sha"] == before,
                 "merge commit parent differs from reviewed base")
-        code, result = cli_merge(config, number)
+        code, result = cli_merge_with_read_retry(config, number)
         require(code == 0 and result is not None and result.get("status") == "complete"
                 and result.get("merge_commit") == merge_oid
                 and result.get("main_ci", {}).get("result") == "passed"
@@ -344,7 +371,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
                  "Change reviewed marker"], cwd=checkout)
         changed = command(["git", "rev-parse", "HEAD"], cwd=checkout)
         command(["git", "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}"], cwd=checkout)
-        code, result = cli_merge(config, number)
+        code, result = cli_merge_with_read_retry(config, number)
         require(code == 1 and result is None, "changed HEAD was accepted")
         require(pr_remote(repo, number)["head"]["sha"] == changed
                 and pr_remote(repo, number).get("merged_at") is None
@@ -361,7 +388,7 @@ def run_case(repo: str, base: str, image: str, root: Path, case: str) -> dict:
                 "closed PR created merge attempt")
         row.update(status="passed", outcome="rejected_closed_unmerged")
         return row
-    code, result = cli_merge(config, number)
+    code, result = cli_merge_with_read_retry(config, number)
     require(code == 2 and result is not None and result.get("status") == "incomplete"
             and result.get("reason") == "post-merge checks failed"
             and result.get("main_ci") is None,
@@ -433,7 +460,7 @@ def main() -> int:
                 try:
                     row = run_case(args.repo, base, args.image, root, case)
                 except Exception as exc:
-                    safe = str(exc) if isinstance(exc, MatrixFailure) else type(exc).__name__
+                    safe = str(exc) if isinstance(exc, (MatrixFailure, WorkflowError)) else type(exc).__name__
                     report["cases"].append({"case": case, "status": "failed",
                                             "error": safe})
                     raise
@@ -442,7 +469,7 @@ def main() -> int:
         report["status"] = "passed"
     except (MatrixFailure, KeyError, ValueError, OSError, WorkflowError) as exc:
         # Only fixed error classes and messages from this file enter the report.
-        report["error"] = str(exc) if isinstance(exc, MatrixFailure) else type(exc).__name__
+        report["error"] = str(exc) if isinstance(exc, (MatrixFailure, WorkflowError)) else type(exc).__name__
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n",
