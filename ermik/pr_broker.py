@@ -11,11 +11,13 @@ import re
 import socket
 import stat
 import struct
+import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .evidence_store import MAX_BROKER_EVIDENCE_BYTES
+from .app_token_rotation import TokenRotationError, TokenStore
 from .policy import parse_issue, validate_changed_paths
 
 
@@ -319,13 +321,36 @@ def main() -> None:
     token = parser.add_mutually_exclusive_group(required=True)
     token.add_argument("--token-file", type=Path)
     token.add_argument("--token-env")
+    token.add_argument("--app-token-store", type=Path)
+    parser.add_argument("--app-client-id")
     args = parser.parse_args()
-    secret = (_private_file(args.token_file, {0, os.geteuid()}).decode().strip()
-              if args.token_file else os.environ.get(args.token_env, ""))
-    _require(bool(secret) and "\n" not in secret, "publication credential unavailable")
+    _require(bool(args.app_client_id) == bool(args.app_token_store),
+             "App client ID and token store must be configured together")
+    store = TokenStore(args.app_token_store) if args.app_token_store else None
+    if store is None:
+        secret = (_private_file(args.token_file, {0, os.geteuid()}).decode().strip()
+                  if args.token_file else os.environ.get(args.token_env, ""))
+        _require(bool(secret) and "\n" not in secret,
+                 "publication credential unavailable")
+    else:
+        secret = ""
+    api = Api(secret)
+
+    def ensure_app_token() -> None:
+        if store is None:
+            return
+        try:
+            pair = store.load()
+            if pair.due(time.time()):
+                pair = store.refresh(args.app_client_id)
+            api.token = pair.access_token
+        except TokenRotationError as exc:
+            raise SystemExit(f"Broker publication stopped: {exc}") from None
+
+    ensure_app_token()
     broker = Broker(repo=args.repo, fork=args.fork, maintainer=args.maintainer,
                     controller_uid=args.controller_uid, evidence_dir=args.evidence_dir,
-                    api=Api(secret), repo_id=args.repo_id, fork_id=args.fork_id)
+                    api=api, repo_id=args.repo_id, fork_id=args.fork_id)
     _require(args.socket.is_absolute() and not args.socket.exists(),
              "socket path must be absent and absolute")
     _require(args.socket_gid >= 0, "invalid socket group")
@@ -336,8 +361,13 @@ def main() -> None:
         os.chown(args.socket, -1, args.socket_gid)
         os.chmod(args.socket, 0o660)
         server.listen(8)
+        server.settimeout(60)
         while True:
-            connection, _ = server.accept()
+            ensure_app_token()
+            try:
+                connection, _ = server.accept()
+            except socket.timeout:
+                continue
             with connection:
                 handle_connection(connection, broker)
     finally:
