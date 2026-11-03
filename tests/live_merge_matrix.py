@@ -369,7 +369,16 @@ def main() -> int:
                 "child requires config and PR")
         child(args.child, args.config, args.pr)
         return 1
-    report = {"repository": args.repo, "cases": [], "status": "failed"}
+    report = {"repository": args.repo, "cases": [], "status": "failed",
+              "command_sequence": [
+                  "gh issue create -R OWNER/REPO",
+                  "ermik admit ISSUE",
+                  "git push origin HEAD:refs/heads/BRANCH",
+                  "gh pr create -R OWNER/REPO --draft",
+                  "ermik review PR",
+                  "ermik merge PR",
+                  "gh api repos/OWNER/REPO/pulls/PR",
+              ]}
     try:
         require(sys.platform == "linux", "Linux host required")
         require(bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", args.repo)),
@@ -398,8 +407,15 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="ermik-live-merge-") as directory:
             root = Path(directory)
             for case in CASES:
-                row = run_case(args.repo, base, args.image, root, case)
-                report["cases"].append(row)
+                try:
+                    row = run_case(args.repo, base, args.image, root, case)
+                except Exception as exc:
+                    safe = str(exc) if isinstance(exc, MatrixFailure) else type(exc).__name__
+                    report["cases"].append({"case": case, "status": "failed",
+                                            "error": safe})
+                    raise
+                else:
+                    report["cases"].append(row)
         report["status"] = "passed"
     except (MatrixFailure, KeyError, ValueError, OSError, WorkflowError) as exc:
         # Only fixed error classes and messages from this file enter the report.
