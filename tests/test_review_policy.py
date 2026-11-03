@@ -31,7 +31,7 @@ class Hub:
     def identity(self):
         return "maintainer"
 
-    def issue(self, number):
+    def issue(self, number, *, allow_closed=False):
         assert number == 7
         return {"body": BODY, "labels": [{"name": "queue:worker"},
                                           {"name": "state:in-progress"}]}

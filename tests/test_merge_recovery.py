@@ -40,7 +40,7 @@ class MergeHub(GitHub):
         self.merge_entered = None
         self.release_merge = None
         self.drift_after_merge = False
-        self.issue_closed = True
+        self.close_on_merge = True
 
     def identity(self):
         return "maintainer"
@@ -54,11 +54,6 @@ class MergeHub(GitHub):
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
                 "body": "Closes #7",
                 "mergeCommit": {"oid": MERGED} if self.state == "MERGED" else None}
-
-    def issue(self, number):
-        assert number == 7
-        return {"body": BODY, "labels": [{"name": "queue:worker"},
-                                          {"name": "state:in-progress"}]}
 
     def comments(self, number):
         assert number == PR
@@ -89,7 +84,9 @@ class MergeHub(GitHub):
 
     def api(self, path):
         if path == "issues/7":
-            return {"state": "closed" if self.issue_closed else "open"}
+            return {"state": "closed" if self.state == "MERGED" and self.close_on_merge else "open",
+                    "body": BODY, "labels": [{"name": "queue:worker"},
+                                              {"name": "state:in-progress"}]}
         if path == f"git/commits/{MERGED}":
             return {"sha": MERGED, "parents": [{"sha": self.merge_parent}]}
         raise AssertionError(path)
@@ -296,7 +293,7 @@ class MergeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.hub.merge_calls, 1)
 
     def test_open_issue_after_merge_has_distinct_incomplete_reason(self):
-        self.hub.issue_closed = False
+        self.hub.close_on_merge = False
         first = self._merge()
         self.assertEqual(first["status"], "incomplete")
         self.assertEqual(first["reason"], "linked issue is not closed")

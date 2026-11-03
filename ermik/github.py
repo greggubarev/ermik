@@ -283,9 +283,10 @@ class GitHub:
         value = json.loads(self.command(["api", "user"]))
         return value["login"]
 
-    def issue(self, number: int) -> dict:
+    def issue(self, number: int, *, allow_closed: bool = False) -> dict:
         value = self.api(f"issues/{number}")
-        if "pull_request" in value or value.get("state") != "open":
+        if ("pull_request" in value or value.get("state") not in
+                ({"open", "closed"} if allow_closed else {"open"})):
             raise GitHubError("issue is absent, closed, or a pull request")
         return value
 

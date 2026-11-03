@@ -213,7 +213,7 @@ def _merged_identity(cfg: Config, gh: GitHub, number: int,
                             head_sha=record["head"], state="MERGED")
     if pr.get("state") != "MERGED" or pr.get("headRefOid") != record["head"]:
         raise WorkflowError("merge outcome not confirmed")
-    issue = gh.issue(record["issue"])
+    issue = gh.issue(record["issue"], allow_closed=True)
     if parse_issue(issue.get("body") or "").body_sha256 != record.get("body_sha256"):
         raise WorkflowError("reviewed issue changed after merge")
     merge_commit = pr.get("mergeCommit")
