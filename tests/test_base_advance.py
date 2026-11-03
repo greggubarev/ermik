@@ -33,6 +33,9 @@ def command(*args):
 
 class BaseAdvanceTests(unittest.TestCase):
     def setUp(self):
+        resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "e" * 64)
+        resolver.start()
+        self.addCleanup(resolver.stop)
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.remote = root / "remote.git"
