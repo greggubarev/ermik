@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 from pathlib import Path
 import re
 
 from .config import Config
+from .evidence_store import read_evidence, write_evidence
 from .github import GitHub, GitHubError
 from .git_tree import verify_changed_tree
 from .policy import parse_issue, validate_changed_paths
@@ -18,6 +18,7 @@ from . import state
 
 _CLOSES = re.compile(r"(?im)\bCloses\s+#(\d+)\b")
 _BRANCH = re.compile(r"^work/issue-(\d+)-[a-z0-9-]+$")
+_MAX_REVIEW_BYTES = 20000
 
 
 def _identity(cfg: Config, gh: GitHub, number: int, *,
@@ -69,14 +70,26 @@ def _save(cfg: Config, number: int, value: dict) -> None:
     root = cfg.state_dir / "reviews"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = root / f"pr-{number}.json"
-    path.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    if path.stat().st_size > 20000:
-        raise WorkflowError("review record unexpectedly large")
+    try:
+        write_evidence(path, value, mode=0o600, max_bytes=_MAX_REVIEW_BYTES)
+    except ValueError as exc:
+        if str(exc) == "evidence is too large":
+            raise WorkflowError("review record unexpectedly large") from exc
+        raise
 
 
 def _load(cfg: Config, number: int) -> dict:
     path = cfg.state_dir / "reviews" / f"pr-{number}.json"
-    return json.loads(path.read_text(encoding="utf-8"))
+    before = path.lstat()
+    if before.st_size > _MAX_REVIEW_BYTES:
+        raise WorkflowError("review record unexpectedly large")
+    record = read_evidence(path)
+    after = path.lstat()
+    if (before.st_dev, before.st_ino, before.st_size) != (after.st_dev, after.st_ino, after.st_size):
+        raise WorkflowError("review record changed during read")
+    if after.st_size > _MAX_REVIEW_BYTES:
+        raise WorkflowError("review record unexpectedly large")
+    return record
 
 
 def review(cfg: Config, number: int) -> dict:
