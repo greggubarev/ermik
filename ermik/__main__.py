@@ -16,6 +16,7 @@ from .review import merge, request_changes, review
 from .runtime import admit, checked, main_sha, poll, run_once
 from .observability import status_snapshot
 from .dashboard import create_server
+from .retention import cleanup as cleanup_artifacts, inventory as inventory_artifacts
 
 
 def doctor(cfg) -> dict:
@@ -75,6 +76,11 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("doctor", "status", "run-once", "poll"):
         commands.add_parser(name)
+    storage_parser = commands.add_parser("storage")
+    storage_parser.add_argument("--cleanup", action="store_true")
+    storage_parser.add_argument("--apply", action="store_true")
+    storage_parser.add_argument("--max-items", type=int, default=32)
+    storage_parser.add_argument("--max-bytes", type=int, default=268435456)
     dashboard_parser = commands.add_parser("dashboard")
     dashboard_parser.add_argument("--port", type=int, default=8765)
     admit_parser = commands.add_parser("admit")
@@ -97,6 +103,13 @@ def main(argv: list[str] | None = None) -> int:
             result = admit(cfg, args.issue)
         elif args.command == "run-once":
             result = run_once(cfg)
+        elif args.command == "storage":
+            if args.apply and not args.cleanup:
+                raise ValueError("--apply requires --cleanup")
+            result = (cleanup_artifacts(cfg, dry_run=not args.apply,
+                                        max_items=args.max_items,
+                                        max_bytes=args.max_bytes)
+                      if args.cleanup else inventory_artifacts(cfg))
         elif args.command == "poll":
             poll(cfg)
             return 0

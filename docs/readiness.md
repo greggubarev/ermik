@@ -10,6 +10,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 | SQLite state upgrade | Six migration tests use populated, synthetic preview state. They cover an idempotent upgrade to schema version 1, preserved admissions, jobs, retry and usage rows and review evidence files, refusal of an unknown newer version, an interrupted transaction, and backup/restore. Run `python3 -m unittest tests.test_state_migrations -v`. The [setup guide](setup.md#stop-update-and-roll-back) gives the stopped-service backup and rollback procedure. |
 | Demo runner | The Docker host smoke covers a failed check, task execution, correction, and local checks. |
 | Container cleanup | A host smoke removes only a stopped run's labelled container. |
+| Artifact retention | The `storage` command inventories controller-owned worktrees, check logs, and publication evidence; cleanup requires a preview, explicit bounds, and a verified merged record. Unit tests cover its eligibility and refusal rules. A live disk-pressure and interrupted-cleanup trial remains open. See [local artifact storage](storage.md). |
 | Publication probe recovery | Issue #30 adds an exact repository, ref, and expected SHA intent for a fork capability probe, synced before POST on the documented Linux controller. Restart reconciliation is limited to that recorded ref and the same scoped credential; a changed or unreadable ref blocks automatic cleanup. Unit tests cover the crash windows and a second controller's ref. The [live disposable-fork matrix](../tests/live_probe_matrix.py) stopped the process before POST, after POST, and after DELETE, and simulated lost POST and DELETE responses; replay left no probe refs. Windows power-loss durability of the intent directory is unverified. GitHub's ref DELETE has no SHA precondition, so a concurrent ref update between the final read and DELETE remains a limit. |
 | Evidence file writes | Unit tests cover atomic replacement, malformed records, POSIX permissions, and a simulated failure before and after replacement. Interrupted-run recovery blocks a partial evidence file without creating another PR. The Linux suite passed; live process termination remains to be verified. |
 | Maintainer review records | Unit tests cover private atomic replacement, failed writes, malformed and oversized records, and legacy permission upgrades. Real process termination during a maintainer decision remains to be verified. |
@@ -24,6 +25,8 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 
 - Recovery from a real process kill in every remote-write window.
 - Reboot of the execution host while a task is active.
+- Live disk-pressure, interrupted artifact cleanup, and repeated cleanup on a real long-running installation.
+- Windows ACL ownership parity for artifact retention; Windows path, link, and file-type checks are present, while ownership and permission validation has been verified on POSIX/Linux.
 - Setup on a clean host by an unrelated operator.
 - A live upgrade and rollback of an existing controller installation; the SQLite migration and backup/restore evidence above uses synthetic preview-shaped state.
 - Every compatible provider endpoint and its authentication, quota, and timeout responses.

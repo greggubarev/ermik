@@ -9,5 +9,7 @@
   "worker_env": [],
   "checks": [["python3", "-c", "import runpy; greeting = runpy.run_path('src/example.py')['greeting']; assert greeting() == 'Hello from the example project'"]],
   "max_parallel": 1,
-  "poll_seconds": 60
+  "poll_seconds": 60,
+  "retention_days": 30,
+  "artifact_warn_mb": 1024
 }
