@@ -146,13 +146,17 @@ class GitHub:
                 or not re.fullmatch(r"refs/heads/ermik-access-probe-[0-9a-f]{32}", ref)
                 or not re.fullmatch(r"[0-9a-fA-F]{40}", sha)):
             raise GitHubError("publication probe intent identity invalid")
-        was_present = directory.exists()
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if directory.is_symlink() or not directory.is_dir():
-            raise GitHubError("publication probe intent directory invalid")
-        if not was_present:
-            self._sync_directory(directory.parent)
-        if len(list(directory.iterdir())) >= 32:
+        try:
+            was_present = directory.exists()
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if directory.is_symlink() or not directory.is_dir():
+                raise GitHubError("publication probe intent directory invalid")
+            if not was_present:
+                self._sync_directory(directory.parent)
+            count = sum(1 for _ in directory.iterdir())
+        except OSError:
+            raise GitHubError("publication probe intent could not be persisted") from None
+        if count >= 32:
             raise GitHubError("too many unresolved publication probe intents")
         path = directory / f"{ref.removeprefix('refs/heads/')}.json"
         data = {"repo": repo, "ref": ref, "sha": sha,
