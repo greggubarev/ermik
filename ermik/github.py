@@ -27,10 +27,10 @@ class GitHub:
     def publish_repo(self) -> str:
         return getattr(self, "_publish_repo", self.repo)
 
-    def validate_publish_access(self) -> None:
-        """Fail closed when the configured fork is not a permission boundary."""
+    def inspect_publish_identity(self) -> tuple[dict, str, str]:
+        """Read and verify the configured upstream, fork, and default refs."""
         if self.publish_repo.casefold() == self.repo.casefold():
-            return
+            raise GitHubError("fork publication is not configured")
         if not self.publish_token_env:
             raise GitHubError("fork publication credential is not configured")
         upstream = json.loads(self.command(["api", f"repos/{self.repo}"]))
@@ -43,13 +43,20 @@ class GitHub:
                 or str((fork.get("parent") or {}).get("full_name", "")).casefold()
                 != self.repo.casefold()):
             raise GitHubError("fork identity is unsafe")
+        upstream_sha = self._branch_sha(self.repo, upstream, None)
+        fork_sha = self._branch_sha(self.publish_repo, fork, self.publish_token_env)
+        return upstream, upstream_sha, fork_sha
+
+    def validate_publish_access(self) -> None:
+        """Fail closed when the configured fork is not a permission boundary."""
+        if self.publish_repo.casefold() == self.repo.casefold():
+            return
+        upstream, upstream_sha, fork_sha = self.inspect_publish_identity()
         upstream_token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
                           or self.command(["auth", "token"]).strip())
         fork_token = os.environ.get(self.publish_token_env)
         if not upstream_token or not fork_token or upstream_token == fork_token:
             raise GitHubError("publication credentials are unavailable or shared")
-        upstream_sha = self._branch_sha(self.repo, upstream, None)
-        fork_sha = self._branch_sha(self.publish_repo, fork, self.publish_token_env)
         if self._probe_branch_write(self.repo, upstream_sha, upstream_token):
             raise GitHubError("upstream credential can write the upstream repository")
         if self._probe_existing_branch_update(self.repo, upstream["default_branch"], upstream_token):
@@ -108,11 +115,13 @@ class GitHub:
                             *, allow_404: bool = False) -> bool:
         """Return whether this credential can create a disposable branch."""
         branch = f"ermik-access-probe-{uuid.uuid4().hex}"
+        ref = f"refs/heads/{branch}"
+        identity = f"{repo}/{ref} (expected {sha})"
         base = f"https://api.github.com/repos/{repo}/git/refs"
         headers = {"Authorization": f"Bearer {token}",
                    "Accept": "application/vnd.github+json",
                    "User-Agent": "ermik-controller"}
-        request = Request(base, data=json.dumps({"ref": f"refs/heads/{branch}",
+        request = Request(base, data=json.dumps({"ref": ref,
                                                   "sha": sha}).encode(),
                           headers=headers, method="POST")
         try:
@@ -122,18 +131,89 @@ class GitHub:
             if exc.code == 403 or (allow_404 and exc.code == 404):
                 return False
             raise GitHubError("publication capability probe was inconclusive") from None
-        except (URLError, OSError, ValueError, TypeError):
-            raise GitHubError("publication capability probe failed") from None
+        except (URLError, OSError):
+            observed = self._probe_ref_sha(repo, ref, headers, sha)
+            if observed is None:
+                raise GitHubError(f"publication capability probe POST unconfirmed: {identity}") from None
+            if observed.casefold() != sha.casefold():
+                raise GitHubError(f"publication capability probe ref changed: {identity}") from None
+            status = 201
+        except (ValueError, TypeError):
+            raise GitHubError(f"publication capability probe POST unconfirmed: {identity}") from None
         if status != 201:
             raise GitHubError("publication capability probe was inconclusive")
+        observed = self._probe_ref_sha(repo, ref, headers, sha)
+        if observed is None or observed.casefold() != sha.casefold():
+            raise GitHubError(f"publication capability probe ref changed: {identity}")
         delete = Request(f"{base}/heads/{branch}", headers=headers, method="DELETE")
         try:
             with urlopen(delete, timeout=20) as response:
                 if response.status != 204:
-                    raise GitHubError("publication capability probe cleanup failed")
-        except (HTTPError, URLError, OSError, ValueError, TypeError):
-            raise GitHubError("publication capability probe cleanup failed") from None
+                    raise GitHubError(f"publication capability probe cleanup unconfirmed: {identity}")
+        except HTTPError:
+            raise GitHubError(f"publication capability probe cleanup failed: {identity}") from None
+        except (URLError, OSError):
+            if self._probe_ref_sha(repo, ref, headers, sha) is not None:
+                raise GitHubError(f"publication capability probe cleanup unconfirmed: {identity}") from None
+        except (ValueError, TypeError):
+            raise GitHubError(f"publication capability probe cleanup unconfirmed: {identity}") from None
         return True
+
+    def _probe_ref_sha(self, repo: str, ref: str, headers: dict[str, str],
+                       expected_sha: str) -> str | None:
+        """Read the exact probe ref; confirm repo visibility before accepting 404."""
+        identity = f"{repo}/{ref} (expected {expected_sha})"
+        request = Request(f"https://api.github.com/repos/{repo}/git/ref/"
+                          f"{quote(ref.removeprefix('refs/'), safe='/')}", headers=headers)
+        try:
+            with urlopen(request, timeout=20) as response:
+                row = json.load(response)
+        except HTTPError as exc:
+            if exc.code == 404:
+                self._confirm_probe_repo_visible(repo, headers, identity)
+                return None
+            raise GitHubError(f"publication capability probe ref unreadable: {identity}") from None
+        except (URLError, OSError, ValueError, TypeError):
+            raise GitHubError(f"publication capability probe ref unreadable: {identity}") from None
+        obj = row.get("object") if isinstance(row, dict) else None
+        observed = obj.get("sha") if isinstance(obj, dict) else None
+        if (not isinstance(row, dict) or row.get("ref") != ref
+                or not isinstance(observed, str) or len(observed) != 40
+                or any(c not in "0123456789abcdefABCDEF" for c in observed)):
+            raise GitHubError(f"publication capability probe ref invalid: {identity}")
+        return observed
+
+    def _confirm_probe_repo_visible(self, repo: str, headers: dict[str, str],
+                                    identity: str) -> None:
+        request = Request(f"https://api.github.com/repos/{repo}", headers=headers)
+        try:
+            with urlopen(request, timeout=20) as response:
+                metadata = json.load(response)
+        except (HTTPError, URLError, OSError, ValueError, TypeError):
+            raise GitHubError(f"publication capability probe repository visibility unconfirmed: "
+                              f"{identity}") from None
+        if (not isinstance(metadata, dict)
+                or str(metadata.get("full_name", "")).casefold() != repo.casefold()):
+            raise GitHubError(f"publication capability probe repository identity changed: "
+                              f"{identity}")
+        branch = metadata.get("default_branch")
+        if not isinstance(branch, str) or not branch or branch.startswith("/"):
+            raise GitHubError(f"publication capability probe default ref invalid: {identity}")
+        default_ref = f"refs/heads/{branch}"
+        request = Request(f"https://api.github.com/repos/{repo}/git/ref/heads/"
+                          f"{quote(branch, safe='')}", headers=headers)
+        try:
+            with urlopen(request, timeout=20) as response:
+                row = json.load(response)
+        except (HTTPError, URLError, OSError, ValueError, TypeError):
+            raise GitHubError(f"publication capability probe default ref unreadable: "
+                              f"{identity}") from None
+        obj = row.get("object") if isinstance(row, dict) else None
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        if (not isinstance(row, dict) or row.get("ref") != default_ref
+                or not isinstance(sha, str) or len(sha) != 40
+                or any(c not in "0123456789abcdefABCDEF" for c in sha)):
+            raise GitHubError(f"publication capability probe default ref invalid: {identity}")
 
     def _probe_existing_branch_update(self, repo: str, branch: str, token: str,
                                       *, allow_404: bool = False) -> bool:

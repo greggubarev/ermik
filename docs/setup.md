@@ -206,7 +206,7 @@ python -m ermik --config config.json doctor
 python -m ermik --config config.json status
 ```
 
-Treat this as the dry run: inspect the reported repository, account, paths, Docker availability, image, commands, and current state. It does not execute a task or create a PR. Also inspect the exact issue body and allowed paths with `gh issue view NUMBER --repo example-org/example-project`. Do not continue if a prerequisite or permission check is uncertain.
+Treat this as the dry run: inspect the reported repository, account, paths, Docker availability, image, commands, and current state. It does not execute a task, create a PR, or probe write permissions. `publish_write_capabilities: unverified` is deliberate: `doctor` checks the configured fork identity and parent using reads only. `run-once` and `poll` perform the separate write-capability checks, which may create and delete disposable probe refs; verify scoped permissions and use a disposable repository before starting them. Also inspect the exact issue body and allowed paths with `gh issue view NUMBER --repo example-org/example-project`. Do not continue if a prerequisite is uncertain.
 
 ## Run a disposable task
 

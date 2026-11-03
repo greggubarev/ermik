@@ -1,5 +1,5 @@
 [Unit]
-Description=Ermik read-only deployment preflight
+Description=Ermik read-only identity and environment preflight
 Wants=network-online.target
 After=network-online.target
 
