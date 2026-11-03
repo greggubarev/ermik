@@ -84,7 +84,7 @@ Ermik remains a preview while the v0.2 recovery and credential gates are open. S
 | [Security](docs/security.md) and [PR broker](docs/pr-broker.md) | Credentials and publication boundaries |
 | [Local CI](docs/local-ci.md), [status](docs/status.md), and [dashboard](docs/dashboard.md) | Checks and observability |
 | [Providers](docs/providers.md) and [troubleshooting](docs/troubleshooting.md) | Model routing and recovery |
-| [Architecture](docs/architecture.md) and [readiness](docs/readiness.md) | State machine, verified behavior, and open work |
+| [Architecture](docs/architecture.md), [image continuity](docs/image-continuity.md), and [readiness](docs/readiness.md) | State machine, image identity, verified behavior, and open work |
 | [Roadmap](docs/roadmap.md) | Phases and acceptance criteria |
 
 Source code is available under the [MIT License](LICENSE). Components added to a custom task image retain their own licenses and terms.

@@ -32,7 +32,7 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 **Acceptance:** Pin and inspect the task and check image by immutable identifier. Upgrade a populated local SQLite state through a documented migration, restart, and verify that pending and completed jobs retain their identities; test rollback from a saved state and reconcile remote writes before resuming. Publish a vulnerability-reporting path and check the source release for credentials, local state, and required third-party notices. Repeat the complete handoff on the release candidate after upgrade.
 
-[Image continuity](https://github.com/greggubarev/ermik/issues/8), [review check-policy identity](https://github.com/greggubarev/ermik/issues/28), [state upgrades](https://github.com/greggubarev/ermik/issues/10), and [owned artifact retention](https://github.com/greggubarev/ermik/issues/31) are separate gates. The image-continuity implementation covers correction, recovery, and separate-host review in unit tests; a live tag-replacement trial is still required for Issue #8.
+[Image continuity](https://github.com/greggubarev/ermik/issues/8), [review check-policy identity](https://github.com/greggubarev/ermik/issues/28), [state upgrades](https://github.com/greggubarev/ermik/issues/10), and [owned artifact retention](https://github.com/greggubarev/ermik/issues/31) are separate gates. The [image-continuity trial](image-continuity.md) covers correction and recovery in unit tests, real Docker tag replacement, and review through an independent maintainer installation. Physical cross-host delivery belongs to v0.3.
 
 ## 4. v0.3: Portable evidence and reviewer decision support (planned)
 
