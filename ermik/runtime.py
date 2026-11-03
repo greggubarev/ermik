@@ -1003,11 +1003,20 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                         # reports the old head. Never rerun the worker until the
                         # exact remote ref establishes the push outcome.
                         source = mirror(cfg)
-                        remote = (_publish_git(cfg, source, "ls-remote", "--heads",
-                                               row["branch"], timeout=60)
-                                  if cfg.publish_repo else
-                                  git(source, "ls-remote", "--heads", "origin",
-                                      row["branch"], timeout=60))
+                        try:
+                            remote = (_publish_git(cfg, source, "ls-remote", "--heads",
+                                                   row["branch"], timeout=60)
+                                      if cfg.publish_repo else
+                                      git(source, "ls-remote", "--heads", "origin",
+                                          row["branch"], timeout=60))
+                        except TransientFailure:
+                            if row["status"] == "retry_wait":
+                                conn.execute("DELETE FROM retry_state WHERE issue=?",
+                                             (row["issue"],))
+                                conn.execute("UPDATE jobs SET status='correcting',"
+                                             "updated_at=CURRENT_TIMESTAMP WHERE issue=?",
+                                             (row["issue"],))
+                            raise
                         match = re.fullmatch(
                             r"([0-9a-f]{40})\s+refs/heads/" + re.escape(row["branch"]),
                             remote.strip())
@@ -1018,8 +1027,13 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                                 raise WorkflowError("correction remote head lacks local commit")
                             _verify_leftover_checkout(cfg, row, match.group(1))
                             if row["status"] == "retry_wait":
-                                conn.execute("UPDATE retry_state SET next_retry_at=? WHERE issue=?",
-                                             (int(time.time()) + 60, row["issue"]))
+                                # A due retry must not start another worker while
+                                # the PR API still reports the previous head.
+                                conn.execute("DELETE FROM retry_state WHERE issue=?",
+                                             (row["issue"],))
+                                conn.execute("UPDATE jobs SET status='correcting',"
+                                             "updated_at=CURRENT_TIMESTAMP WHERE issue=?",
+                                             (row["issue"],))
                             continue
                     leftover = _verify_leftover_checkout(cfg, row, pr["headRefOid"])
                     if row["status"] == "retry_wait":

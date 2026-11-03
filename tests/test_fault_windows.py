@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ermik import review, runtime, state
+from ermik import recovery, review, runtime, state
 from ermik.config import Config
 
 
@@ -430,14 +430,35 @@ class FaultWindowTests(unittest.TestCase):
             with self.subTest(status=status), state.connect(self.cfg.state_dir) as conn:
                 self.gh.names = {"queue:worker", "state:in-progress"}
                 conn.execute("UPDATE jobs SET status=?,error=NULL WHERE issue=1", (status,))
+                if status == "retry_wait":
+                    conn.execute("INSERT INTO retry_state(issue,attempts,category,"
+                                 "resume_status,next_retry_at,failure_id) "
+                                 "VALUES(1,1,'transient','correcting',1,'push-lost')")
                 with patch.object(runtime, "mirror", return_value=source), patch.object(
                         runtime, "git", side_effect=git), patch.object(
                         runtime, "_perform") as perform:
                     runtime._reconcile_interrupted(self.gh, self.cfg, conn)
-                self.assertEqual(state.job(conn, 1)["status"], status)
+                self.assertEqual(state.job(conn, 1)["status"], "correcting")
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM retry_state WHERE issue=1").fetchone())
+                self.assertEqual(recovery.claim_due(conn, now=2_000_000_000), [])
                 perform.assert_not_called()
             self.assertEqual(self.gh.prs[10]["headRefOid"], HEAD)
             self.assertEqual(self.gh.remote_head, advanced)
+
+        self.gh.prs[10]["headRefOid"] = advanced
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "local_checks", return_value={
+                    "result": "passed", "image_id": IMAGE}) as checks, patch.object(
+                runtime, "_perform") as perform:
+            with state.connect(self.cfg.state_dir) as conn:
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["pr"], row["head_sha"]),
+                                 ("awaiting_review", 10, advanced))
+                self.assertEqual(recovery.claim_due(conn, now=2_000_000_000), [])
+            checks.assert_called_once()
+            perform.assert_not_called()
 
     def test_existing_evidence_identity_tampering_blocks_recovery(self):
         _source, _checkout, base, head = self._published_leftover()
