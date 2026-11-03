@@ -32,6 +32,17 @@ class GitHubPRIdentityTests(unittest.TestCase):
     def setUp(self):
         self.github = GitHub("example/project")
 
+    def test_issue_allows_closed_issue_only_when_requested_and_rejects_pr(self):
+        issue = {"number": 42, "state": "closed", "body": "Completed task"}
+        with patch.object(self.github, "api", return_value=issue) as api:
+            with self.assertRaisesRegex(GitHubError, "closed"):
+                self.github.issue(42)
+            self.assertEqual(self.github.issue(42, allow_closed=True), issue)
+        self.assertEqual(api.call_args.args, ("issues/42",))
+        with patch.object(self.github, "api", return_value={**issue, "pull_request": {}}):
+            with self.assertRaisesRegex(GitHubError, "pull request"):
+                self.github.issue(42, allow_closed=True)
+
     def test_find_branch_pr_matches_source_repository_branch_and_base(self):
         rows = [rest_pr(1, repo="other/project"),
                 rest_pr(2, branch="other-branch"),
