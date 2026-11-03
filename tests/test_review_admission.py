@@ -90,7 +90,9 @@ class ReviewAdmissionTests(unittest.TestCase):
 
     def test_merge_refuses_unadmitted_pr_before_github_write(self):
         self.gh.marker = "SEMI_ADMIT issue=7 body=stale scope=stale"
-        record = {"issue": 7, "head": HEAD, "base": BASE,
+        record = {"pr": 19, "issue": 7, "repo": self.cfg.repo,
+                  "head_repository": self.cfg.repo,
+                  "branch": "work/issue-7-delivery", "head": HEAD, "base": BASE,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
                   "paths": ["src/a.py"]}
         with patch.object(review, "GitHub", return_value=self.gh), patch.object(

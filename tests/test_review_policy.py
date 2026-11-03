@@ -60,7 +60,9 @@ class Hub:
         elif args[:2] == ["pr", "merge"]:
             self.pr_state = "MERGED"
 
-    def api(self, _path):
+    def api(self, path):
+        if path == f"git/commits/{MERGED}":
+            return {"parents": [{"sha": BASE}]}
         return {"state": "closed"}
 
 

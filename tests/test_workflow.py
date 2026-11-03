@@ -292,7 +292,9 @@ class WorkflowTests(unittest.TestCase):
         FakeHub.notes[10] = [{"id": 99,
             "body": f"SEMI_REWORK issue=1 head={SHA_B}\n\nPlease fix it",
             "user": {"login": "owner"}}]
-        record = {"issue": 1, "head": SHA_B, "base": SHA_A,
+        record = {"pr": 10, "issue": 1, "repo": self.cfg.repo,
+                  "head_repository": self.cfg.repo,
+                  "branch": "work/issue-1-delivery", "head": SHA_B, "base": SHA_A,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
                   "paths": ["src/example.py"]}
         review_module._save(self.cfg, 10, record)
