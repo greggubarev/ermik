@@ -24,6 +24,7 @@ class Hub:
     def __init__(self):
         self.pr_state = "OPEN"
         self.draft = True
+        self.head = HEAD
         self.writes = []
         self.on_ready = None
 
@@ -39,7 +40,7 @@ class Hub:
         assert number == 19
         return {"number": 19, "state": self.pr_state, "isDraft": self.draft,
                 "baseRefName": "main", "baseRefOid": BASE,
-                "headRefName": "work/issue-7-delivery", "headRefOid": HEAD,
+                "headRefName": "work/issue-7-delivery", "headRefOid": self.head,
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
                 "body": "Closes #7",
                 "mergeCommit": {"oid": MERGED} if self.pr_state == "MERGED" else None}
@@ -139,7 +140,8 @@ class ReviewPolicyTests(unittest.TestCase):
 
     def test_added_removed_and_reordered_checks_invalidate_review(self):
         self._review()
-        for changed in (CHECKS + (("python", "-V"),), CHECKS[:1], CHECKS[::-1]):
+        for changed in (CHECKS + (("python", "-V"),), CHECKS[:1],
+                        CHECKS[::-1], (("python", "-m", "pytest"), CHECKS[1])):
             with self.subTest(checks=changed):
                 self.cfg = replace(self.cfg, checks=changed)
                 with self.assertRaises(runtime.WorkflowError):
@@ -149,6 +151,14 @@ class ReviewPolicyTests(unittest.TestCase):
     def test_retagged_image_invalidates_review_before_ready(self):
         self._review()
         self.image = OTHER_IMAGE
+        with self.assertRaises(runtime.WorkflowError):
+            self._merge()
+        self.assertEqual(self.gh.writes, [])
+
+    def test_moved_head_invalidates_review_before_ready(self):
+        self._review()
+        self.gh.head = "f" * 40
+
         with self.assertRaises(runtime.WorkflowError):
             self._merge()
         self.assertEqual(self.gh.writes, [])
