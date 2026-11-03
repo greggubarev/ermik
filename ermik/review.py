@@ -116,32 +116,39 @@ def _load(cfg: Config, number: int) -> dict:
 
 
 def review(cfg: Config, number: int) -> dict:
+    with state.exclusive(cfg.state_dir):
+        return _review_locked(cfg, number)
+
+
+def _review_locked(cfg: Config, number: int) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
+    record_path = cfg.state_dir / "reviews" / f"pr-{number}.json"
+    if record_path.exists() and _load(cfg, number).get("merge_attempt") is not None:
+        raise WorkflowError("review cannot replace a pending merge attempt")
     pr, issue_num, issue = _identity(cfg, gh, number)
     if pr["baseRefOid"] != main_sha(gh, cfg):
         raise WorkflowError("PR base is not current base branch")
     spec = parse_issue(issue["body"])
-    with state.exclusive(cfg.state_dir):
-        checkout = _checkout_pr(cfg, number, pr)
-        try:
-            if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
-                raise WorkflowError("review checkout HEAD differs")
-            actual = set(verify_changed_tree(checkout, pr["baseRefOid"],
-                                             pr["headRefOid"],
-                                             allowed_paths=spec.allowed_paths))
-            published = {row["path"] for row in pr["files"]}
-            if actual != published:
-                raise WorkflowError("published and fetched PR diffs differ")
-            validate_changed_paths(actual, spec.allowed_paths)
-            proof = local_checks(cfg, checkout)
-            image_id = proof.get("image_id") if isinstance(proof, dict) else None
-            if (not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id)
-                    or _resolve_image_id(cfg.image) != image_id):
-                raise WorkflowError("review checks did not use the configured image")
-        finally:
-            if checkout.exists():
-                git(cfg.workspace / "source", "worktree", "remove", str(checkout))
+    checkout = _checkout_pr(cfg, number, pr)
+    try:
+        if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
+            raise WorkflowError("review checkout HEAD differs")
+        actual = set(verify_changed_tree(checkout, pr["baseRefOid"],
+                                         pr["headRefOid"],
+                                         allowed_paths=spec.allowed_paths))
+        published = {row["path"] for row in pr["files"]}
+        if actual != published:
+            raise WorkflowError("published and fetched PR diffs differ")
+        validate_changed_paths(actual, spec.allowed_paths)
+        proof = local_checks(cfg, checkout)
+        image_id = proof.get("image_id") if isinstance(proof, dict) else None
+        if (not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id)
+                or _resolve_image_id(cfg.image) != image_id):
+            raise WorkflowError("review checks did not use the configured image")
+    finally:
+        if checkout.exists():
+            git(cfg.workspace / "source", "worktree", "remove", str(checkout))
     current = gh.pr(number)
     if current["headRefOid"] != pr["headRefOid"] or current["baseRefOid"] != pr["baseRefOid"]:
         raise WorkflowError("PR changed during local review")
@@ -160,10 +167,17 @@ def review(cfg: Config, number: int) -> dict:
 
 
 def request_changes(cfg: Config, number: int, note_file: Path) -> dict:
+    with state.exclusive(cfg.state_dir):
+        return _request_changes_locked(cfg, number, note_file)
+
+
+def _request_changes_locked(cfg: Config, number: int, note_file: Path) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
     pr, issue_num, issue = _identity(cfg, gh, number, allow_blocked=True)
     record = _load(cfg, number)
+    if record.get("merge_attempt") is not None:
+        raise WorkflowError("correction request cannot follow a pending merge attempt")
     if (record.get("head") != pr["headRefOid"] or record.get("base") != pr["baseRefOid"]
             or record.get("body_sha256") != parse_issue(issue["body"]).body_sha256
             or record.get("paths") != sorted(row["path"] for row in pr["files"])):
@@ -223,6 +237,48 @@ def _incomplete(number: int, issue_num: int, reason: str,
     if merge_commit is not None:
         result.update(merge_commit=merge_commit, main_ci=None, issue_closed=None)
     return result
+
+
+def _post_merge_verification(cfg: Config, gh: GitHub, number: int,
+                             record: dict, merge_commit: str) -> dict:
+    try:
+        image_id = _review_policy(cfg, record, check_reference=False)
+    except Exception:
+        raise WorkflowError("review policy unavailable after merge") from None
+    try:
+        new_main = main_sha(gh, cfg)
+    except Exception:
+        raise WorkflowError("base branch could not be verified") from None
+    if merge_commit != new_main:
+        raise WorkflowError("base branch moved after merge")
+    try:
+        source = mirror(cfg)
+        path = cfg.workspace / "reviews" / f"main-after-{number}"
+        if path.exists():
+            raise WorkflowError("existing main CI checkout requires inspection")
+        git(source, "worktree", "add", "--detach", str(path), new_main)
+    except Exception:
+        raise WorkflowError("post-merge checkout failed") from None
+    try:
+        try:
+            proof = local_checks(cfg, path, image_id=image_id)
+        except Exception:
+            raise WorkflowError("post-merge checks failed") from None
+    finally:
+        if path.exists():
+            try:
+                git(source, "worktree", "remove", str(path))
+            except Exception:
+                raise WorkflowError("post-merge checkout cleanup failed") from None
+    if not isinstance(proof, dict) or proof.get("result") != "passed":
+        raise WorkflowError("post-merge checks failed")
+    try:
+        issue_closed = gh.api(f"issues/{record['issue']}")["state"] == "closed"
+    except Exception:
+        raise WorkflowError("linked issue closure could not be verified") from None
+    if not issue_closed:
+        raise WorkflowError("linked issue is not closed")
+    return proof
 
 
 def merge(cfg: Config, number: int) -> dict:
@@ -319,30 +375,12 @@ def _merge_locked(cfg: Config, number: int) -> dict:
             and completed.get("status", "complete") == "complete"):
         return completed
     try:
-        image_id = _review_policy(cfg, record, check_reference=False)
-        new_main = main_sha(gh, cfg)
-        if merge_commit != new_main:
-            raise WorkflowError("base branch moved after merge")
-        source = mirror(cfg)
-        path = cfg.workspace / "reviews" / f"main-after-{number}"
-        if path.exists():
-            raise WorkflowError("existing main CI checkout requires inspection")
-        git(source, "worktree", "add", "--detach", str(path), new_main)
-        try:
-            proof = local_checks(cfg, path, image_id=image_id)
-        finally:
-            if path.exists():
-                git(source, "worktree", "remove", str(path))
-        if not isinstance(proof, dict) or proof.get("result") != "passed":
-            raise WorkflowError("post-merge checks did not pass")
-        issue_closed = gh.api(f"issues/{issue_num}")["state"] == "closed"
-        if not issue_closed:
-            raise WorkflowError("linked issue is not closed")
+        proof = _post_merge_verification(cfg, gh, number, record, merge_commit)
         result = {"pr": number, "issue": issue_num, "merge_commit": merge_commit,
-                  "main_ci": proof, "issue_closed": issue_closed,
+                  "main_ci": proof, "issue_closed": True,
                   "status": "complete"}
-    except Exception:
-        result = _incomplete(number, issue_num, "post-merge verification failed",
+    except WorkflowError as exc:
+        result = _incomplete(number, issue_num, str(exc),
                              merge_commit)
     _save(cfg, number, {**record, "merged": result})
     return result

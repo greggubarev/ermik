@@ -39,6 +39,8 @@ class MergeHub(GitHub):
         self.ambiguous_open_response = False
         self.merge_entered = None
         self.release_merge = None
+        self.drift_after_merge = False
+        self.issue_closed = True
 
     def identity(self):
         return "maintainer"
@@ -74,7 +76,7 @@ class MergeHub(GitHub):
                 self.ambiguous_open_response = False
                 raise GitHubError("merge response lost before remote outcome")
             self.state = "MERGED"
-            self.main = MERGED
+            self.main = "f" * 40 if self.drift_after_merge else MERGED
             self.base = MERGED  # GitHub may show the updated target ref after merge.
             if self.lose_merge_response:
                 self.lose_merge_response = False
@@ -87,7 +89,7 @@ class MergeHub(GitHub):
 
     def api(self, path):
         if path == "issues/7":
-            return {"state": "closed"}
+            return {"state": "closed" if self.issue_closed else "open"}
         if path == f"git/commits/{MERGED}":
             return {"sha": MERGED, "parents": [{"sha": self.merge_parent}]}
         raise AssertionError(path)
@@ -177,6 +179,35 @@ class MergeRecoveryTests(unittest.TestCase):
         self.assertEqual(self.hub.merge_calls, 1)
         self.assertEqual(self.check_calls, 0)
 
+    def test_crash_after_durable_attempt_before_request_does_not_issue_merge_on_retry(self):
+        actual_save = review._save
+
+        def crash_after_attempt(cfg, number, value):
+            actual_save(cfg, number, value)
+            if "merge_attempt" in value and "merge_commit" not in value:
+                raise SystemExit("interrupted after durable attempt")
+
+        with patch.object(review, "_save", side_effect=crash_after_attempt):
+            with self.assertRaises(SystemExit):
+                self._merge()
+        stored = review._load(self.cfg, PR)
+        self.assertEqual(stored["merge_attempt"],
+                         {"head": HEAD, "base": BASE, "branch": BRANCH})
+        self.assertEqual(self.hub.merge_calls, 0)
+        self.assertEqual(self._merge()["reason"], "merge outcome is unconfirmed")
+        self.assertEqual(self.hub.merge_calls, 0)
+
+    def test_review_cannot_overwrite_ambiguous_merge_attempt(self):
+        self.hub.ambiguous_open_response = True
+        self._merge()
+        prior = review._load(self.cfg, PR)
+        with patch.object(review, "_checkout_pr", side_effect=AssertionError(
+                "review checkout must not start after a merge attempt")):
+            with self.assertRaisesRegex(runtime.WorkflowError, "merge attempt"):
+                review.review(self.cfg, PR)
+        self.assertEqual(review._load(self.cfg, PR), prior)
+        self.assertEqual(self.hub.merge_calls, 1)
+
     def test_concurrent_merge_commands_do_not_both_write(self):
         self.hub.merge_entered = Event()
         self.hub.release_merge = Event()
@@ -205,7 +236,7 @@ class MergeRecoveryTests(unittest.TestCase):
         with patch.object(review, "mirror", side_effect=RuntimeError("interrupted")):
             first = self._merge()
         self.assertEqual(first["status"], "incomplete")
-        self.assertEqual(first["reason"], "post-merge verification failed")
+        self.assertEqual(first["reason"], "post-merge checkout failed")
         self.assertEqual(review._load(self.cfg, PR)["merged"], first)
         self.assertEqual(self.hub.state, "MERGED")
         self.assertEqual(self.check_calls, 0)
@@ -246,7 +277,7 @@ class MergeRecoveryTests(unittest.TestCase):
         self.fail_check_once = True
         first = self._merge()
         self.assertEqual(first["status"], "incomplete")
-        self.assertEqual(first["reason"], "post-merge verification failed")
+        self.assertEqual(first["reason"], "post-merge checks failed")
         self.assertEqual(review._load(self.cfg, PR)["merged"], first)
         self.assertEqual(self.hub.state, "MERGED")
         incomplete = review._load(self.cfg, PR)["merged"]
@@ -254,6 +285,24 @@ class MergeRecoveryTests(unittest.TestCase):
         self.assertEqual(incomplete["merge_commit"], MERGED)
         self._assert_saved_once()
         self.assertEqual(self.check_calls, 2)
+
+    def test_main_drift_after_merge_has_distinct_incomplete_reason(self):
+        self.hub.drift_after_merge = True
+        first = self._merge()
+        self.assertEqual(first["status"], "incomplete")
+        self.assertEqual(first["reason"], "base branch moved after merge")
+        self.assertEqual(review._load(self.cfg, PR)["merged"], first)
+        self.assertEqual(self.check_calls, 0)
+        self.assertEqual(self.hub.merge_calls, 1)
+
+    def test_open_issue_after_merge_has_distinct_incomplete_reason(self):
+        self.hub.issue_closed = False
+        first = self._merge()
+        self.assertEqual(first["status"], "incomplete")
+        self.assertEqual(first["reason"], "linked issue is not closed")
+        self.assertEqual(review._load(self.cfg, PR)["merged"], first)
+        self.assertEqual(self.check_calls, 1)
+        self.assertEqual(self.hub.merge_calls, 1)
 
     def test_merged_pr_from_another_repository_is_not_adopted(self):
         self.hub.state = "MERGED"

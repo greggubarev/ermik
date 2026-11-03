@@ -125,6 +125,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             raise AssertionError("unhandled command")
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        if args.command == "merge" and result.get("status") == "incomplete":
+            return 2
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError) as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
