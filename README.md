@@ -1,6 +1,6 @@
 # Ermik
 
-Ermik is a self-hosted GitHub Issues queue for coding agents. It runs admitted tasks in separate Docker containers, performs local CI without GitHub Actions, and opens draft pull requests for human review. Multiple model providers can share the queue, with fallback when an account reaches its limit. A maintainer reviews the exact commit, requests changes in the same PR if needed, and explicitly merges.
+Ermik is a self-hosted handoff from scoped GitHub Issues to draft pull requests. A maintainer admits an issue; a trusted controller runs the configured task command in a separate Docker container, validates the changed paths, and runs local checks without requiring GitHub Actions. The maintainer reviews the exact PR commit and is the only party that initiates a merge. This is a preview: the documented end-to-end trial verifies one disposable repository and its configuration, not every project or failure mode.
 
 ![Workflow: issue admission, server execution, review, correction or merge](assets/workflow.svg)
 
@@ -9,9 +9,9 @@ Ermik is a self-hosted GitHub Issues queue for coding agents. It runs admitted t
 - Admission is tied to the issue body and allowed paths through a maintainer comment. Only open issues with `queue:worker` and `state:ready` are eligible.
 - A configured worker runs in an isolated checkout. The controller validates changed paths, runs configured checks without network access, pushes the branch, and opens one draft PR.
 - `review` reruns checks on the exact PR HEAD. `request-changes` continues in the same PR. `merge` requires a current review record and checks the new base commit after merging.
-- A deterministic demo worker and an OpenCode worker with configurable model routing are included. Each new project must supply suitable worker and check commands and verify its own complete issue-to-merge cycle.
+- A deterministic demo task command and a configurable task runner are included. Provider routing can retry an eligible route after a confirmed rate limit. Each new project must supply suitable task and check commands and verify its own complete issue-to-merge cycle.
 
-The [documented trial](docs/readiness.md) completed an issue, draft PR, correction, second review, merge, and `main` check in a separate GitHub repository using the two configured provider connections. That result applies to the trial configuration.
+The [documented trial](docs/readiness.md) completed admission, a draft PR, correction on the same PR, a second review, explicit merge, and a check on the resulting default branch in a separate GitHub repository. The two configured provider routes also completed live tasks. These results apply to the trial configuration.
 
 ## Five-step trial
 
@@ -56,7 +56,7 @@ python3 -m compileall -q ermik
 
 ## Roadmap
 
-The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks release-readiness work, including crash recovery, separate publication credentials, clean-host setup, provider failures, host reboot, immutable images, vulnerability reporting, and upgrades of the local SQLite state. The current version remains a preview; [release readiness](docs/readiness.md) records what has and has not been verified.
+The [phased roadmap](docs/roadmap.md) keeps v0.2 focused on interruption recovery, clean-host operation, and release maintenance. After those reliability gates, planned v0.3 work covers portable evidence and reviewer decision support ([evidence-manifest issue](https://github.com/greggubarev/ermik/issues/11)); v0.4 covers measured routing and cost per accepted PR; v0.5 covers an optional interface. The [v0.3.0 milestone](https://github.com/greggubarev/ermik/milestone/2) tracks related work. [Release readiness](docs/readiness.md) records verified behavior and remaining gaps. These later phases are plans, not current capabilities.
 
 ## Documentation
 
@@ -68,5 +68,6 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 | [Local CI](docs/local-ci.md), [status](docs/status.md), and [dashboard](docs/dashboard.md) | Checks and observability |
 | [Providers](docs/providers.md) and [troubleshooting](docs/troubleshooting.md) | Model routing and recovery |
 | [Architecture](docs/architecture.md) and [readiness](docs/readiness.md) | State machine, verified behavior, and open work |
+| [Roadmap](docs/roadmap.md) | Phases and acceptance criteria |
 
 Source code is available under the [MIT License](LICENSE). Components added to a custom task image retain their own licenses and terms.

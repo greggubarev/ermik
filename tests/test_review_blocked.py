@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from ermik import review
+from ermik import review, runtime
 from ermik.runtime import WorkflowError
 
 BODY = """## Goal
@@ -32,6 +32,10 @@ class BlockedReviewRequestTests(unittest.TestCase):
             "body": BODY,
             "labels": [{"name": "queue:worker"}, {"name": "state:blocked"}],
         }
+        gh.comments.return_value = [{
+            "body": runtime._admission_marker(1, runtime.parse_issue(BODY)),
+            "user": {"login": "owner"},
+        }]
         with self.assertRaisesRegex(WorkflowError, "issue queue or state changed"):
             review._identity(cfg, gh, 10)
         pr, issue, _ = review._identity(cfg, gh, 10, allow_blocked=True)

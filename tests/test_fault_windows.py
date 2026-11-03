@@ -473,8 +473,11 @@ class FaultWindowTests(unittest.TestCase):
     def test_review_comment_response_loss_reuses_exact_head_request(self):
         note_file = Path(self.temp.name) / "review.txt"
         note_file.write_text("Please fix the negative case.", encoding="utf-8")
-        pr = {"headRefOid": HEAD, "baseRefOid": BASE}
-        record = {"head": HEAD, "base": BASE}
+        pr = {"headRefOid": HEAD, "baseRefOid": BASE,
+              "files": [{"path": "src/example.py"}]}
+        record = {"head": HEAD, "base": BASE,
+                  "body_sha256": runtime.parse_issue(BODY).body_sha256,
+                  "paths": ["src/example.py"]}
         self.gh.comment_loss = True
         with patch.object(review, "GitHub", return_value=self.gh), patch.object(
                 review, "_identity", return_value=(pr, 1, self.gh.issue(1))), patch.object(
