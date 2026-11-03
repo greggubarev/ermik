@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import hashlib
+import functools
 import os
 import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +20,17 @@ from urllib.request import Request, urlopen
 
 class GitHubError(RuntimeError):
     pass
+
+
+_PROBE_LOCK = threading.RLock()
+
+
+def _serialized_probe(method):
+    @functools.wraps(method)
+    def locked(*args, **kwargs):
+        with _PROBE_LOCK:
+            return method(*args, **kwargs)
+    return locked
 
 
 def _read_api_command(args: list[str]) -> bool:
@@ -193,6 +206,7 @@ class GitHub:
         except OSError:
             raise GitHubError("publication probe intent cleanup failed") from None
 
+    @_serialized_probe
     def reconcile_probe_intents(self) -> None:
         """Resolve only locally recorded probes under their original credential."""
         directory = self._probe_intent_dir()
@@ -316,6 +330,7 @@ class GitHub:
             raise GitHubError("fork credential upstream identity is unsafe")
         return False
 
+    @_serialized_probe
     def _probe_branch_write(self, repo: str, sha: str, token: str,
                             *, allow_404: bool = False) -> bool:
         """Return whether this credential can create a disposable branch."""
@@ -337,6 +352,10 @@ class GitHub:
             if exc.code == 403 or (allow_404 and exc.code == 404):
                 self._remove_probe_intent(intent)
                 return False
+            if exc.code == 422:
+                # GitHub rejected creation (for example, the ref already
+                # exists). The ref was never ours to remove on replay.
+                self._remove_probe_intent(intent)
             raise GitHubError("publication capability probe was inconclusive") from None
         except (URLError, OSError):
             observed = self._probe_ref_sha(repo, ref, headers, sha)

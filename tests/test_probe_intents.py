@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -91,6 +92,20 @@ class ProbeIntentTests(unittest.TestCase):
                 github._probe_branch_write(REPO, HEAD, TOKEN)
             request.assert_not_called()
 
+    def test_post_422_does_not_adopt_preexisting_same_sha_ref(self):
+        preexisting = HTTPError("https://api.github.com", 422, "exists", None, None)
+        with patch("ermik.github.uuid.uuid4") as unique, patch(
+                "ermik.github.urlopen", side_effect=[preexisting]) as request:
+            unique.return_value.hex = PROBE_ID
+            with self.assertRaises(GitHubError):
+                self.github._probe_branch_write(REPO, HEAD, TOKEN)
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[0].get_method(), "POST")
+        self.assertFalse(self._intents())
+        with patch("ermik.github.urlopen") as request:
+            self.github.reconcile_probe_intents()
+            request.assert_not_called()
+
     def test_restart_after_stop_before_post_clears_only_missing_intent(self):
         self._stop_at_post()
         restarted = GitHub("example/project", REPO, "ERMIK_FORK_TOKEN",
@@ -146,6 +161,89 @@ class ProbeIntentTests(unittest.TestCase):
         self.assertEqual([call.args[0].get_method() for call in request.call_args_list],
                          ["GET", "GET"])
         self.assertEqual(len(self._intents()), 1)
+
+    def test_reconcile_cannot_erase_fresh_intent_before_post(self):
+        """A second instance must not turn a pending POST into an orphan ref."""
+        saved = threading.Event()
+        release_post = threading.Event()
+        reconcile_started = threading.Event()
+        reconcile_done = threading.Event()
+        remote = {"sha": None}
+        failures = []
+        first = self.github
+        second = GitHub("example/project", REPO, "ERMIK_FORK_TOKEN",
+                        probe_state_dir=self.state_dir)
+        original_save = first._save_probe_intent
+
+        def pause_after_save(*args):
+            path = original_save(*args)
+            saved.set()
+            if not release_post.wait(3):
+                raise AssertionError("POST was never released")
+            return path
+
+        def fake_urlopen(request, *_args, **_kwargs):
+            method = request.get_method()
+            url = request.full_url
+            if method == "POST":
+                remote["sha"] = HEAD
+                return Response(201)
+            if method == "DELETE":
+                self.assertEqual(remote["sha"], HEAD)
+                remote["sha"] = None
+                return Response(204)
+            if url.endswith("/git/ref/heads/ermik-access-probe-" + PROBE_ID):
+                return Response(body=ref_row()) if remote["sha"] else missing()
+            if url == f"https://api.github.com/repos/{REPO}":
+                return Response(body={"full_name": REPO, "default_branch": "main"})
+            if url == f"https://api.github.com/repos/{REPO}/git/ref/heads/main":
+                return Response(body={"ref": "refs/heads/main",
+                                      "object": {"sha": HEAD}})
+            raise AssertionError("unexpected GitHub request")
+
+        def run_probe():
+            try:
+                self.assertTrue(first._probe_branch_write(REPO, HEAD, TOKEN))
+            except BaseException as exc:
+                failures.append(exc)
+
+        def run_reconcile():
+            reconcile_started.set()
+            try:
+                second.reconcile_probe_intents()
+            except GitHubError:
+                # A safe refusal may finish before the pending POST.
+                pass
+            except BaseException as exc:
+                failures.append(exc)
+            finally:
+                reconcile_done.set()
+
+        with patch.object(first, "_save_probe_intent", side_effect=pause_after_save), patch(
+                "ermik.github.uuid.uuid4") as unique, patch(
+                "ermik.github.urlopen", side_effect=fake_urlopen):
+            unique.return_value.hex = PROBE_ID
+            thread_a = threading.Thread(target=run_probe)
+            thread_b = threading.Thread(target=run_reconcile)
+            thread_a.start()
+            try:
+                self.assertTrue(saved.wait(3), "A did not persist its intent")
+                self.assertEqual(len(self._intents()), 1)
+                thread_b.start()
+                self.assertTrue(reconcile_started.wait(3), "B did not start")
+                if reconcile_done.wait(0.2):
+                    self.assertEqual(len(self._intents()), 1,
+                                     "B erased A's intent before its POST")
+            finally:
+                release_post.set()
+                thread_a.join(3)
+                if thread_b.ident is not None:
+                    thread_b.join(3)
+        self.assertFalse(thread_a.is_alive() or thread_b.is_alive(),
+                         "probe or reconciliation did not finish")
+        self.assertEqual(failures, [])
+        self.assertIsNone(remote["sha"], "probe ref was orphaned")
+        self.assertFalse(self._intents())
 
     def test_other_controller_cannot_reconcile_this_controllers_intent(self):
         self._stop_at_post()
