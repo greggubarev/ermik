@@ -11,6 +11,7 @@ import tempfile
 
 
 MAX_EVIDENCE_BYTES = 1024 * 1024
+MAX_BROKER_EVIDENCE_BYTES = 65536
 
 
 def _check_existing_file(info: os.stat_result, parent: os.stat_result) -> None:
@@ -84,20 +85,35 @@ def _fsync_directory(parent: Path) -> None:
         os.close(fd)
 
 
-def write_evidence(path: Path, payload: dict, *, mode: int = 0o600) -> None:
-    """Atomically replace evidence after syncing a private sibling file."""
-    path = Path(path)
+def _serialize_evidence(payload: dict) -> bytes:
     if type(payload) is not dict:
         raise ValueError("evidence must be a dictionary")
-    if mode not in (0o600, 0o640):
-        raise ValueError("unsupported evidence permissions")
-    _check_path(path)
     try:
-        data = (json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True,
+        return (json.dumps(payload, sort_keys=True, indent=2, ensure_ascii=True,
                            allow_nan=False) + "\n").encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise ValueError("invalid evidence data") from exc
-    if len(data) > MAX_EVIDENCE_BYTES:
+
+
+def validate_evidence_size(payload: dict, *, max_bytes: int) -> None:
+    """Reject evidence whose exact on-disk serialization exceeds max_bytes."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("invalid evidence size limit")
+    if len(_serialize_evidence(payload)) > max_bytes:
+        raise ValueError("evidence is too large")
+
+
+def write_evidence(path: Path, payload: dict, *, mode: int = 0o600,
+                   max_bytes: int = MAX_EVIDENCE_BYTES) -> None:
+    """Atomically replace evidence after syncing a private sibling file."""
+    path = Path(path)
+    if mode not in (0o600, 0o640):
+        raise ValueError("unsupported evidence permissions")
+    _check_path(path)
+    data = _serialize_evidence(payload)
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("invalid evidence size limit")
+    if len(data) > max_bytes or len(data) > MAX_EVIDENCE_BYTES:
         raise ValueError("evidence is too large")
 
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)

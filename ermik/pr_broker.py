@@ -15,12 +15,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
+from .evidence_store import MAX_BROKER_EVIDENCE_BYTES
 from .policy import parse_issue, validate_changed_paths
 
 
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _MAX_MESSAGE = 4096
+_MAX_PRIVATE_FILE_BYTES = 65536
 
 
 class BrokerError(RuntimeError):
@@ -32,17 +34,20 @@ def _require(condition: bool, message: str) -> None:
         raise BrokerError(message)
 
 
-def _private_file(path: Path, owners: set[int]) -> bytes:
+def _private_file(path: Path, owners: set[int], *,
+                  max_bytes: int = _MAX_PRIVATE_FILE_BYTES) -> bytes:
     """Open without following a symlink and check the opened inode."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(path, flags)
     try:
         info = os.fstat(fd)
-        _require(stat.S_ISREG(info.st_mode) and info.st_size <= 65536
+        _require(stat.S_ISREG(info.st_mode) and info.st_size <= max_bytes
                  and (os.name != "posix" or
                       (info.st_uid in owners and not info.st_mode & 0o022)),
                  "untrusted private file")
-        return os.read(fd, 65537)
+        data = os.read(fd, max_bytes + 1)
+        _require(len(data) <= max_bytes, "untrusted private file")
+        return data
     finally:
         os.close(fd)
 
@@ -140,7 +145,8 @@ class Broker:
                  (parent_info.st_uid in {0, self.controller_uid}
                   and not parent_info.st_mode & 0o022),
                  "untrusted evidence directory")
-        evidence = json.loads(_private_file(path, {0, self.controller_uid}))
+        evidence = json.loads(_private_file(path, {0, self.controller_uid},
+                                            max_bytes=MAX_BROKER_EVIDENCE_BYTES))
         _require(isinstance(evidence, dict) and evidence.get("issue") == issue
                  and evidence.get("branch") == branch
                  and evidence.get("head") == head and evidence.get("base") == base

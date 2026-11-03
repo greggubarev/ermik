@@ -41,6 +41,8 @@ After local checks and branch push, but before requesting a PR, the controller w
 
 `paths` is sorted and includes old and new names for renames. The controller is the trusted source of local check results; the broker does not rerun checks or accept a result from the request or issue. Create this file before invoking the broker. After PR creation, the existing evidence storage scheme may use another record.
 
+The prepublication record is limited to 65,536 UTF-8 bytes, including JSON formatting. The controller validates the exact serialized size before pushing a new branch and applies the same limit when writing the file. If the record is larger, reduce the configured check command data or evidence fields; the controller does not truncate proof silently. Other private controller evidence retains its separate 1 MiB limit.
+
 For every request, the broker rereads the issue and requires it to be open with `queue:worker` and `state:in-progress`, valid `Allowed paths`, `Goal`, and `Acceptance` sections, and a current admission comment by the configured maintainer bound to the body and path hashes. It checks `main == base_sha`, the fork branch ref `== head_sha`, comparison with base and merge base, changed paths through `ermik.policy`, and regular file types in the Git tree. At most 100 changed files are accepted. It then validates check evidence and searches for an existing PR. Refs are checked again before POST. Missing or incomplete API responses cause refusal.
 
 There is no distributed branch lock. If the branch changes between the last ref check and POST, later PR reconciliation detects the mismatch and refuses, but a newly created PR requires manual inspection. Run one broker per socket and prevent concurrent publication of the same branch.

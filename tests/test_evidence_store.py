@@ -7,7 +7,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ermik.evidence_store import MAX_EVIDENCE_BYTES, read_evidence, write_evidence
+from ermik.evidence_store import (MAX_BROKER_EVIDENCE_BYTES, MAX_EVIDENCE_BYTES,
+                                  read_evidence, validate_evidence_size, write_evidence)
 
 
 class EvidenceStoreTests(unittest.TestCase):
@@ -112,6 +113,32 @@ class EvidenceStoreTests(unittest.TestCase):
         self.path.write_bytes(b" " * (MAX_EVIDENCE_BYTES + 1))
         with self.assertRaises(ValueError):
             read_evidence(self.path)
+
+    def test_broker_size_limit_uses_exact_serialized_bytes(self):
+        # The writer escapes non-ASCII text and includes indentation and a newline.
+        overhead = len(b'{\n  "data": ""\n}\n')
+        payload = {"data": "x" * (MAX_BROKER_EVIDENCE_BYTES - overhead)}
+        validate_evidence_size(payload, max_bytes=MAX_BROKER_EVIDENCE_BYTES)
+        write_evidence(self.path, payload, max_bytes=MAX_BROKER_EVIDENCE_BYTES)
+        self.assertEqual(self.path.stat().st_size, MAX_BROKER_EVIDENCE_BYTES)
+        self.assertEqual(read_evidence(self.path), payload)
+
+        too_large = {"data": payload["data"] + "x"}
+        with self.assertRaisesRegex(ValueError, "evidence is too large"):
+            validate_evidence_size(too_large, max_bytes=MAX_BROKER_EVIDENCE_BYTES)
+        with self.assertRaisesRegex(ValueError, "evidence is too large"):
+            write_evidence(self.path, too_large, max_bytes=MAX_BROKER_EVIDENCE_BYTES)
+        self.assertEqual(self.path.stat().st_size, MAX_BROKER_EVIDENCE_BYTES)
+        self.assertEqual(read_evidence(self.path), payload)
+
+    def test_size_validator_counts_escaped_unicode_and_newline(self):
+        payload = {"value": "é"}
+        serialized = b'{\n  "value": "\\u00e9"\n}\n'
+        validate_evidence_size(payload, max_bytes=len(serialized))
+        with self.assertRaisesRegex(ValueError, "evidence is too large"):
+            validate_evidence_size(payload, max_bytes=len(serialized) - 1)
+        write_evidence(self.path, payload, max_bytes=len(serialized))
+        self.assertEqual(self.path.read_bytes(), serialized)
 
     def test_reject_truncated_duplicate_and_non_object_json(self):
         for content in (b'{"valid":', b'{"x":1,"x":2}', b'[1,2]', b'{"x":NaN}'):
