@@ -213,10 +213,14 @@ class GitHubPRIdentityTests(unittest.TestCase):
                 with self.assertRaisesRegex(GitHubError, ref):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
                 self.assertEqual(request.call_count, 2)
-            with patch("ermik.github.urlopen", side_effect=[URLError("lost POST"), missing()]) as request:
+            with patch("ermik.github.urlopen", side_effect=[URLError("lost POST"), missing(),
+                                                             response(200, {"full_name": "publisher/project",
+                                                                            "default_branch": "main"}),
+                                                             response(200, {"ref": "refs/heads/main",
+                                                                            "object": {"sha": HEAD}})]) as request:
                 with self.assertRaisesRegex(GitHubError, "POST unconfirmed"):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
-                self.assertEqual(request.call_count, 2)
+                self.assertEqual(request.call_count, 4)
 
     def test_probe_reconciles_lost_delete_response_and_preserves_changed_ref(self):
         github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
@@ -236,10 +240,20 @@ class GitHubPRIdentityTests(unittest.TestCase):
             unique.return_value.hex = "f" * 32
             with patch("ermik.github.urlopen", side_effect=[response(201),
                                                              response(200, matching),
-                                                             URLError("lost DELETE"), missing()]) as request:
+                                                             URLError("lost DELETE"), missing(),
+                                                             response(200, {"full_name": "publisher/project",
+                                                                            "default_branch": "main"}),
+                                                             response(200, {"ref": "refs/heads/main",
+                                                                            "object": {"sha": HEAD}})]) as request:
                 self.assertTrue(github._probe_branch_write("publisher/project", HEAD, "secret"))
                 self.assertEqual([call.args[0].get_method() for call in request.call_args_list],
-                                 ["POST", "GET", "DELETE", "GET"])
+                                 ["POST", "GET", "DELETE", "GET", "GET", "GET"])
+                self.assertEqual(request.call_args_list[-2].args[0].full_url,
+                                 "https://api.github.com/repos/publisher/project")
+                self.assertEqual(request.call_args_list[-1].args[0].full_url,
+                                 "https://api.github.com/repos/publisher/project/git/ref/heads/main")
+                self.assertEqual(request.call_args_list[-1].args[0].get_header("Authorization"),
+                                 request.call_args_list[-3].args[0].get_header("Authorization"))
             with patch("ermik.github.urlopen", side_effect=[response(201),
                                                              response(200, matching),
                                                              URLError("lost DELETE"),
@@ -248,11 +262,62 @@ class GitHubPRIdentityTests(unittest.TestCase):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
                 self.assertEqual(request.call_count, 4)
             with patch("ermik.github.urlopen", side_effect=[response(201),
+                                                             response(200, matching),
+                                                             URLError("lost DELETE"), missing(),
+                                                             missing()]) as request:
+                with self.assertRaisesRegex(GitHubError, "repository visibility unconfirmed"):
+                    github._probe_branch_write("publisher/project", HEAD, "secret")
+                self.assertEqual(request.call_count, 5)
+            with patch("ermik.github.urlopen", side_effect=[response(201),
                                                              response(200, changed)]) as request:
                 with self.assertRaisesRegex(GitHubError, "ref changed"):
                     github._probe_branch_write("publisher/project", HEAD, "secret")
                 self.assertEqual([call.args[0].get_method() for call in request.call_args_list],
                                  ["POST", "GET"])
+
+    def test_probe_ref_404_requires_exact_repository_visibility(self):
+        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        ref = "refs/heads/ermik-access-probe-" + "f" * 32
+        headers = {"Authorization": "Bearer secret"}
+
+        def response(body):
+            return io.BytesIO(json.dumps(body).encode())
+
+        def missing():
+            return HTTPError("https://api.github.com", 404, "hidden", None, None)
+
+        for repo_result in (missing(), response({"full_name": "other/project"}),
+                            response({"message": "unexpected"}), URLError("offline")):
+            with self.subTest(repo_result=type(repo_result).__name__), patch(
+                    "ermik.github.urlopen", side_effect=[missing(), repo_result]) as request:
+                with self.assertRaisesRegex(GitHubError, "visibility unconfirmed|identity changed"):
+                    github._probe_ref_sha("publisher/project", ref, headers, HEAD)
+                self.assertEqual(request.call_count, 2)
+
+    def test_probe_ref_404_rejects_metadata_only_visibility(self):
+        github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")
+        ref = "refs/heads/ermik-access-probe-" + "f" * 32
+        headers = {"Authorization": "Bearer secret"}
+
+        def response(body):
+            return io.BytesIO(json.dumps(body).encode())
+
+        def missing():
+            return HTTPError("https://api.github.com", 404, "hidden", None, None)
+
+        metadata = {"full_name": "publisher/project", "default_branch": "main"}
+        for default_result in (missing(), response({"ref": "refs/heads/main",
+                                                     "object": {"sha": "bad"}}),
+                               response({"ref": "refs/heads/other",
+                                         "object": {"sha": HEAD}})):
+            with self.subTest(default_result=type(default_result).__name__), patch(
+                    "ermik.github.urlopen", side_effect=[missing(), response(metadata),
+                                                         default_result]) as request:
+                with self.assertRaisesRegex(GitHubError, "default ref unreadable|default ref invalid"):
+                    github._probe_ref_sha("publisher/project", ref, headers, HEAD)
+                self.assertEqual(request.call_count, 3)
+                self.assertEqual(request.call_args_list[-1].args[0].get_header("Authorization"),
+                                 request.call_args_list[0].args[0].get_header("Authorization"))
 
     def test_existing_branch_update_probe_distinguishes_permission_from_validation(self):
         github = GitHub("example/project", "publisher/project", "ERMIK_FORK_TOKEN")

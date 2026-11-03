@@ -161,7 +161,7 @@ class GitHub:
 
     def _probe_ref_sha(self, repo: str, ref: str, headers: dict[str, str],
                        expected_sha: str) -> str | None:
-        """Read only the exact probe ref; None means GitHub confirms it is absent."""
+        """Read the exact probe ref; confirm repo visibility before accepting 404."""
         identity = f"{repo}/{ref} (expected {expected_sha})"
         request = Request(f"https://api.github.com/repos/{repo}/git/ref/"
                           f"{quote(ref.removeprefix('refs/'), safe='/')}", headers=headers)
@@ -170,6 +170,7 @@ class GitHub:
                 row = json.load(response)
         except HTTPError as exc:
             if exc.code == 404:
+                self._confirm_probe_repo_visible(repo, headers, identity)
                 return None
             raise GitHubError(f"publication capability probe ref unreadable: {identity}") from None
         except (URLError, OSError, ValueError, TypeError):
@@ -181,6 +182,38 @@ class GitHub:
                 or any(c not in "0123456789abcdefABCDEF" for c in observed)):
             raise GitHubError(f"publication capability probe ref invalid: {identity}")
         return observed
+
+    def _confirm_probe_repo_visible(self, repo: str, headers: dict[str, str],
+                                    identity: str) -> None:
+        request = Request(f"https://api.github.com/repos/{repo}", headers=headers)
+        try:
+            with urlopen(request, timeout=20) as response:
+                metadata = json.load(response)
+        except (HTTPError, URLError, OSError, ValueError, TypeError):
+            raise GitHubError(f"publication capability probe repository visibility unconfirmed: "
+                              f"{identity}") from None
+        if (not isinstance(metadata, dict)
+                or str(metadata.get("full_name", "")).casefold() != repo.casefold()):
+            raise GitHubError(f"publication capability probe repository identity changed: "
+                              f"{identity}")
+        branch = metadata.get("default_branch")
+        if not isinstance(branch, str) or not branch or branch.startswith("/"):
+            raise GitHubError(f"publication capability probe default ref invalid: {identity}")
+        default_ref = f"refs/heads/{branch}"
+        request = Request(f"https://api.github.com/repos/{repo}/git/ref/heads/"
+                          f"{quote(branch, safe='')}", headers=headers)
+        try:
+            with urlopen(request, timeout=20) as response:
+                row = json.load(response)
+        except (HTTPError, URLError, OSError, ValueError, TypeError):
+            raise GitHubError(f"publication capability probe default ref unreadable: "
+                              f"{identity}") from None
+        obj = row.get("object") if isinstance(row, dict) else None
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        if (not isinstance(row, dict) or row.get("ref") != default_ref
+                or not isinstance(sha, str) or len(sha) != 40
+                or any(c not in "0123456789abcdefABCDEF" for c in sha)):
+            raise GitHubError(f"publication capability probe default ref invalid: {identity}")
 
     def _probe_existing_branch_update(self, repo: str, branch: str, token: str,
                                       *, allow_404: bool = False) -> bool:
