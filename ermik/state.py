@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from functools import lru_cache
 import json
 import os
 from pathlib import Path
@@ -65,6 +66,117 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
+SCHEMA_VERSION = 1
+
+_TABLE_COLUMNS = {
+    "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
+    "jobs": {"issue", "branch", "base_sha", "head_sha", "pr", "status",
+             "allowed_json", "last_request", "error", "updated_at", "last_model",
+             "result_model", "attempts_count", "review_next_check_at", "image_id"},
+    "retry_state": {"issue", "attempts", "category", "resume_status",
+                    "next_retry_at", "lease_token", "lease_expires_at", "failure_id"},
+    "events": {"id", "issue", "kind", "model", "head_sha", "created_at"},
+    "usage_events": {"attempt_id", "issue", "provider_id", "model_id", "complete",
+                     "input_tokens", "output_tokens", "reasoning_tokens",
+                     "cache_read_tokens", "cache_write_tokens", "total_tokens",
+                     "estimated_cost", "result_code", "created_at"},
+}
+_PROVIDER_COLUMNS = {
+    "provider_cooldowns": {"provider_id", "retry_at", "reason"},
+    "provider_leases": {"lease_id", "provider_id", "model_id", "expires_at"},
+}
+_INDEXES = {"events_issue_id", "usage_events_issue"}
+
+
+def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
+    rows = conn.execute("SELECT type,name FROM sqlite_master WHERE type IN "
+                        "('table','index','view','trigger')").fetchall()
+    tables = {name for kind, name in rows if kind == "table" and name != "sqlite_sequence"}
+    indexes = {name for kind, name in rows if kind == "index"
+               and not name.startswith("sqlite_autoindex_")}
+    other = {name for kind, name in rows if kind in ("view", "trigger")}
+    if other:
+        raise ValueError("unknown SQLite state schema objects")
+    return tables, indexes
+
+
+def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False) -> None:
+    tables, indexes = _schema_objects(conn)
+    if (not set(_TABLE_COLUMNS).issubset(tables)
+            or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
+            or indexes != _INDEXES):
+        raise ValueError("unknown or incomplete SQLite state schema")
+    reference = _reference_columns()
+    for table in tables:
+        actual = [tuple(row) for row in conn.execute(f"PRAGMA table_info({table})")]
+        if table in reference:
+            expected = reference[table]
+            if preview and table == "jobs" and len(actual) == len(expected) - 1:
+                expected = expected[:-1]
+            if actual != expected:
+                raise ValueError("unknown or incomplete SQLite state schema")
+        elif {row[1] for row in actual} != _PROVIDER_COLUMNS[table]:
+            raise ValueError("unknown or incomplete SQLite state schema")
+    for index, table, columns in (("events_issue_id", "events", ("issue", "id")),
+                                  ("usage_events_issue", "usage_events",
+                                   ("issue", "created_at"))):
+        actual = tuple(row[2] for row in conn.execute(f"PRAGMA index_info({index})"))
+        owner = conn.execute("SELECT tbl_name FROM sqlite_master WHERE name=?",
+                             (index,)).fetchone()
+        if actual != columns or owner[0] != table:
+            raise ValueError("unknown or incomplete SQLite state schema")
+    unique_branch = any(
+        row[2] and not row[4] and
+        tuple(column[2] for column in conn.execute(f"PRAGMA index_info({row[1]})"))
+        == ("branch",)
+        for row in conn.execute("PRAGMA index_list(jobs)"))
+    if not unique_branch:
+        raise ValueError("unknown or incomplete SQLite state schema")
+    foreign_keys = [tuple(row[2:5]) for row in conn.execute(
+        "PRAGMA foreign_key_list(retry_state)")]
+    if foreign_keys != [("jobs", "issue", "issue")]:
+        raise ValueError("unknown or incomplete SQLite state schema")
+    checks = {
+        "retry_state": ("CHECK(attempts>=1)",
+                        "CHECK(resume_statusIN('running','correcting'))",
+                        "CHECK((lease_tokenISNULL)=(lease_expires_atISNULL))"),
+        "usage_events": ("CHECK(completeIN(0,1))",),
+    }
+    if "provider_cooldowns" in tables:
+        checks["provider_cooldowns"] = ("CHECK(reasonIN('quota'))",)
+    for table, required in checks.items():
+        sql = conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (table,)).fetchone()[0]
+        normalized = re.sub(r"\s+", "", sql).upper()
+        if any(expression.upper() not in normalized for expression in required):
+            raise ValueError("unknown or incomplete SQLite state schema")
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    # executescript() commits a pending transaction, so execute each statement
+    # separately to keep creation and user_version in the same transaction.
+    statement = ""
+    for line in SCHEMA.splitlines():
+        statement += line + "\n"
+        if sqlite3.complete_statement(statement):
+            conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise ValueError("incomplete SQLite schema definition")
+
+
+@lru_cache(maxsize=1)
+def _reference_columns() -> dict[str, list[tuple]]:
+    with sqlite3.connect(":memory:") as reference:
+        _create_schema(reference)
+        return {table: [tuple(row) for row in reference.execute(
+            f"PRAGMA table_info({table})")] for table in _TABLE_COLUMNS}
+
+
+def _migrate_preview(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "image_id" not in columns:
+        conn.execute("ALTER TABLE jobs ADD COLUMN image_id TEXT")
+
 
 def initialize(root: Path) -> Path:
     if root.is_symlink():
@@ -75,18 +187,28 @@ def initialize(root: Path) -> Path:
             raise ValueError("state_dir belongs to another user")
         os.chmod(root, 0o700)
     db = root / "state.sqlite3"
-    conn = sqlite3.connect(db)
+    fresh = not db.exists()
+    conn = sqlite3.connect(db, timeout=30)
     try:
-        conn.executescript(SCHEMA)
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-        for name, definition in (("last_model", "TEXT"),
-                                 ("result_model", "TEXT"),
-                                 ("attempts_count", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("review_next_check_at", "INTEGER NOT NULL DEFAULT 0"),
-                                 ("image_id", "TEXT")):
-            if name not in columns:
-                conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        conn.execute("BEGIN IMMEDIATE")
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version == 0 and fresh:
+            tables, indexes = _schema_objects(conn)
+            if tables or indexes:
+                raise ValueError("unknown or incomplete SQLite state schema")
+            _create_schema(conn)
+        elif version == 0:
+            _validate_schema(conn, preview=True)
+            _migrate_preview(conn)
+        elif version != SCHEMA_VERSION:
+            raise ValueError(f"unsupported SQLite state schema version: {version}")
+        _validate_schema(conn)
+        if version == 0:
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     finally:
         conn.close()
     if os.name != "nt":

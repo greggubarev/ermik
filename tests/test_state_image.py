@@ -7,6 +7,7 @@ import tempfile
 import unittest
 
 from ermik import state
+from tests.test_state_migrations import PREVIEW_SCHEMA
 
 
 IMAGE = "sha256:" + "a" * 64
@@ -51,10 +52,9 @@ class ImageStateTests(unittest.TestCase):
     def test_legacy_database_gains_nullable_image_column(self):
         db = self.root / "state.sqlite3"
         with closing(sqlite3.connect(db)) as conn:
-            conn.execute("CREATE TABLE jobs (issue INTEGER PRIMARY KEY, branch TEXT, "
-                         "base_sha TEXT, status TEXT, allowed_json TEXT)")
-            conn.execute("INSERT INTO jobs VALUES(1,'work/issue-1-test',?,'running','[]')",
-                         ("a" * 40,))
+            conn.executescript(PREVIEW_SCHEMA)
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(1,'work/issue-1-test',?,'running','[]')", ("a" * 40,))
             conn.commit()
         state.initialize(self.root)
         with state.connect(self.root) as conn:
