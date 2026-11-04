@@ -22,6 +22,7 @@ GO = ModelCandidate("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY")
 BODY = "## Goal\nChange one file.\n\n## Allowed paths\nfile.txt\n\n## Acceptance\nThe file changes.\n"
 BASE = "a" * 40
 IMAGE_ID = "sha256:" + "b" * 64
+CONFIG_DIGEST = "sha256:" + "9" * 64
 
 
 class StopAttempt(RuntimeError):
@@ -54,6 +55,10 @@ class RoutingTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE_ID)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest",
+                                return_value=CONFIG_DIGEST)
+        portable.start()
+        self.addCleanup(portable.stop)
 
     def tearDown(self):
         self.temp.cleanup()

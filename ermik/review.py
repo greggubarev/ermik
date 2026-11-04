@@ -15,7 +15,9 @@ from .github import GitHub, GitHubError
 from .git_tree import verify_changed_tree
 from .policy import parse_issue, validate_changed_paths
 from .runtime import (WorkflowError, _approved_on_github, git, local_checks,
-                      mirror, main_sha, _resolve_image_id, published_image_id)
+                      mirror, main_sha, _portable_image_digest,
+                      _resolve_image_id, published_image_id,
+                      published_image_config_digest)
 from . import state
 
 
@@ -35,13 +37,22 @@ def _checks_sha256(cfg: Config) -> str:
 def _review_policy(cfg: Config, record: dict, *, check_reference: bool) -> str:
     checks_hash = record.get("checks_sha256")
     image_id = record.get("image_id")
+    image_config_digest = record.get("image_config_digest")
+    published_image = record.get("published_image_id")
     if (not isinstance(checks_hash, str) or not _SHA256.fullmatch(checks_hash)
             or checks_hash != _checks_sha256(cfg)):
         raise WorkflowError("review check policy is missing or changed")
     if not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id):
         raise WorkflowError("review image ID is missing or malformed")
-    if check_reference and _resolve_image_id(cfg.image) != image_id:
-        raise WorkflowError("configured image changed since review")
+    if (not isinstance(image_config_digest, str)
+            or not _IMAGE_ID.fullmatch(image_config_digest)
+            or not isinstance(published_image, str)
+            or not _IMAGE_ID.fullmatch(published_image)):
+        raise WorkflowError("review portable image identity is missing or malformed")
+    if check_reference:
+        if (_resolve_image_id(cfg.image) != image_id
+                or _portable_image_digest(cfg.image, image_id) != image_config_digest):
+            raise WorkflowError("configured image changed since review")
     return image_id
 
 
@@ -148,9 +159,11 @@ def _review_locked(cfg: Config, number: int) -> dict:
     if pr["baseRefOid"] != main_sha(gh, cfg):
         raise WorkflowError("PR base is not current base branch")
     spec = parse_issue(issue["body"])
-    image_id = published_image_id(pr.get("body") or "")
-    if _resolve_image_id(cfg.image) != image_id:
-        raise WorkflowError("published execution image differs from configured image")
+    published_image = published_image_id(pr.get("body") or "")
+    published_config = published_image_config_digest(pr.get("body") or "")
+    image_id = _resolve_image_id(cfg.image)
+    if _portable_image_digest(cfg.image, image_id) != published_config:
+        raise WorkflowError("published execution image config differs from configured image")
     checkout = _checkout_pr(cfg, number, pr)
     try:
         if git(checkout, "rev-parse", "HEAD") != pr["headRefOid"]:
@@ -164,7 +177,8 @@ def _review_locked(cfg: Config, number: int) -> dict:
         validate_changed_paths(actual, spec.allowed_paths)
         proof = local_checks(cfg, checkout, image_id=image_id)
         actual_image = proof.get("image_id") if isinstance(proof, dict) else None
-        if actual_image != image_id:
+        if (actual_image != image_id
+                or proof.get("image_config_digest") != published_config):
             raise WorkflowError("review checks did not use the published execution image")
     finally:
         if checkout.exists():
@@ -172,7 +186,9 @@ def _review_locked(cfg: Config, number: int) -> dict:
     current = gh.pr(number)
     if current["headRefOid"] != pr["headRefOid"] or current["baseRefOid"] != pr["baseRefOid"]:
         raise WorkflowError("PR changed during local review")
-    if published_image_id(current.get("body") or "") != image_id:
+    if (published_image_id(current.get("body") or "") != published_image
+            or published_image_config_digest(current.get("body") or "")
+            != published_config):
         raise WorkflowError("published execution image changed during local review")
     _, _, current_issue = _identity(cfg, gh, number)
     if parse_issue(current_issue["body"]).body_sha256 != spec.body_sha256:
@@ -183,7 +199,8 @@ def _review_locked(cfg: Config, number: int) -> dict:
               "head": pr["headRefOid"], "body_sha256": spec.body_sha256,
               "paths": sorted(actual), "reviewed_at": datetime.now(timezone.utc).isoformat(),
               "ci": proof, "checks_sha256": _checks_sha256(cfg),
-              "image_id": image_id, "decision": "reviewed"}
+              "image_id": image_id, "published_image_id": published_image,
+              "image_config_digest": published_config, "decision": "reviewed"}
     _save(cfg, number, result)
     _record_decision(cfg, result, "reviewed")
     return result
@@ -307,7 +324,9 @@ def _post_merge_verification(cfg: Config, gh: GitHub, number: int,
                 git(source, "worktree", "remove", str(path))
             except Exception:
                 raise WorkflowError("post-merge checkout cleanup failed") from None
-    if not isinstance(proof, dict) or proof.get("result") != "passed":
+    if (not isinstance(proof, dict) or proof.get("result") != "passed"
+            or proof.get("image_id") != image_id
+            or proof.get("image_config_digest") != record["image_config_digest"]):
         raise WorkflowError("post-merge checks failed")
     try:
         issue_closed = gh.api(f"issues/{record['issue']}")["state"] == "closed"
@@ -337,7 +356,9 @@ def _merge_locked(cfg: Config, number: int) -> dict:
             or record.get("head_repository") != (cfg.publish_repo or cfg.repo)
             or not isinstance(record.get("branch"), str)):
         raise WorkflowError("reviewed PR identity is missing")
-    if published_image_id(pr.get("body") or "") != record.get("image_id"):
+    if (published_image_id(pr.get("body") or "") != record.get("published_image_id")
+            or published_image_config_digest(pr.get("body") or "")
+            != record.get("image_config_digest")):
         raise WorkflowError("published execution image changed since review")
     if pr["state"] == "OPEN":
         if record.get("merge_attempt") is not None:
@@ -369,15 +390,15 @@ def _merge_locked(cfg: Config, number: int) -> dict:
                comment.get("user", {}).get("login") == cfg.maintainer
                for comment in gh.comments(number)):
             raise WorkflowError("PR has a pending exact-head correction request")
-        if published_image_id(pr.get("body") or "") != _review_policy(
-                cfg, record, check_reference=True):
-            raise WorkflowError("published execution image changed since review")
+        _review_policy(cfg, record, check_reference=True)
         _record_decision(cfg, record, "reviewed")
         check_decision(cfg, record, "merge_intent")
         if pr["isDraft"]:
             gh.command(["pr", "ready", str(number), "-R", cfg.repo])
             pr = gh.pr(number)
-            if published_image_id(pr.get("body") or "") != record["image_id"]:
+            if (published_image_id(pr.get("body") or "") != record["published_image_id"]
+                    or published_image_config_digest(pr.get("body") or "")
+                    != record["image_config_digest"]):
                 raise WorkflowError("published execution image changed while making PR ready")
             if pr["isDraft"]:
                 raise WorkflowError("PR did not become ready")
@@ -390,7 +411,10 @@ def _merge_locked(cfg: Config, number: int) -> dict:
         current_pr, _, current_issue = _identity(cfg, gh, number)
         if parse_issue(current_issue["body"]).body_sha256 != record["body_sha256"]:
             raise WorkflowError("issue changed before merge")
-        if published_image_id(current_pr.get("body") or "") != record["image_id"]:
+        if (published_image_id(current_pr.get("body") or "")
+                != record["published_image_id"]
+                or published_image_config_digest(current_pr.get("body") or "")
+                != record["image_config_digest"]):
             raise WorkflowError("published execution image changed before merge")
         _review_policy(cfg, record, check_reference=True)
         record["merge_attempt"] = {"head": record["head"],

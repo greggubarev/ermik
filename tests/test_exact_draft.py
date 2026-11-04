@@ -13,6 +13,7 @@ BASE = "a" * 40
 HEAD = "b" * 40
 BRANCH = "work/issue-7-delivery"
 IMAGE = "sha256:" + "f" * 64
+CONFIG_DIGEST = "sha256:" + "9" * 64
 BODY = "## Allowed paths\nsrc/a.py\n\n## Goal\nFix a\n\n## Acceptance\nWorks\n"
 
 
@@ -54,7 +55,9 @@ def draft(**changes):
     return {"number": 19, "state": "OPEN", "isDraft": True,
             "headRefName": BRANCH, "headRefOid": HEAD,
             "baseRefName": "main", "baseRefOid": BASE,
-            "body": f"Closes #7\n\nExecution image: `{IMAGE}`\nLocal checks passed.",
+            "body": (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
+                     f"Execution image config: `{CONFIG_DIGEST}`\n"
+                     "Local checks passed."),
             "changedFiles": 1, "files": [{"path": "src/a.py"}], **changes}
 
 
@@ -63,6 +66,10 @@ class ExactDraftTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "f" * 64)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest",
+                                return_value=CONFIG_DIGEST)
+        portable.start()
+        self.addCleanup(portable.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
@@ -91,7 +98,8 @@ class ExactDraftTests(unittest.TestCase):
                 runtime, "_docker"), patch.object(
                 runtime, "_check_scope", return_value=["src/a.py"]), patch.object(
                 runtime, "git", side_effect=git), patch.object(
-                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}), patch.object(
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE,
+                                                       "image_config_digest": CONFIG_DIGEST}), patch.object(
                 runtime, "main_sha", return_value=BASE), patch.object(
                 runtime, "_approved_on_github", return_value=True):
             return runtime._perform(self.cfg, 7, BRANCH, self.spec,

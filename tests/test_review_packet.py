@@ -16,6 +16,7 @@ HEAD = "b" * 40
 BASE = "a" * 40
 OLD = "c" * 40
 IMAGE = "sha256:" + "d" * 64
+IMAGE_CONFIG_DIGEST = "sha256:" + "e" * 64
 BODY = "## Allowed paths\nsrc/one.py\n\n## Goal\nFix the parser\n\n## Acceptance\nChecks pass"
 
 
@@ -32,17 +33,22 @@ class ReviewPacketTests(unittest.TestCase):
         self.live = patch("ermik.review_packet._live",
                           return_value=(self.pr, 7, self.spec, ["src/one.py"]))
         self.image = patch("ermik.review_packet.published_image_id", return_value=IMAGE)
+        self.image_config = patch("ermik.review_packet.published_image_config_digest",
+                                  return_value=IMAGE_CONFIG_DIGEST)
         self.live.start()
         self.image.start()
+        self.image_config.start()
         self.addCleanup(self.live.stop)
         self.addCleanup(self.image.stop)
+        self.addCleanup(self.image_config.stop)
 
     def record(self, head=HEAD):
-        return {"repo": self.cfg.repo, "issue": 7, "pr": 12,
+        return {"version": 2, "repo": self.cfg.repo, "issue": 7, "pr": 12,
                 "head_repository": self.cfg.repo,
                 "branch": self.pr["headRefName"], "base": BASE, "head": head,
                 "body_sha256": self.spec.body_sha256, "paths": ["src/one.py"],
                 "checks_sha256": _checks_sha256(self.cfg), "image": IMAGE,
+                "image_config_digest": IMAGE_CONFIG_DIGEST,
                 "sha256": "f" * 64,
                 "checks": [{"index": 1, "result": "passed",
                             "log_sha256": "1" * 64}],
@@ -85,7 +91,10 @@ class ReviewPacketTests(unittest.TestCase):
                  "head_repository": self.cfg.repo,
                  "branch": self.pr["headRefName"], "base": BASE, "head": HEAD,
                  "body_sha256": self.spec.body_sha256, "paths": ["src/one.py"],
-                 "checks_sha256": _checks_sha256(self.cfg), "image_id": IMAGE,
+                 "checks_sha256": _checks_sha256(self.cfg),
+                 "image_id": "sha256:" + "9" * 64,
+                 "published_image_id": IMAGE,
+                 "image_config_digest": IMAGE_CONFIG_DIGEST,
                  "decision": "reviewed", "ci": {"result": "passed",
                                                  "private_log": "/secret/log"}}
         with (patch("ermik.review_packet._load", return_value=local),
@@ -97,6 +106,45 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(packet["status"], "current")
         self.assertEqual(packet["review"], {"status": "current", "head": HEAD})
         self.assertNotIn("/secret/log", str(packet))
+
+    def test_local_review_without_config_digest_is_stale(self):
+        (self.cfg.state_dir / "reviews").mkdir(parents=True)
+        (self.cfg.state_dir / "reviews" / "pr-12.json").write_text("{}")
+        local = {"repo": self.cfg.repo, "issue": 7, "pr": 12,
+                 "head_repository": self.cfg.repo,
+                 "branch": self.pr["headRefName"], "base": BASE, "head": HEAD,
+                 "body_sha256": self.spec.body_sha256, "paths": ["src/one.py"],
+                 "checks_sha256": _checks_sha256(self.cfg),
+                 "published_image_id": IMAGE,
+                 "decision": "reviewed", "ci": {"result": "passed"}}
+        with (patch("ermik.review_packet._load", return_value=local),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "current"}, self.record())),
+              patch("ermik.review_packet._published_records", return_value=[])):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "current")
+        self.assertEqual(packet["review"], {"status": "stale", "head": HEAD})
+
+    def test_manifest_without_config_digest_is_stale(self):
+        legacy = self.record()
+        legacy.pop("image_config_digest")
+        with patch("ermik.review_packet.fetch_manifest",
+                   return_value=({"status": "current"}, legacy)):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "stale")
+        self.assertEqual(packet["evidence"], {"status": "stale",
+                                              "reason": "identity_changed"})
+
+    def test_final_pr_config_change_marks_packet_stale(self):
+        with (patch("ermik.review_packet.published_image_config_digest",
+                    side_effect=[IMAGE_CONFIG_DIGEST, "sha256:" + "0" * 64]),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "current"}, self.record())),
+              patch("ermik.review_packet._published_records", return_value=[])):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "stale")
+        self.assertEqual(packet["evidence"], {"status": "stale",
+                                              "reason": "identity_changed"})
 
     def test_head_moves_between_live_snapshot_and_current_fetch(self):
         second_head = "e" * 40
@@ -177,6 +225,13 @@ class ReviewPacketTests(unittest.TestCase):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "unsupported_version")
         self.assertEqual(packet["evidence"], {"status": "unsupported_version"})
+
+    def test_legacy_manifest_reason_stays_explicit(self):
+        with patch("ermik.review_packet.fetch_manifest", return_value=(
+                {"status": "stale", "reason": "image_identity_missing"}, None)):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["evidence"], {"status": "stale",
+                                              "reason": "image_identity_missing"})
 
 
 if __name__ == "__main__":

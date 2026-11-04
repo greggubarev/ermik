@@ -24,7 +24,9 @@ BASE = "a" * 40
 HEAD = "b" * 40
 BRANCH = "work/issue-1-delivery"
 IMAGE = "sha256:" + "c" * 64
-PR_BODY = f"Closes #1\n\nExecution image: `{IMAGE}`"
+CONFIG = "sha256:" + "e" * 64
+PR_BODY = (f"Closes #1\n\nExecution image: `{IMAGE}`\n"
+           f"Execution image config: `{CONFIG}`")
 
 
 class FaultHub:
@@ -110,6 +112,9 @@ class FaultWindowTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest", return_value=CONFIG)
+        portable.start()
+        self.addCleanup(portable.stop)
 
     def tearDown(self):
         self.temp.cleanup()
@@ -231,7 +236,8 @@ class FaultWindowTests(unittest.TestCase):
                 runtime, "_docker"), patch.object(
                 runtime, "_check_scope", return_value=["src/example.py"]), patch.object(
                 runtime, "git", side_effect=git), patch.object(
-                runtime, "local_checks", return_value=proof or {"result": "passed", "image_id": IMAGE}), patch.object(
+                runtime, "local_checks", return_value=proof or {"result": "passed", "image_id": IMAGE,
+                                                                 "image_config_digest": CONFIG}), patch.object(
                 runtime, "main_sha", return_value=BASE):
             return runtime._perform(self.cfg, 1, BRANCH, self.spec,
                                     correction_note=None, pr_number=None,
@@ -259,7 +265,7 @@ class FaultWindowTests(unittest.TestCase):
 
     def test_oversized_broker_evidence_blocks_before_branch_push(self):
         self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
-        proof = {"result": "passed", "image_id": IMAGE,
+        proof = {"result": "passed", "image_id": IMAGE, "image_config_digest": CONFIG,
                  "checks": [{"command": ["x" * 65536]}]}
         with self.assertRaisesRegex(ValueError, "evidence is too large"):
             self._perform_with_fake_git(proof=proof)
@@ -289,7 +295,8 @@ class FaultWindowTests(unittest.TestCase):
         with patch.object(runtime, "mirror", return_value=self.cfg.workspace), patch.object(
                 runtime, "git", side_effect=fake_git), patch.object(
                 runtime, "_remove_checkout"), patch.object(
-                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}), patch.object(
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE,
+                                                       "image_config_digest": CONFIG}), patch.object(
                 runtime, "main_sha", return_value=BASE):
             result = runtime._recover_unacknowledged_push(
                 self.gh, self.cfg, row, self.gh.issue(1), self.spec, remote)
@@ -320,7 +327,8 @@ class FaultWindowTests(unittest.TestCase):
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
                  "body_sha256": self.spec.body_sha256,
-                 "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
+                 "ci": {"result": "passed", "image_id": IMAGE,
+                        "image_config_digest": CONFIG}, "model": "kimi"}
         (self.cfg.workspace / "source").mkdir(parents=True)
         with patch.object(self.gh, "find_branch_pr", return_value=None), patch.object(
                 runtime, "checked", return_value=f"{HEAD}\trefs/heads/{BRANCH}"), patch.object(
@@ -343,7 +351,8 @@ class FaultWindowTests(unittest.TestCase):
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
                  "body_sha256": self.spec.body_sha256,
-                 "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
+                 "ci": {"result": "passed", "image_id": IMAGE,
+                        "image_config_digest": CONFIG}, "model": "kimi"}
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
@@ -369,7 +378,8 @@ class FaultWindowTests(unittest.TestCase):
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
                  "body_sha256": self.spec.body_sha256,
-                 "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
+                 "ci": {"result": "passed", "image_id": IMAGE,
+                        "image_config_digest": CONFIG}, "model": "kimi"}
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
@@ -387,7 +397,8 @@ class FaultWindowTests(unittest.TestCase):
     def test_crash_leftover_clean_exact_head_recovers_with_fresh_checks(self):
         source, checkout, base, head = self._published_leftover()
         with patch.object(runtime, "mirror", return_value=source), patch.object(
-                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks:
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE,
+                                                       "image_config_digest": CONFIG}) as checks:
             with state.connect(self.cfg.state_dir) as conn:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
                 row = state.job(conn, 1)
@@ -449,7 +460,8 @@ class FaultWindowTests(unittest.TestCase):
         self.gh.prs[10]["headRefOid"] = advanced
         with patch.object(runtime, "mirror", return_value=source), patch.object(
                 runtime, "local_checks", return_value={
-                    "result": "passed", "image_id": IMAGE}) as checks, patch.object(
+                    "result": "passed", "image_id": IMAGE,
+                    "image_config_digest": CONFIG}) as checks, patch.object(
                 runtime, "_perform") as perform:
             with state.connect(self.cfg.state_dir) as conn:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
@@ -467,7 +479,8 @@ class FaultWindowTests(unittest.TestCase):
         valid = {"issue": 1, "pr": 10, "branch": BRANCH, "head": None,
                  "base": None, "paths": ["src/example.py"],
                  "body_sha256": self.spec.body_sha256,
-                 "ci": {"result": "passed", "image_id": IMAGE}, "model": None}
+                 "ci": {"result": "passed", "image_id": IMAGE,
+                        "image_config_digest": CONFIG}, "model": None}
         changes = {"base": "d" * 40, "paths": ["src/other.py"],
                    "body_sha256": "0" * 64, "model": "wrong-route"}
         for field, changed in changes.items():
@@ -498,7 +511,8 @@ class FaultWindowTests(unittest.TestCase):
         with patch.object(runtime, "mirror", return_value=source), patch.object(
                 runtime, "checked", side_effect=checked), patch.object(
                 runtime, "main_sha", return_value=base), patch.object(
-                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks:
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE,
+                                                       "image_config_digest": CONFIG}) as checks:
             with state.connect(self.cfg.state_dir) as conn:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
                 row = state.job(conn, 1)
@@ -550,7 +564,8 @@ class FaultWindowTests(unittest.TestCase):
         source, checkout, _base, _head = self._published_leftover()
         self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
         with patch.object(runtime, "mirror", return_value=source), patch.object(
-                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks, \
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE,
+                                                       "image_config_digest": CONFIG}) as checks, \
                 patch.object(runtime, "_draft_pr", side_effect=runtime.GitHubError(
                     "broker refused")) as broker:
             with state.connect(self.cfg.state_dir) as conn:
@@ -591,10 +606,12 @@ class FaultWindowTests(unittest.TestCase):
               "files": [{"path": "src/example.py"}]}
         record = {"pr": 10, "issue": 1, "repo": self.cfg.repo,
                   "head": HEAD, "base": BASE, "image_id": IMAGE,
+                  "image_config_digest": CONFIG,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
                   "paths": ["src/example.py"],
                   "ci": {"head": HEAD, "committed_diff_base": BASE,
-                         "image_id": IMAGE, "result": "passed",
+                         "image_id": IMAGE, "image_config_digest": CONFIG,
+                         "result": "passed",
                          "checks": [{"command": ["true"], "exit_code": 0,
                                      "log_sha256": "d" * 64}]}}
         self.gh.comment_loss = True

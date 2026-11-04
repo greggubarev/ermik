@@ -26,6 +26,7 @@ from ermik.pr_broker import Broker
 HEAD = "a" * 40
 BASE = "b" * 40
 IMAGE = "sha256:" + "c" * 64
+CONFIG = "sha256:" + "d" * 64
 BRANCH = "work/issue-7-delivery"
 BODY = "## Allowed paths\nsrc/file.py\n\n## Goal\nFix it\n\n## Acceptance\nIt works\n"
 REQUEST = {"op": "create_draft", "issue": 7, "branch": BRANCH,
@@ -119,7 +120,8 @@ class BrokerProcessKillTests(unittest.TestCase):
             spec = parse_issue(BODY)
             record = {"issue": 7, "branch": BRANCH, "head": HEAD, "base": BASE,
                       "body_sha256": spec.body_sha256, "paths": ["src/file.py"],
-                      "ci": {"result": "passed", "image_id": IMAGE}}
+                      "ci": {"result": "passed", "image_id": IMAGE,
+                             "image_config_digest": CONFIG}}
             (evidence / f"{HEAD}.json").write_text(json.dumps(record), encoding="utf-8")
             first = subprocess.Popen([sys.executable, __file__, "--child", str(root), "hold"],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

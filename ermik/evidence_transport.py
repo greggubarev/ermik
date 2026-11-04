@@ -12,7 +12,8 @@ from .evidence_export import export_manifest, verify_manifest
 from .github import GitHub, GitHubError
 
 
-MARKER = "Ermik evidence v1\n\n```json\n"
+MARKER = "Ermik evidence v2\n\n```json\n"
+_MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER}
 _SUFFIX = "```"
 MAX_COMMENTS = 1000
 
@@ -36,14 +37,17 @@ def _body(record: dict) -> str:
     raw = dumps_manifest(record)
     if len(raw) > MAX_BYTES + 1:
         raise ValueError("manifest too large")
-    return MARKER + raw.decode("utf-8") + _SUFFIX
+    return _MARKERS[record["version"]] + raw.decode("utf-8") + _SUFFIX
 
 
 def _record(body: str) -> dict:
-    if (not isinstance(body, str) or not body.startswith(MARKER)
-            or not body.endswith(_SUFFIX)):
+    if not isinstance(body, str) or not body.endswith(_SUFFIX):
         raise ValueError("invalid evidence comment")
-    raw = body[len(MARKER):-len(_SUFFIX)].encode("utf-8")
+    marker = next((value for value in _MARKERS.values()
+                   if body.startswith(value)), None)
+    if marker is None:
+        raise ValueError("invalid evidence comment")
+    raw = body[len(marker):-len(_SUFFIX)].encode("utf-8")
     if len(raw) > MAX_BYTES + 1:
         raise ValueError("manifest too large")
     record = loads_manifest(raw)
@@ -89,9 +93,9 @@ def _published_records(cfg: Config, gh: GitHub, pr_number: int) -> list[tuple[di
                 bounded = False
             if not bounded:
                 raise EvidenceRecordError("publisher evidence comment is malformed")
-            if marker.group(1) != "1":
+            if marker.group(1) not in ("1", "2"):
                 raise UnsupportedEvidenceVersion("publisher evidence version is unsupported")
-        if not body.startswith(MARKER):
+        if not any(body.startswith(value) for value in _MARKERS.values()):
             if marker:
                 raise EvidenceRecordError("publisher evidence comment is malformed")
             continue

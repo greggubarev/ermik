@@ -48,7 +48,10 @@ def review_digest(cfg: Config, record: dict) -> str:
     if type(ci) is not dict or ci.get("result") != "passed":
         raise ValueError("passing local CI proof is required")
     image = ci.get("image_id")
+    image_config_digest = ci.get("image_config_digest")
     if (not isinstance(image, str) or not _IMAGE.fullmatch(image)
+            or not isinstance(image_config_digest, str)
+            or not _IMAGE.fullmatch(image_config_digest)
             or record.get("image_id") != image
             or ci.get("head") != head
             or ci.get("committed_diff_base") != base):
@@ -69,10 +72,11 @@ def review_digest(cfg: Config, record: dict) -> str:
         projection.append({"command": command, "exit_code": 0,
                            "log_sha256": log_hash})
     proof = {"base": base, "head": head, "image_id": image,
+             "image_config_digest": image_config_digest,
              "result": "passed", "checks": projection}
     encoded = json.dumps(proof, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=True).encode("utf-8")
-    return hashlib.sha256(b"ermik-local-review-proof-v1\0" + encoded).hexdigest()
+    return hashlib.sha256(b"ermik-local-review-proof-v2\0" + encoded).hexdigest()
 
 
 def _path(cfg: Config, pr: int) -> Path:

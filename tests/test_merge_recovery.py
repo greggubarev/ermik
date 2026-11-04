@@ -20,6 +20,7 @@ BASE = "a" * 40
 HEAD = "b" * 40
 MERGED = "c" * 40
 IMAGE = "sha256:" + "d" * 64
+IMAGE_CONFIG = "sha256:" + "f" * 64
 BRANCH = "work/issue-7-delivery"
 PR = 19
 
@@ -53,7 +54,8 @@ class MergeHub(GitHub):
                 "headRefName": self.branch, "headRefOid": self.head,
                 "headRepository": {"nameWithOwner": self.head_repo},
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
-                "body": f"Closes #7\n\nExecution image: `{IMAGE}`",
+                "body": (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
+                         f"Execution image config: `{IMAGE_CONFIG}`"),
                 "mergeCommit": {"oid": MERGED} if self.state == "MERGED" else None}
 
     def comments(self, number):
@@ -110,15 +112,19 @@ class MergeRecoveryTests(unittest.TestCase):
                        "body_sha256": parse_issue(BODY).body_sha256,
                        "paths": ["src/a.py"], "decision": "reviewed",
                        "checks_sha256": review._checks_sha256(self.cfg),
-                       "image_id": IMAGE,
+                       "image_id": IMAGE, "published_image_id": IMAGE,
+                       "image_config_digest": IMAGE_CONFIG,
                        "ci": {"head": HEAD, "committed_diff_base": BASE,
-                              "image_id": IMAGE, "result": "passed",
+                              "image_id": IMAGE,
+                              "image_config_digest": IMAGE_CONFIG,
+                              "result": "passed",
                               "checks": [{"command": ["true"], "exit_code": 0,
                                           "log_sha256": "e" * 64}]}}
         review._save(self.cfg, PR, self.record)
         for target, value in (("GitHub", self.hub),
                               ("_approved_on_github", True),
                               ("_resolve_image_id", IMAGE),
+                              ("_portable_image_digest", IMAGE_CONFIG),
                               ("main_sha", self._main_sha),
                               ("mirror", root / "source"),
                               ("git", self._git),
@@ -147,7 +153,8 @@ class MergeRecoveryTests(unittest.TestCase):
         if self.fail_check_once:
             self.fail_check_once = False
             raise runtime.WorkflowError("post-merge checks failed")
-        return {"result": "passed", "image_id": image_id}
+        return {"result": "passed", "image_id": image_id,
+                "image_config_digest": IMAGE_CONFIG}
 
     def _merge(self):
         return review.merge(self.cfg, PR)

@@ -11,6 +11,7 @@ from ermik import runtime
 from ermik.config import Config
 
 IMAGE_ID = "sha256:" + "a" * 64
+CONFIG_DIGEST = "sha256:" + "b" * 64
 
 
 class ContainerCleanupTests(unittest.TestCase):
@@ -25,6 +26,10 @@ class ContainerCleanupTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value=IMAGE_ID)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest",
+                                return_value=CONFIG_DIGEST)
+        portable.start()
+        self.addCleanup(portable.stop)
 
     def tearDown(self):
         runtime._CLEANED_NAMESPACES.discard(self.namespace)
@@ -185,6 +190,7 @@ class ContainerCleanupTests(unittest.TestCase):
             proof = runtime.local_checks(cfg, checkout)
         self.assertEqual(launches, [IMAGE_ID, IMAGE_ID])
         self.assertEqual(proof["image_id"], IMAGE_ID)
+        self.assertEqual(proof["image_config_digest"], CONFIG_DIGEST)
 
     def test_retag_between_checks_does_not_change_launched_image(self):
         from dataclasses import replace

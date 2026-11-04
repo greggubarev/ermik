@@ -43,6 +43,7 @@ _CONTAINER_LOCK = threading.Lock()
 _PUBLISH_HELPER_LOCK = threading.Lock()
 _MIRROR_LOCK = threading.RLock()
 _PUBLISHED_IMAGE = re.compile(r"Execution image: `(sha256:[0-9a-f]{64})`\Z")
+_PUBLISHED_IMAGE_CONFIG = re.compile(r"Execution image config: `(sha256:[0-9a-f]{64})`\Z")
 
 
 def published_image_id(body: str) -> str:
@@ -51,6 +52,16 @@ def published_image_id(body: str) -> str:
     lines = [line for line in body.splitlines() if line.startswith("Execution image:")]
     if len(lines) != 1 or (match := _PUBLISHED_IMAGE.fullmatch(lines[0])) is None:
         raise WorkflowError("PR lacks one valid execution image ID")
+    return match.group(1)
+
+
+def published_image_config_digest(body: str) -> str:
+    if not isinstance(body, str):
+        raise WorkflowError("PR lacks one valid execution image config digest")
+    lines = [line for line in body.splitlines()
+             if line.startswith("Execution image config:")]
+    if len(lines) != 1 or (match := _PUBLISHED_IMAGE_CONFIG.fullmatch(lines[0])) is None:
+        raise WorkflowError("PR lacks one valid execution image config digest")
     return match.group(1)
 
 
@@ -68,10 +79,15 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
     """Publish only a checked commit; the broker validates remote identity again."""
     if cfg.draft_pr_socket is None:
         image_id = proof.get("image_id")
+        image_config_digest = proof.get("image_config_digest")
         if not isinstance(image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
             raise WorkflowError("draft evidence lacks a valid execution image ID")
+        if (not isinstance(image_config_digest, str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", image_config_digest)):
+            raise WorkflowError("draft evidence lacks a valid image config digest")
         body = (f"Closes #{issue}\n\nAllowed paths: {', '.join(paths)}\n"
                 f"Execution image: `{image_id}`\n"
+                f"Execution image config: `{image_config_digest}`\n"
                 f"Local checks passed on `{head}`.\nReview the full diff and acceptance criteria.")
         return gh.open_pr(branch, body, title, cfg.base_branch)
     root = cfg.draft_pr_evidence_dir or cfg.state_dir / "evidence"
@@ -461,6 +477,18 @@ def _resolve_image_id(image: str) -> str:
     return image_id
 
 
+def _portable_image_digest(image: str, image_id: str) -> str:
+    """Bind the runnable local reference to verified image config bytes."""
+    from .image_identity import ImageIdentityError, resolve_image_identity
+    try:
+        observed_id, digest = resolve_image_identity(image)
+    except ImageIdentityError as exc:
+        raise WorkflowError("portable image identity is unavailable") from exc
+    if observed_id != image_id:
+        raise WorkflowError("Docker image changed while resolving portable identity")
+    return digest
+
+
 def _docker(cfg: Config, checkout: Path, command: tuple[str, ...], *,
             issue_file: Path | None, network: bool, timeout: int,
             log_path: Path | None = None, selected_model=None,
@@ -532,11 +560,13 @@ def local_checks(cfg: Config, checkout: Path, *, image_id: str | None = None) ->
     sha = git(checkout, "rev-parse", "HEAD")
     base = git(checkout, "merge-base", sha, f"origin/{cfg.base_branch}")
     git(checkout, "diff", "--check", f"{base}...{sha}")
+    identity_ref = cfg.image if image_id is None else image_id
     if image_id is None:
         image_id = _resolve_image_id(cfg.image)
     elif (not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id)
           or _resolve_image_id(image_id) != image_id):
         raise WorkflowError("expected Docker image is unavailable")
+    image_config_digest = _portable_image_digest(identity_ref, image_id)
     logs = []
     for index, command in enumerate(cfg.checks, start=1):
         log_path = cfg.state_dir / "ci-logs" / sha / f"check-{index}.log"
@@ -552,6 +582,7 @@ def local_checks(cfg: Config, checkout: Path, *, image_id: str | None = None) ->
     return {"head": sha, "committed_diff_base": base,
             "started": started, "finished": datetime.now(timezone.utc).isoformat(),
             "checks": logs, "image_id": image_id,
+            "image_config_digest": image_config_digest,
             "result": "passed"}
 
 
@@ -833,6 +864,9 @@ def _rebuild_published_evidence(cfg: Config, row, pr: dict) -> dict:
     """Rerun checks on an exact local commit after an acknowledged PR write was lost."""
     if not row["image_id"] or published_image_id(pr.get("body") or "") != row["image_id"]:
         raise WorkflowError("published PR image differs from recorded execution image")
+    if (published_image_config_digest(pr.get("body") or "")
+            != _portable_image_digest(row["image_id"], row["image_id"])):
+        raise WorkflowError("published PR image config differs from recorded execution image")
     if (not pr.get("isDraft") or pr.get("changedFiles") != len(pr.get("files", []))
             or not pr["files"] or pr["changedFiles"] > 100
             or re.findall(r"(?im)\bCloses\s+#(\d+)\b", pr.get("body") or "") !=
@@ -887,7 +921,9 @@ def _published_evidence_matches(proof: dict, row, pr: dict,
             and isinstance(proof.get("ci"), dict)
             and proof["ci"].get("result") == "passed"
             and row["image_id"] is not None
-            and proof["ci"].get("image_id") == row["image_id"])
+            and proof["ci"].get("image_id") == row["image_id"]
+            and proof["ci"].get("image_config_digest")
+            == published_image_config_digest(pr.get("body") or ""))
 
 
 def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
@@ -955,7 +991,9 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
     if (not pr["isDraft"] or sorted(file["path"] for file in pr["files"]) != paths
             or pr["changedFiles"] != len(paths)):
         raise WorkflowError("orphan branch PR differs from checked commit")
-    if published_image_id(pr.get("body") or "") != row["image_id"]:
+    if (published_image_id(pr.get("body") or "") != row["image_id"]
+            or published_image_config_digest(pr.get("body") or "")
+            != proof["image_config_digest"]):
         raise WorkflowError("orphan branch PR image differs from recorded execution image")
     return {"issue": row["issue"], "pr": number, "branch": row["branch"],
             "head": head, "base": row["base_sha"], "paths": paths,
@@ -1082,7 +1120,9 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                         raise WorkflowError("published branch lacks matching evidence")
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
                     write_evidence(evidence, proof)
-                if published_image_id(pr.get("body") or "") != row["image_id"]:
+                if (published_image_id(pr.get("body") or "") != row["image_id"]
+                        or published_image_config_digest(pr.get("body") or "")
+                        != proof["ci"].get("image_config_digest")):
                     raise WorkflowError("published PR image differs from recorded execution image")
                 if cfg.draft_pr_socket is not None and row["pr"] is None:
                     # A lost PR response must pass the same broker gate as a new PR.
@@ -1225,7 +1265,9 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         with state.connect(cfg.state_dir) as conn:
             prior = state.job(conn, issue)
         if prior is None or not prior["image_id"] or published_image_id(
-                original.get("body") or "") != prior["image_id"]:
+                original.get("body") or "") != prior["image_id"] or published_image_config_digest(
+                    original.get("body") or "") != _portable_image_digest(
+                        prior["image_id"], prior["image_id"]):
             raise WorkflowError("correction PR image differs from recorded execution image")
     base = main_sha(gh, cfg) if pr_number is not None else expected_base
     checkout = _checkout(cfg, issue, branch, correction=pr_number is not None)
@@ -1252,7 +1294,9 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
             if image_id is None:
                 if job["attempts_count"] != 0 or pr_number is not None:
                     raise WorkflowError("previous attempt has no recorded image ID")
-                image_id = state.bind_image(conn, issue, _resolve_image_id(cfg.image))
+                image_id = _resolve_image_id(cfg.image)
+                _portable_image_digest(cfg.image, image_id)
+                image_id = state.bind_image(conn, issue, image_id)
         if _resolve_image_id(image_id) != image_id:
             raise WorkflowError("recorded Docker image is unavailable")
         used_model = None
@@ -1392,7 +1436,9 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         head_sha=head)
             if creating_pr and observed.get("isDraft") is not True:
                 raise WorkflowError("initial PR is not a draft")
-        if published_image_id(observed.get("body") or "") != image_id:
+        if (published_image_id(observed.get("body") or "") != image_id
+                or published_image_config_digest(observed.get("body") or "")
+                != proof["image_config_digest"]):
             raise WorkflowError("published PR image differs from recorded execution image")
         result = {"issue": issue, "pr": pr_number, "branch": branch, "head": head,
                   "base": base,

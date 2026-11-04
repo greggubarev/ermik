@@ -41,19 +41,20 @@ class EvidenceTests(unittest.TestCase):
               patch("ermik.evidence_export._live", return_value=(pr, 1, spec, h2["paths"])),
               patch("ermik.evidence_export.published_image_id", return_value=h2["image"]),
               patch("ermik.evidence_export._resolve_image_id", return_value=h2["image"])):
-            self.assertEqual(verify_manifest(cfg, 2, h2)["status"], "current")
+            self.assertEqual(verify_manifest(cfg, 2, h2),
+                             {"status": "stale", "reason": "image_identity_missing"})
             self.assertEqual(verify_manifest(cfg, 2, h1),
-                             {"status": "stale", "reason": "identity_changed"})
+                             {"status": "stale", "reason": "image_identity_missing"})
             changed_checks = Config("owner/example", "maintainer", Path("state"),
                                     Path("work"), h2["image"], ("run",),
                                     (("check", "different"),), 1, 60, (), "main")
             self.assertEqual(verify_manifest(changed_checks, 2, h2),
-                             {"status": "stale", "reason": "identity_changed"})
+                             {"status": "stale", "reason": "image_identity_missing"})
 
     def test_fixture_version_dispatch_and_rejections(self):
         raw = self.fixture("h1")
         record = loads_manifest(raw)
-        for version in (2, 0, 1.0, "1", True):
+        for version in (3, 0, 1.0, "1", True):
             changed = {**record, "version": version, "future_required": "value"}
             with self.subTest(version=version), self.assertRaisesRegex(
                     UnsupportedManifestVersion, "unsupported manifest version"):
@@ -87,7 +88,9 @@ class EvidenceTests(unittest.TestCase):
                 "checks_sha256": checks,
                 "paths": ["src/one.py", "tests/test_one.py"],
                 "checks": [{"index": 1, "result": "passed", "log_sha256": "d" * 64}],
-                "image": "sha256:" + "e" * 64, "model": "provider/model",
+                "image": "sha256:" + "e" * 64,
+                "image_config_digest": "sha256:" + "9" * 64,
+                "model": "provider/model",
                 "attempts": 2,
                 "usage": {"observation": "measured", "input": 100, "output": 20,
                           "reasoning": 0, "cache_read": 5, "cache_write": 0,

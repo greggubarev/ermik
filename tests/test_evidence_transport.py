@@ -1,5 +1,6 @@
 """Bounded, identity-checked delivery across independent installations."""
 
+import hashlib
 import json
 from pathlib import Path
 import unittest
@@ -16,6 +17,7 @@ from ermik.github import GitHubError
 HEAD = "b" * 40
 BASE = "a" * 40
 IMAGE = "sha256:" + "e" * 64
+CONFIG_DIGEST = "sha256:" + "9" * 64
 
 
 def manifest(head=HEAD, repo="owner/project", model="provider/model"):
@@ -25,9 +27,21 @@ def manifest(head=HEAD, repo="owner/project", model="provider/model"):
                          checks_sha256="f" * 64, paths=["src/one.py"],
                          checks=[{"index": 1, "result": "passed",
                                   "log_sha256": "1" * 64}], image=IMAGE,
+                         image_config_digest=CONFIG_DIGEST,
                          model=model, attempts=1,
                          usage={"observation": "unknown"},
                          unknowns=["usage"] if model else ["model", "usage"])
+
+
+def legacy_manifest():
+    record = manifest(model=None)
+    del record["image_config_digest"]
+    del record["sha256"]
+    record["version"] = 1
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=True).encode("utf-8")
+    record["sha256"] = hashlib.sha256(payload).hexdigest()
+    return record
 
 
 class FakeGitHub:
@@ -93,6 +107,24 @@ class EvidenceTransportTests(unittest.TestCase):
         result, record = fetch_manifest(self.cfg, 12)
         self.assertEqual(result["status"], "current")
         self.assertEqual(record["sha256"], first["sha256"])
+        self.assertTrue(self.gh.rows[0]["body"].startswith(MARKER))
+        self.assertEqual(record["image_config_digest"], CONFIG_DIGEST)
+
+    def test_v1_comment_remains_parseable_as_history(self):
+        legacy = legacy_manifest()
+        body = _body(legacy)
+        self.assertTrue(body.startswith("Ermik evidence v1\n"))
+        self.assertEqual(_record(body), legacy)
+        self.gh.rows.append({"id": 1, "body": body,
+                             "user": {"login": "publisher", "id": 42}})
+        found = _published_records(self.cfg, self.gh, 12)
+        self.assertEqual(found[0][1], legacy)
+        self.assertEqual(found[0][1]["version"], 1)
+        with patch("ermik.evidence_transport.verify_manifest",
+                   return_value={"status": "stale", "reason": "image_identity_missing"}):
+            status, historical = fetch_manifest(self.cfg, 12)
+        self.assertEqual(status["reason"], "image_identity_missing")
+        self.assertEqual(historical, legacy)
 
     def test_missing_wrong_publisher_and_correction(self):
         self.assertEqual(fetch_manifest(self.cfg, 12), ({"status": "missing"}, None))
@@ -145,7 +177,7 @@ class EvidenceTransportTests(unittest.TestCase):
             fetch_manifest(self.cfg, 12)
 
     def test_future_marker_from_pinned_publisher_is_unsupported(self):
-        body = "Ermik evidence v2\n\n```json\n{}\n```"
+        body = "Ermik evidence v3\n\n```json\n{}\n```"
         self.gh.rows.append({"id": 1, "body": body,
                              "user": {"login": "publisher", "id": 99}})
         self.assertEqual(fetch_manifest(self.cfg, 12), ({"status": "missing"}, None))
@@ -154,24 +186,24 @@ class EvidenceTransportTests(unittest.TestCase):
             _published_records(self.cfg, self.gh, 12)
         self.assertEqual(fetch_manifest(self.cfg, 12),
                          ({"status": "unsupported_version"}, None))
-        for marker in ("Ermik evidence v2", "Ermik evidence v01"):
+        for marker in ("Ermik evidence v3", "Ermik evidence v01"):
             with self.subTest(marker=marker):
                 self.gh.rows[0]["body"] = marker
                 self.assertEqual(fetch_manifest(self.cfg, 12),
                                  ({"status": "unsupported_version"}, None))
-        self.gh.rows[0]["body"] = "Ermik evidence v2.0"
+        self.gh.rows[0]["body"] = "Ermik evidence v3.0"
         self.assertEqual(fetch_manifest(self.cfg, 12),
                          ({"status": "stale", "reason": "invalid_record"}, None))
         self.gh.rows[0]["body"] = body + "x" * 17000
         self.assertEqual(fetch_manifest(self.cfg, 12),
                          ({"status": "stale", "reason": "invalid_record"}, None))
 
-    def test_v2_payload_under_v1_marker_is_unsupported(self):
-        body = _body(manifest(model=None)).replace('"version":1', '"version":2')
+    def test_v2_payload_under_v1_marker_is_invalid(self):
+        body = _body(manifest(model=None)).replace("Ermik evidence v2", "Ermik evidence v1")
         self.gh.rows.append({"id": 1, "body": body,
                              "user": {"login": "publisher", "id": 42}})
         self.assertEqual(fetch_manifest(self.cfg, 12),
-                         ({"status": "unsupported_version"}, None))
+                         ({"status": "stale", "reason": "invalid_record"}, None))
 
     def test_lost_post_response_reconciles_without_second_comment(self):
         self.gh.fail_after_post = True

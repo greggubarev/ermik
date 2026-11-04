@@ -27,6 +27,7 @@ The file contains a greeting.
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
+CONFIG = "sha256:" + "e" * 64
 
 
 class FakeHub:
@@ -100,6 +101,9 @@ class WorkflowTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "d" * 64)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest", return_value=CONFIG)
+        portable.start()
+        self.addCleanup(portable.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -288,7 +292,8 @@ class WorkflowTests(unittest.TestCase):
                             "headRefOid": SHA_B, "baseRefOid": SHA_A,
                             "baseRefName": "main", "isDraft": True,
                             "changedFiles": 1, "files": [{"path": "src/example.py"}],
-                            "body": f"Closes #1\n\nExecution image: `sha256:{'d' * 64}`"}
+                            "body": f"Closes #1\n\nExecution image: `sha256:{'d' * 64}`\n"
+                                    f"Execution image config: `{CONFIG}`"}
         FakeHub.notes[10] = [{"id": 99,
             "body": f"SEMI_REWORK issue=1 head={SHA_B}\n\nPlease fix it",
             "user": {"login": "owner"}}]
@@ -296,7 +301,9 @@ class WorkflowTests(unittest.TestCase):
                   "head_repository": self.cfg.repo,
                   "branch": "work/issue-1-delivery", "head": SHA_B, "base": SHA_A,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
-                  "paths": ["src/example.py"], "image_id": "sha256:" + "d" * 64}
+                  "paths": ["src/example.py"], "image_id": "sha256:" + "d" * 64,
+                  "image_config_digest": CONFIG,
+                  "published_image_id": "sha256:" + "d" * 64}
         review_module._save(self.cfg, 10, record)
         with patch.object(review_module, "GitHub", FakeHub), patch.object(
                 review_module, "main_sha", return_value=SHA_A):
@@ -348,7 +355,8 @@ class WorkflowTests(unittest.TestCase):
                 return {"number": number, "state": "OPEN", "isDraft": True,
                         "headRefName": branch, "headRefOid": head,
                         "baseRefName": "main", "baseRefOid": base,
-                        "body": f"Closes #1\n\nExecution image: `sha256:{'d' * 64}`"}
+                        "body": f"Closes #1\n\nExecution image: `sha256:{'d' * 64}`\n"
+                                f"Execution image config: `{CONFIG}`"}
 
         def write_file(_cfg, checkout, _command, *, issue_file, network, timeout,
                        image_id):
@@ -362,7 +370,8 @@ class WorkflowTests(unittest.TestCase):
                 runtime, "mirror", return_value=mirror), patch.object(
                 runtime, "_docker", side_effect=write_file), patch.object(
                 runtime, "local_checks", return_value={"result": "passed",
-                                                      "image_id": "sha256:" + "d" * 64}), patch.object(
+                                                      "image_id": "sha256:" + "d" * 64,
+                                                      "image_config_digest": CONFIG}), patch.object(
                 runtime, "main_sha", return_value=base):
             spec = runtime.parse_issue(BODY)
             first = runtime._perform(self.cfg, 1, branch, spec,
