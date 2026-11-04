@@ -347,9 +347,9 @@ class FaultWindowTests(unittest.TestCase):
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id) "
-                         "VALUES(?,?,?,'running',?,?)",
-                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id,last_model) "
+                         "VALUES(?,?,?,'running',?,?,?)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE, "kimi"))
             with patch.object(runtime, "_rebuild_published_evidence", return_value=proof), \
                     patch.object(runtime, "_draft_pr", side_effect=runtime.GitHubError(
                         "broker refused")) as broker:
@@ -373,9 +373,9 @@ class FaultWindowTests(unittest.TestCase):
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, self.spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id) "
-                         "VALUES(?,?,?,'running',?,?)",
-                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,image_id,last_model) "
+                         "VALUES(?,?,?,'running',?,?,?)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE, "kimi"))
             with patch.object(runtime, "_rebuild_published_evidence", return_value=proof), \
                     patch.object(runtime, "_draft_pr", return_value=10) as broker:
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
