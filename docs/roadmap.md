@@ -2,19 +2,13 @@
 
 Ermik is a preview. Its immediate goal is a verifiable handoff: an admitted, path-scoped issue becomes one draft PR; a maintainer can request a correction on that PR, review its current HEAD, and explicitly merge it. The controller runs configured local checks without requiring GitHub Actions. The [release status](readiness.md) separates completed trials from open validation work, and the [security model](security.md) describes the trusted host and credential boundaries.
 
-Phases below are ordered by evidence needed, not by release date. The v0.2 reliability gates remain open. Portable evidence reached a separate read-scoped installation in v0.3, and a cross-store image review completed its documented trial. v0.4 and v0.5 describe planned work. Completion requires the stated observations in a disposable repository and relevant automated tests. A passing test or check establishes only the behavior it exercises.
+Phases below are ordered by evidence needed, not by release date. The v0.2 milestone has no open Issues, but preview limitations remain. Portable evidence reached a separate read-scoped installation in v0.3, and a cross-store image review completed its documented trial. v0.4 and v0.5 describe planned work. Completion requires the stated observations in a disposable repository and relevant automated tests. A passing test or check establishes only the behavior it exercises.
 
 The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks recovery, credential isolation, image identity, upgrades and release gates. [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) tracks portable evidence and review handoff; [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) tracks measured routing; [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) tracks optional operator experience and adoption trials. Closed Issues remain in their milestone as evidence of completed steps. Listing work here does not mark it complete.
 
-## Next release gates
+## v0.2 preview gates
 
-| Order | Issue | Required observation |
-| --- | --- | --- |
-| 1 | [#5](https://github.com/greggubarev/ermik/issues/5) | Have an operator follow setup through a complete disposable Issue and PR on fresh Linux. The separate [source host gate](https://github.com/greggubarev/ermik/issues/4#issuecomment-6642136455) passed on clean Linux and Windows runners. |
-| 2 | [#6](https://github.com/greggubarev/ermik/issues/6) | On each advertised route, record a successful disposable task and bounded auth, quota, timeout, and malformed-response failures, including slot release and redaction. |
-| 3 | [#7](https://github.com/greggubarev/ermik/issues/7) | Reboot a supported Linux host during an active disposable worker and broker request; confirm one PR or an explicit blocked state after recovery. |
-
-These are the remaining v0.2 acceptance gates. Do not repeat completed tests merely to increase activity; attach each run to the exact Issue, host, versions, and commit it verifies.
+[#5](https://github.com/greggubarev/ermik/issues/5) completed its clean-host installation trial. In the [#7 reboot trial](https://github.com/greggubarev/ermik/issues/7#issuecomment-6643766138), a disposable worker and broker service were active before reboot; both services restarted, the broker socket returned, installation-owned container cleanup preserved an unrelated container, and SQLite and the checkout survived. The job ended in a specific blocked state with no PR. The trial did not interrupt an in-flight broker PR POST.
 
 ## 0. Verified handoff baseline
 
@@ -57,6 +51,8 @@ These are the remaining v0.2 acceptance gates. Do not repeat completed tests mer
 **Goal:** Compare configured routes using observed outcomes and resource use over complete PR cycles.
 
 The [outcome ledger](https://github.com/greggubarev/ermik/issues/16) must precede any [measured routing policy](https://github.com/greggubarev/ermik/issues/17). [Quota observations](https://github.com/greggubarev/ermik/issues/35) and [context-efficiency measures](https://github.com/greggubarev/ermik/issues/36) must distinguish verified counters from estimates and missing data.
+
+The [live provider failure matrix](https://github.com/greggubarev/ermik/issues/6) remains open for each advertised route: bounded authentication, quota, timeout, and malformed-response observations, including cooldown, slot release, retry behavior, and redaction. Successful file tasks alone do not complete this matrix; route failure handling remains experimental until it passes.
 
 **Acceptance:** Record attempts, retries, rate limits, elapsed time, usage observations, and accepted PR outcomes against issue and PR identities without mixing separate tasks. Report cost per accepted PR for a stated period and route, including failed and retried attempts in the numerator; report the measure as unavailable when no PR was accepted. Separate estimated usage or cost from billed amounts and show missing data explicitly. Compare at least two configured routes on the same documented task set, including a failure and a retry, before using the results to change routing defaults. A routing choice must not bypass admission, scope, checks, or maintainer review.
 
