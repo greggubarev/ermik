@@ -127,6 +127,16 @@ class DecisionIntegrationTests(unittest.TestCase):
         self.assertEqual(len(entries), 2)
         self.assertNotEqual(entries[1]["evidence_sha256"], first["evidence_sha256"])
 
+    def test_pending_correction_blocks_new_review_on_same_head(self):
+        review.review(self.cfg, 19)
+        review.request_changes(self.cfg, 19, self._note())
+        before = list(self._decisions())
+        with self.assertRaisesRegex(review.WorkflowError, "pending exact-head correction"):
+            review.review(self.cfg, 19)
+        self.assertEqual(self._decisions(), before)
+        self.hub.head = HEADS[1]
+        self.assertEqual(review.review(self.cfg, 19)["head"], HEADS[1])
+
     def test_lost_comment_response_reconciles_without_duplicate(self):
         review.review(self.cfg, 19)
         note = self._note()

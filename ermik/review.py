@@ -131,6 +131,7 @@ def _review_locked(cfg: Config, number: int) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
     record_path = cfg.state_dir / "reviews" / f"pr-{number}.json"
+    prior = None
     if record_path.exists():
         prior = _load(cfg, number)
         if prior.get("merge_attempt") is not None:
@@ -138,6 +139,12 @@ def _review_locked(cfg: Config, number: int) -> dict:
         if "ci" in prior:
             _record_decision(cfg, prior, "reviewed")
     pr, issue_num, issue = _identity(cfg, gh, number)
+    if prior is not None and prior.get("head") == pr["headRefOid"]:
+        marker = f"SEMI_REWORK issue={issue_num} head={pr['headRefOid']}"
+        if any(marker in (row.get("body") or "") and
+               row.get("user", {}).get("login") == cfg.maintainer
+               for row in gh.comments(number)):
+            raise WorkflowError("PR has a pending exact-head correction request")
     if pr["baseRefOid"] != main_sha(gh, cfg):
         raise WorkflowError("PR base is not current base branch")
     spec = parse_issue(issue["body"])
