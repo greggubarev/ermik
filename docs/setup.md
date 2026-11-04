@@ -11,61 +11,38 @@ This project coordinates scoped GitHub issues with an explicit concurrency limit
 
 ## Prepare a clean Ubuntu host
 
-The commands below target Ubuntu 24.04 or newer, where the distribution's `python3` satisfies the Python 3.11 minimum. Run the package commands as a sudo-capable administrator. On an older Ubuntu release, install a supported Python version first and use that exact executable in the commands and service below.
+These commands target Ubuntu 24.04+ and a dedicated controller account. Clone this source once on the host, detach at the fetched commit, record its SHA, and inspect the complete script before applying it. For a release installation, select a reviewed release commit before running the script:
 
 ```sh
-sudo apt update
-sudo apt install -y python3 git ca-certificates curl
-python3 --version
-git --version
+sudo apt-get update
+sudo apt-get install -y git ca-certificates
+git clone https://github.com/greggubarev/ermik.git
+cd ermik
+git switch --detach HEAD
+git rev-parse HEAD
+sed -n '1,180p' scripts/bootstrap-ubuntu.sh
+bash scripts/bootstrap-ubuntu.sh --check
+sudo bash scripts/bootstrap-ubuntu.sh --apply
+cd ..
+test ! -e /home/ermikctl/ermik && test ! -L /home/ermikctl/ermik
+sudo mv ermik /home/ermikctl/ermik
+sudo chown -R ermikctl:ermikctl /home/ermikctl/ermik
 ```
 
-Install `gh` from the [official GitHub CLI apt repository](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian):
+The script installs Python, Git, GitHub CLI, and Docker from the documented package sources when needed; it creates `ermikctl`, `/var/lib/ermik`, and `/srv/ermik/workspace`, and enables linger for the user service. It refuses an unsupported OS, symlinked or foreign-owned paths, and conflicting Docker packages. It does not authenticate, configure a target project, grant Docker access, or enable polling. If the host already has managed packages or accounts, use the [official GitHub CLI](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian) and [Docker Ubuntu](https://docs.docker.com/engine/install/ubuntu/) instructions and reproduce the same isolated paths manually.
+
+Docker access is a separate host decision. [Rootless Docker](https://docs.docker.com/engine/security/rootless/) is preferred when it fits the host. If using the default daemon instead, grant its `docker` group only to the trusted controller account; [Docker documents](https://docs.docker.com/engine/install/linux-postinstall/) that this grants root-level privileges:
 
 ```sh
-sudo install -m 0755 -d /etc/apt/keyrings
-gh_key="$(mktemp)"
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o "$gh_key"
-sudo install -m 0644 "$gh_key" /etc/apt/keyrings/githubcli-archive-keyring.gpg
-rm "$gh_key"
-printf 'deb [arch=%s signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\n' "$(dpkg --print-architecture)" | sudo tee /etc/apt/sources.list.d/github-cli.list
-sudo apt update
-sudo apt install -y gh
-gh --version
+sudo usermod -aG docker ermikctl
+sudo -iu ermikctl docker info --format '{{.ServerVersion}}'
 ```
 
-Install Docker Engine using [Docker's official Ubuntu apt repository](https://docs.docker.com/engine/install/ubuntu/). If Docker or conflicting distribution packages are already present, inspect that guide before changing packages. On a clean host:
+Use a fresh login after changing group membership. Verify `docker info` **as `ermikctl`** before proceeding. Never give Docker access to the task container or unrelated accounts.
 
-```sh
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo systemctl status docker --no-pager
-sudo docker run --rm hello-world
-```
+Then use that account for the remaining account-level commands (`sudo -iu ermikctl` for initial setup, followed by an SSH or console login for the user service). Keep its home, checkout, GitHub credentials, state, workspace, and unit name separate from any existing deployment. Never stop, disable, rename, or replace another project's service or timer.
 
-Run the controller under a dedicated, non-root account that is **not** the account running another project's services. On a clean host, an administrator first checks that the paths are unused and creates the account and directories:
-
-```sh
-test ! -e /var/lib/ermik && test ! -e /srv/ermik
-sudo adduser --disabled-password --gecos '' ermikctl
-sudo install -d -o ermikctl -g ermikctl -m 0700 /var/lib/ermik /srv/ermik/workspace
-sudo loginctl enable-linger ermikctl
-```
-
-Then use that account for the remaining account-level commands (`sudo -iu ermikctl` for initial setup, followed by an SSH or console login for the user service). Keep its home, checkout, GitHub credentials, state, workspace, and unit name separate from any existing deployment. Never stop, disable, rename, or replace another project's service or timer. [Rootless Docker](https://docs.docker.com/engine/security/rootless/) is preferred where supported. The default Docker daemon's `docker` group grants root-level privileges; adding the controller account to that group is a deliberate host privilege grant, not a containment measure. Do not add the untrusted container process or unrelated users to it. Verify that `docker info` works **as the controller account** before proceeding.
-
-Authenticate `gh` as the controller account before cloning a private source repository, and enable its Git credential helper:
+Authenticate `gh` as the controller account for the target repository, and enable its Git credential helper:
 
 ```sh
 gh auth login
@@ -73,17 +50,24 @@ gh auth setup-git
 gh auth status
 ```
 
-Clone the source as that account. The repository may still be private; the account needs read access. Inspect the checkout and choose a reviewed release tag or commit:
+Inspect the checkout moved to the controller account and choose a reviewed release tag or commit:
 
 ```sh
-SOURCE_URL='https://github.com/greggubarev/ermik.git'
-git clone "$SOURCE_URL" "$HOME/ermik"
 cd "$HOME/ermik"
 git status --short
 git rev-parse HEAD
 ```
 
 ## Configure
+
+Use two separate installations for regular operation:
+
+| Installation | Owns | Runs |
+| --- | --- | --- |
+| Ubuntu controller | `ermikctl`, private state/workspace, task image, scoped publication credentials | `doctor`, `run-once` or `poll`; never `merge` |
+| Maintainer computer | Its own checkout, state/workspace, check image, merge credential | `admit`, `review`, `request-changes`, explicit `merge`; no polling service |
+
+Both configurations identify the same target repository, maintainer, worker image and ordered checks. Their `state_dir` and `workspace` paths must differ and remain private. The target project's checkout is created under the controller workspace; do not install Ermik inside that project.
 
 1. In the trusted controller account, authenticate `gh` to the intended GitHub account. Keep its credential store outside the repository and worker checkout. Confirm the selected account and target repository:
 
@@ -278,7 +262,22 @@ gh pr view PR -R example-org/example-project
 gh pr diff PR -R example-org/example-project
 ```
 
-For independent review, clone this repository on the local computer, copy the same configuration with **local** absolute `state_dir` and `workspace` paths, build the configured check image, and authenticate `gh` as the configured maintainer. The local review record stays on that computer. Its private JSON file is replaced atomically; older `0644` records inside an owner-only reviews directory remain readable and are rewritten as `0600` on the next save. Keep the state directory when upgrading, and inspect malformed records rather than removing them. Then run:
+For independent review, install Python 3.11+, Git, GitHub CLI, and Docker on the local computer. Clone this repository there; do not copy the controller's state, workspace, or credential files. Copy the same configuration with **local** absolute `state_dir` and `workspace` paths, build or pull the configured check image, and authenticate `gh` as the configured maintainer. The image must resolve to the ID published in the PR. The local review record stays on that computer. Its private JSON file is replaced atomically; older `0644` records inside an owner-only reviews directory remain readable and are rewritten as `0600` on the next save. Keep the state directory when upgrading, and inspect malformed records rather than removing them. Then run:
+
+```sh
+git clone https://github.com/greggubarev/ermik.git "$HOME/ermik"
+cd "$HOME/ermik"
+cp examples/config.example.json config.json
+chmod 0600 config.json
+# Edit repo, maintainer, image, checks, state_dir, and workspace for this installation.
+gh auth login
+docker build -f examples/Dockerfile.demo -t ermik-demo:latest .
+python3 -m ermik --config config.json doctor
+```
+
+The example build applies only to the disposable demo. On Windows, use a private Windows path for `config.json`, `state_dir`, and `workspace` and Docker Desktop for the local checks. On either OS, do not run the Ubuntu controller bootstrap on the maintainer computer unless it is also a dedicated controller host.
+
+Then run:
 
 ```sh
 python3 -m ermik --config config.json review PR
