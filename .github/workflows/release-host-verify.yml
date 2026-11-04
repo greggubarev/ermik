@@ -59,6 +59,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $tempRoot = python -c "import os; from pathlib import Path; print(Path(os.environ['RUNNER_TEMP']).resolve(strict=True))"
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $tempRoot -PathType Container)) {
+            throw 'Runner temporary directory is unavailable'
+          }
+          $env:TEMP = $tempRoot
+          $env:TMP = $tempRoot
+          $env:TMPDIR = $tempRoot
+          python -c "import tempfile; from pathlib import Path; p = Path(tempfile.gettempdir()); assert p == p.resolve(strict=True)"
+          if ($LASTEXITCODE -ne 0) { throw 'Test temporary directory is not canonical' }
           python -m ermik.host_verify > (Join-Path $env:RUNNER_TEMP 'windows-unit.json')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
