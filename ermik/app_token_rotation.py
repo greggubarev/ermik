@@ -91,9 +91,13 @@ def _fingerprint(pair: TokenPair) -> str:
 
 
 def _private_create(path: Path, data: bytes) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if os.name == "posix" and fchmod is None:
+        raise TokenRotationError("token store permissions unavailable; contact operator")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        os.fchmod(fd, 0o600)
+        if fchmod is not None:
+            fchmod(fd, 0o600)
         with os.fdopen(fd, "wb", closefd=False) as stream:
             stream.write(data)
             stream.flush()

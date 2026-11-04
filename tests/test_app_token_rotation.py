@@ -10,7 +10,7 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs
 
 from ermik.app_token_rotation import TokenPair, TokenRotationError, TokenStore
-from ermik import app_token_login, pr_broker
+from ermik import app_token_login, app_token_rotation, pr_broker
 
 
 NOW = 2_000_000_000
@@ -59,6 +59,19 @@ class TokenRotationTests(unittest.TestCase):
             "expires_in": 28800,
             "refresh_token_expires_in": 15897600,
         })
+
+    def test_private_create_without_fchmod_on_windows(self):
+        with patch.object(app_token_rotation.os, "name", "nt"), patch.object(
+                app_token_rotation.os, "fchmod", None, create=True):
+            app_token_rotation._private_create(self.path, b"private pair")
+        self.assertEqual(self.path.read_bytes(), b"private pair")
+
+    def test_private_create_without_fchmod_fails_closed_on_posix(self):
+        with patch.object(app_token_rotation.os, "name", "posix"), patch.object(
+                app_token_rotation.os, "fchmod", None, create=True):
+            with self.assertRaisesRegex(TokenRotationError, "permissions unavailable"):
+                app_token_rotation._private_create(self.path, b"private pair")
+        self.assertFalse(self.path.exists())
 
     def test_due_pair_refreshes_and_persists_both_tokens_together(self):
         self.seed()

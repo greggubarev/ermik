@@ -47,6 +47,22 @@ class HostVerifyTests(unittest.TestCase):
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(result["executed"], 0)
 
+    def test_failure_types_exclude_exception_messages(self):
+        class FailingCase(unittest.TestCase):
+            def test_assertion(self):
+                self.fail("private assertion detail")
+
+            def test_error(self):
+                raise ValueError("private error detail")
+
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(FailingCase)
+        with patch.object(host_verify.unittest.TestLoader, "discover", return_value=suite):
+            result = host_verify._unit_suite()
+        self.assertEqual(result["result"], "failed")
+        self.assertEqual({row["type"] for row in result["failure_types"]},
+                         {"AssertionError", "ValueError"})
+        self.assertNotIn("private", str(result))
+
     def test_unit_only_records_docker_as_not_requested(self):
         with patch.object(host_verify, "_probe", side_effect=[str(host_verify._ROOT),
                                                                "a" * 40, None,
