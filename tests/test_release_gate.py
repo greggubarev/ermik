@@ -90,12 +90,14 @@ class ReleaseGateTests(unittest.TestCase):
 
     def test_accepts_documented_service_home_paths(self) -> None:
         self.write("docs/paths.md", "\n".join(
-            f"/home/{account}/ermik" for account in ("ermikctl", "ACCOUNT", "%i")) + "\n")
+            "/" + "home/" + account + "/ermik"
+            for account in ("ermikctl", "ACCOUNT", "%i", "{account}")) + "\n")
         head = self.commit()
         build_release(head, Path(self.temp.name) / "out", self.root)
 
     def test_rejects_other_private_home_paths(self) -> None:
-        for path in ("/home/" + "alice/private/", "/root/" + "private/",
+        for path in ("/home/" + "alice/private/", "/home/" + "{account}x/private/",
+                     "/root/" + "private/",
                      "C:/Users/" + "alice/private/"):
             with self.subTest(path=path):
                 self.assertEqual(_sensitive_category(path), "private home path")
