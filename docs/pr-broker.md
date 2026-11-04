@@ -21,6 +21,24 @@ For a separate broker UID, create a shared read-only evidence directory outside 
 
 The administrator creates the socket directory in advance and prevents writes by unrelated users. The service does not remove an existing socket at startup. After binding, it sets `--socket-gid` and mode `0660`. Linux `SO_PEERCRED` must match the exact `--controller-uid`; group membership alone does not authorize a request.
 
+### Private repositories under different owners
+
+A repository-scoped token may be unable to read the other owner's private ref when creating a PR. One tested route is a GitHub App installed on **only** the upstream and fork. Give it `Contents: read`, `Issues: read`, and `Pull requests: read and write`; enable Device Flow and allow installation by both owners. Authorize an upstream maintainer through [GitHub's App user-token Device Flow](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app). Save the user access token in the broker's private token file. Keep the controller's upstream and fork tokens separate. An installation token for just one owner does not provide cross-owner access.
+
+Before enabling polling, query `GET /user/installations` and `GET /user/installations/{installation_id}/repositories` under that token. Confirm exactly the intended installations and repositories. On a disposable upstream, attempt to create a **new branch ref** and merge a ready test PR under each server-side credential; both operations must be denied for every credential. Verify fork branch publication with the fork token and draft PR creation with the broker token. Never test denial against `main`.
+
+With token expiration enabled (the GitHub App default), user access tokens expire after eight hours and Device Flow also returns a refresh token. Set up a private directory owned by the broker account and authorize the App from that account:
+
+```sh
+install -d -m 0700 "$HOME/.config/ermik-pr-broker"
+python3 -m ermik.app_token_login \
+  --client-id APP_CLIENT_ID --store "$HOME/.config/ermik-pr-broker/app-tokens.json"
+```
+
+The command prints a one-time code and GitHub URL; it writes both tokens to a `0600` file after confirmation. Run the broker command above with `--app-token-store "$HOME/.config/ermik-pr-broker/app-tokens.json" --app-client-id APP_CLIENT_ID` in place of `--token-file`. The broker checks the token at startup and every 60 seconds while idle. It [refreshes both tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens) an hour before access-token expiry, replacing the private pair atomically. A restart loads the durable pair and does not need another browser login after a completed refresh.
+
+GitHub invalidates the old access and refresh tokens when refresh succeeds. If the process loses the response before saving the new pair, there is no safe automatic retry. The broker stops publication and reports that Device Flow authorization is required; queued work remains with the controller. Stop the broker, rerun the login command with `--reauthorize`, then restart it. Keep the token store and its adjacent recovery files together across restarts. Do not copy them into a checkout or container. Run only one broker for a token store; concurrent refresh or reauthorization is unsupported.
+
 ## Request and response
 
 Send one UTF-8 JSON object per line, at most 4,096 bytes, with one request per connection:

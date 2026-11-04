@@ -8,3 +8,6 @@
 - Merge requires an explicit maintainer action after checking the exact HEAD again. A new HEAD invalidates the previous review.
 - When changing a state transition, add a positive and a rejection test. When changing installation, update `docs/setup.md` and verify the commands in a clean environment.
 - Keep the implementation within this repository's modules. Do not tie it to a particular target project, model, host, user, or licensed data.
+- Prioritize outcomes that make Ermik distinct: a verifiable issue-to-PR handoff, safe recovery, portable evidence, and measured routing. Keep each change within the issue's acceptance criteria; defer unrelated improvements.
+- Use the smallest meaningful verification that covers the changed behavior and its failure case. Honor required gates above, but stop optional broad or repeated tests once the relevant risk is covered. Report the evidence level accurately.
+- Do not expand work to increase activity counts or apparent progress. Add fixtures, services, abstractions, or test infrastructure only when the accepted outcome needs them.

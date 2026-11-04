@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ermik import review, runtime, state
+from ermik import recovery, review, runtime, state
 from ermik.config import Config
 
 
@@ -319,6 +319,7 @@ class FaultWindowTests(unittest.TestCase):
                          (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
+                 "body_sha256": self.spec.body_sha256,
                  "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
         (self.cfg.workspace / "source").mkdir(parents=True)
         with patch.object(self.gh, "find_branch_pr", return_value=None), patch.object(
@@ -341,6 +342,7 @@ class FaultWindowTests(unittest.TestCase):
         self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
+                 "body_sha256": self.spec.body_sha256,
                  "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
@@ -366,6 +368,7 @@ class FaultWindowTests(unittest.TestCase):
         self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
         proof = {"issue": 1, "pr": 10, "branch": BRANCH, "head": HEAD,
                  "base": BASE, "paths": ["src/example.py"],
+                 "body_sha256": self.spec.body_sha256,
                  "ci": {"result": "passed", "image_id": IMAGE}, "model": "kimi"}
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
@@ -405,6 +408,82 @@ class FaultWindowTests(unittest.TestCase):
             self.assertEqual(state.job(conn, 1)["status"], "blocked")
         self.assertEqual(self.gh.open_calls, before)
         self.assertEqual(evidence.read_bytes(), b'{"issue":1,"pr":')
+
+    def test_correction_push_loss_with_stale_pr_head_never_reexecutes(self):
+        source, checkout, _base, advanced = self._published_leftover()
+        subprocess.check_call(["git", "-C", str(source), "worktree", "remove",
+                               str(checkout)], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        self.gh.prs[10]["headRefOid"] = HEAD  # PR read lags the advanced branch.
+        self.gh.remote_head = advanced
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET status='correcting',head_sha=?,pr=? WHERE issue=1",
+                         (HEAD, 10))
+        actual_git = runtime.git
+
+        def git(path, *args, **kwargs):
+            if args[:3] == ("ls-remote", "--heads", "origin"):
+                return f"{advanced}\trefs/heads/{BRANCH}"
+            return actual_git(path, *args, **kwargs)
+
+        for status in ("correcting", "retry_wait"):
+            with self.subTest(status=status), state.connect(self.cfg.state_dir) as conn:
+                self.gh.names = {"queue:worker", "state:in-progress"}
+                conn.execute("UPDATE jobs SET status=?,error=NULL WHERE issue=1", (status,))
+                if status == "retry_wait":
+                    conn.execute("INSERT INTO retry_state(issue,attempts,category,"
+                                 "resume_status,next_retry_at,failure_id) "
+                                 "VALUES(1,1,'transient','correcting',1,'push-lost')")
+                with patch.object(runtime, "mirror", return_value=source), patch.object(
+                        runtime, "git", side_effect=git), patch.object(
+                        runtime, "_perform") as perform:
+                    runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                self.assertEqual(state.job(conn, 1)["status"], "correcting")
+                self.assertIsNone(conn.execute(
+                    "SELECT 1 FROM retry_state WHERE issue=1").fetchone())
+                self.assertEqual(recovery.claim_due(conn, now=2_000_000_000), [])
+                perform.assert_not_called()
+            self.assertEqual(self.gh.prs[10]["headRefOid"], HEAD)
+            self.assertEqual(self.gh.remote_head, advanced)
+
+        self.gh.prs[10]["headRefOid"] = advanced
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "local_checks", return_value={
+                    "result": "passed", "image_id": IMAGE}) as checks, patch.object(
+                runtime, "_perform") as perform:
+            with state.connect(self.cfg.state_dir) as conn:
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["pr"], row["head_sha"]),
+                                 ("awaiting_review", 10, advanced))
+                self.assertEqual(recovery.claim_due(conn, now=2_000_000_000), [])
+            checks.assert_called_once()
+            perform.assert_not_called()
+
+    def test_existing_evidence_identity_tampering_blocks_recovery(self):
+        _source, _checkout, base, head = self._published_leftover()
+        evidence = self.cfg.state_dir / "evidence" / "1" / f"{head}.json"
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        valid = {"issue": 1, "pr": 10, "branch": BRANCH, "head": None,
+                 "base": None, "paths": ["src/example.py"],
+                 "body_sha256": self.spec.body_sha256,
+                 "ci": {"result": "passed", "image_id": IMAGE}, "model": None}
+        changes = {"base": "d" * 40, "paths": ["src/other.py"],
+                   "body_sha256": "0" * 64, "model": "wrong-route"}
+        for field, changed in changes.items():
+            with self.subTest(field=field):
+                self.gh.names = {"queue:worker", "state:in-progress"}
+                proof = dict(valid, head=head, base=base)
+                proof[field] = changed
+                runtime.write_evidence(evidence, proof)
+                before = evidence.read_bytes()
+                pr_count = self.gh.open_calls
+                with state.connect(self.cfg.state_dir) as conn:
+                    conn.execute("UPDATE jobs SET status='running',error=NULL WHERE issue=1")
+                    runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                    self.assertEqual(state.job(conn, 1)["status"], "blocked")
+                self.assertEqual(self.gh.open_calls, pr_count)
+                self.assertEqual(evidence.read_bytes(), before)
 
     def test_crash_after_push_recovers_leftover_and_opens_one_pr(self):
         source, checkout, base, head = self._published_leftover()

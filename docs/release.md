@@ -1,5 +1,28 @@
 # Source release gate
 
+## Local verification on each supported host
+
+Use a clean checkout at the same commit on Windows and Linux. Python 3.11 or newer and Git are required. Run the unit gate on both hosts; run the Docker gate on a host with a working Docker daemon. Preserve each JSON report with the release record and compare its `commit` with the commit selected for the source archive. `unit.skipped` and `unit.unexpected_skips` are reported separately; an unexpected skip or failed test makes the command exit nonzero. The Docker gate runs both host smoke scripts and records the Docker server version and exact image ID.
+
+```sh
+mkdir -p "$HOME/ermik-verification"
+python3 -m ermik.host_verify > "$HOME/ermik-verification/unit-linux.json"
+docker build -f examples/Dockerfile.demo -t ermik-demo:verification .
+python3 -m ermik.host_verify --docker --image ermik-demo:verification > "$HOME/ermik-verification/docker-linux.json"
+```
+
+On Windows, use `py -3 -m ermik.host_verify` from the same commit and save its JSON outside the checkout. Run the Docker command there only if the Docker daemon is available. The gate permits only documented platform skips; it does not silently treat missing Git or Docker as a passing check. The `--docker` option is required to make Docker smoke part of the result. Review the recorded failure and skip counts before publishing.
+
+For a project check that produces JUnit XML, require a minimum number of **executed** cases. Skipped cases do not count toward that minimum:
+
+```sh
+python3 -m ermik.ci /private/checks/report.xml --min-tests 1
+```
+
+The JUnit gate rejects missing, malformed, partial, inconsistent, failed, and skipped-only reports. Choose `--min-tests` for the actual project check; one is only the default example.
+
+## Source archive
+
 Run this gate on a reviewed release commit before publishing a source archive. Keep the output directory outside the checkout. The gate requires a clean checkout at the named full commit ID. It produces a source-only archive from tracked files, a SHA-256 file, and a manifest, and rejects unexpected content. A successful scan describes that commit and archive; it does not approve a later commit or a separately built container image.
 
 ```sh
