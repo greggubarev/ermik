@@ -1,0 +1,84 @@
+name: Source host verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Full reviewed commit SHA to verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      VERIFY_COMMIT: ${{ inputs.commit }}
+    steps:
+      - name: Validate commit
+        shell: pwsh
+        run: |
+          if ($env:VERIFY_COMMIT -cnotmatch '^[0-9a-fA-F]{40}$') {
+            throw 'A full 40-character commit SHA is required'
+          }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Record host and verify checkout
+        shell: pwsh
+        run: |
+          $commit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $commit -cne $env:VERIFY_COMMIT.ToLowerInvariant()) {
+            throw 'Checked-out commit differs from the requested commit'
+          }
+          @{
+            commit = $commit
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            runner_image = $env:ImageOS
+            runner_image_version = $env:ImageVersion
+            python = (python --version)
+            git = (git --version)
+          } | ConvertTo-Json -Compress | Set-Content -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'host.json')
+
+      - name: Run Windows unit gate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          python -m ermik.host_verify > (Join-Path $env:RUNNER_TEMP 'windows-unit.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build demo image and run Docker gate
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: |
+          docker build -f examples/Dockerfile.demo -t ermik-demo:verification .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m ermik.host_verify --docker --image ermik-demo:verification > (Join-Path $env:RUNNER_TEMP 'linux-unit-docker.json')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Preserve verification reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-verification-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/host.json
+            ${{ runner.temp }}/windows-unit.json
+            ${{ runner.temp }}/linux-unit-docker.json
+          if-no-files-found: warn
+          retention-days: 7
