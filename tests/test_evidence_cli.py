@@ -52,6 +52,44 @@ class EvidenceCliTests(unittest.TestCase):
             self.assertEqual(code, 1)
             parse.assert_not_called()
 
+    def test_fetch_writes_only_current_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fetched.json"
+            with (patch.object(cli, "load_config", return_value=object()),
+                  patch.object(cli, "fetch_manifest", return_value=(
+                      {"status": "missing"}, None)), redirect_stdout(StringIO())):
+                self.assertEqual(cli.main(["--config", "unused", "fetch-evidence", "19",
+                                           "--output", str(path)]), 2)
+            self.assertFalse(path.exists())
+            with (patch.object(cli, "load_config", return_value=object()),
+                  patch.object(cli, "fetch_manifest", return_value=(
+                      {"status": "current", "sha256": "a" * 64}, {"sha256": "a" * 64})),
+                  patch.object(cli, "dumps_manifest", return_value=b"record\n"),
+                  redirect_stdout(StringIO())):
+                self.assertEqual(cli.main(["--config", "unused", "fetch-evidence", "19",
+                                           "--output", str(path)]), 0)
+            self.assertEqual(path.read_bytes(), b"record\n")
+
+    def test_run_once_delivers_when_publisher_is_configured(self):
+        cfg = type("ConfigStub", (), {"evidence_publisher": "keeper"})()
+        output = StringIO()
+        with (patch.object(cli, "load_config", return_value=cfg),
+              patch.object(cli, "run_once", return_value=[]),
+              patch.object(cli, "deliver_pending", return_value=[{"status": "delivered"}]),
+              redirect_stdout(output)):
+            self.assertEqual(cli.main(["--config", "unused", "run-once"]), 0)
+        self.assertEqual(json.loads(output.getvalue()),
+                         {"work": [], "delivery": [{"status": "delivered"}]})
+
+    def test_run_once_retries_delivery_when_work_fails(self):
+        cfg = type("ConfigStub", (), {"evidence_publisher": "keeper"})()
+        with (patch.object(cli, "load_config", return_value=cfg),
+              patch.object(cli, "run_once", side_effect=ValueError("work failed")),
+              patch.object(cli, "deliver_pending", return_value=[]) as deliver,
+              redirect_stderr(StringIO())):
+            self.assertEqual(cli.main(["--config", "unused", "run-once"]), 1)
+        deliver.assert_called_once_with(cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 """A backlog of draft PRs is checked fairly without a request storm."""
 
 from pathlib import Path
+from dataclasses import replace
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -78,6 +79,31 @@ class ReviewPollingTests(unittest.TestCase):
                 with patch.object(runtime.time, "time", return_value=1600):
                     self.assertIsNone(runtime._correction(gh, self.cfg, conn))
                 self.assertEqual(gh.pr.call_count, 2)
+
+    def test_correction_waits_for_old_head_delivery(self):
+        self.seed(1)
+        cfg = replace(self.cfg, evidence_publisher="publisher", evidence_publisher_id=42)
+        gh = Mock()
+        gh.pr.return_value = {"state": "OPEN", "headRefOid": "b" * 40}
+        gh.issue.return_value = {"body": BODY, "labels": [
+            {"name": "queue:worker"}, {"name": "state:in-progress"}]}
+        note = f"SEMI_REWORK issue=1 head={'b' * 40}\nSEMI_REBASE_ONLY"
+        gh.comments.return_value = [{"id": 1, "body": note,
+                                     "user": {"login": "owner"}}]
+        with patch.object(runtime, "_require_pr"), patch.object(
+                runtime, "_approved_on_github", return_value=True):
+            with state.connect(cfg.state_dir) as conn:
+                spec = runtime.parse_issue(BODY)
+                conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
+                             (1, spec.body_sha256, '["src/example.py"]'))
+                with patch.object(runtime.time, "time", return_value=1000):
+                    self.assertIsNone(runtime._correction(gh, cfg, conn))
+                self.assertEqual(state.job(conn, 1)["status"], "awaiting_review")
+                state.event(conn, 1, "evidence_delivered", head_sha="b" * 40)
+                with patch.object(runtime.time, "time", return_value=1060):
+                    selected = runtime._correction(gh, cfg, conn)
+                self.assertEqual(selected[0]["issue"], 1)
+                self.assertEqual(state.job(conn, 1)["status"], "correcting")
 
 
 if __name__ == "__main__":

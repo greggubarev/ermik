@@ -10,7 +10,7 @@ Ermik is a self-hosted path from scoped GitHub Issues to draft pull requests. A 
 
 The goal is a reusable execution queue that can work through admitted Issues while the maintainer is away. Each task gets an isolated checkout, a configured runner and local checks. The controller publishes one draft PR per Issue and sends requested changes back to the same PR. Safe resumption after interruptions is a v0.2 goal still under test. A separate maintainer installation verifies the current HEAD and decides when to merge. The execution loop does not merge; the [security model](docs/security.md) explains the credentials needed to enforce that boundary.
 
-Later releases aim to carry a portable record of checks and task identity to the maintainer, compare provider routes by accepted PR outcomes and cost, and explain blocked or waiting work through optional local views. These are tracked goals, not claims about the preview. The [release status](docs/readiness.md) lists what has actually been verified.
+The controller can export a bounded record of checks and task identity for the maintainer. Optional GitHub comment delivery is under verification. Later releases aim to compare provider routes by accepted PR outcomes and cost and explain blocked or waiting work through optional local views. The [release status](docs/readiness.md) lists what has actually been verified.
 
 ## Current capabilities
 
@@ -19,6 +19,7 @@ Later releases aim to carry a portable record of checks and task identity to the
 - `review` reruns checks on the exact PR HEAD. `request-changes` continues in the same PR. `merge` requires a current review record and checks the new base commit after merging.
 - `storage` inventories private task artifacts and previews bounded retention cleanup. Deletion requires a verified merged record and explicit `--apply` limits.
 - `export-evidence` creates a bounded record for one PR HEAD; `verify-evidence` checks it against current GitHub and local policy before maintainer review. [The manifest guide](docs/evidence.md) explains its trust limits.
+- Optional `publish-evidence` and `fetch-evidence` transfer that record through a PR comment. The receiver checks the current HEAD and pinned publisher identity; the transport does not attest to the controller's check results.
 - A deterministic demo task command and a configurable task runner are included. Provider routing can retry an eligible route after a confirmed rate limit. Each new project must supply suitable task and check commands and verify its own complete issue-to-merge cycle.
 
 The [documented trial](docs/readiness.md) completed admission, a draft PR, correction on the same PR, a second review, explicit merge, and a check on the resulting default branch in a separate GitHub repository. The two configured provider routes also completed live tasks. These results apply to the trial configuration.

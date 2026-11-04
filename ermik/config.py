@@ -14,7 +14,8 @@ _REQUIRED = {"repo", "maintainer", "state_dir", "workspace", "image",
              "worker_command", "checks", "max_parallel", "poll_seconds"}
 _OPTIONAL = {"worker_env", "base_branch", "models", "min_free_gb",
              "publish_repo", "publish_token_env", "routes", "draft_pr_socket",
-             "draft_pr_evidence_dir", "retention_days", "artifact_warn_mb"}
+             "draft_pr_evidence_dir", "retention_days", "artifact_warn_mb",
+             "evidence_publisher", "evidence_publisher_id"}
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ROUTE = re.compile(r"^route:[a-z][a-z0-9_-]{0,39}$")
 
@@ -41,6 +42,8 @@ class Config:
     draft_pr_evidence_dir: Path | None = None
     retention_days: int = 30
     artifact_warn_mb: int = 1024
+    evidence_publisher: str | None = None
+    evidence_publisher_id: int | None = None
 
 
 def _command(value: object, name: str) -> tuple[str, ...]:
@@ -61,6 +64,17 @@ def load_config(path: Path) -> Config:
         raise ValueError("repo must be owner/name")
     if not isinstance(maintainer, str) or not _LOGIN.fullmatch(maintainer):
         raise ValueError("maintainer must be a GitHub login")
+    evidence_publisher = raw.get("evidence_publisher")
+    if (evidence_publisher is not None
+            and (not isinstance(evidence_publisher, str)
+                 or not _LOGIN.fullmatch(evidence_publisher))):
+        raise ValueError("evidence_publisher must be a GitHub login")
+    evidence_publisher_id = raw.get("evidence_publisher_id")
+    if (evidence_publisher is None) != (evidence_publisher_id is None):
+        raise ValueError("evidence_publisher and evidence_publisher_id must be set together")
+    if (evidence_publisher_id is not None
+            and (type(evidence_publisher_id) is not int or evidence_publisher_id <= 0)):
+        raise ValueError("evidence_publisher_id must be a positive integer")
     publish_repo = raw.get("publish_repo")
     if publish_repo is not None:
         if (not isinstance(publish_repo, str) or not _REPO.fullmatch(publish_repo)
@@ -160,4 +174,5 @@ def load_config(path: Path) -> Config:
                   worker_command, commands, max_parallel, poll_seconds,
                   tuple(worker_env), base_branch, models, min_free_gb,
                   publish_repo, publish_token_env, dict(routes), draft_pr_socket,
-                  draft_pr_evidence_dir, retention_days, artifact_warn_mb)
+                  draft_pr_evidence_dir, retention_days, artifact_warn_mb,
+                  evidence_publisher, evidence_publisher_id)

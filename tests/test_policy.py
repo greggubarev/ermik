@@ -109,6 +109,47 @@ class PolicyTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "draft_pr_evidence_dir"):
                         load_config(path)
 
+    def test_evidence_publisher_requires_login_and_positive_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw = {"repo": "example/project", "maintainer": "example",
+                   "state_dir": str(root / "state"), "workspace": str(root / "work"),
+                   "image": "example:latest", "worker_command": ["true"],
+                   "checks": [["true"]], "max_parallel": 1, "poll_seconds": 10}
+            path = root / "config.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertIsNone(load_config(path).evidence_publisher)
+            self.assertIsNone(load_config(path).evidence_publisher_id)
+            for login, publisher_id in ((None, None), ("publisher", 1),
+                                        ("Publisher-1", 22465386)):
+                with self.subTest(login=login, publisher_id=publisher_id):
+                    path.write_text(json.dumps({**raw, "evidence_publisher": login,
+                                                "evidence_publisher_id": publisher_id}),
+                                    encoding="utf-8")
+                    cfg = load_config(path)
+                    self.assertEqual((cfg.evidence_publisher,
+                                      cfg.evidence_publisher_id), (login, publisher_id))
+            for lone in ({"evidence_publisher": "publisher"},
+                         {"evidence_publisher_id": 1}):
+                with self.subTest(lone=lone):
+                    path.write_text(json.dumps({**raw, **lone}), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "must be set together"):
+                        load_config(path)
+            for invalid in ("", "-publisher", "publisher_1", "a" * 40, 1, True, []):
+                with self.subTest(invalid=invalid):
+                    path.write_text(json.dumps({**raw, "evidence_publisher": invalid,
+                                                "evidence_publisher_id": 1}),
+                                    encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "evidence_publisher"):
+                        load_config(path)
+            for invalid in (0, -1, "1", True, 1.0, []):
+                with self.subTest(invalid_id=invalid):
+                    path.write_text(json.dumps({**raw, "evidence_publisher": "publisher",
+                                                "evidence_publisher_id": invalid}),
+                                    encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, "evidence_publisher_id"):
+                        load_config(path)
+
 
 if __name__ == "__main__":
     unittest.main()

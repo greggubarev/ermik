@@ -20,6 +20,8 @@ from .dashboard import create_server
 from .retention import cleanup as cleanup_artifacts, inventory as inventory_artifacts
 from .evidence import MAX_BYTES, dumps_manifest, loads_manifest
 from .evidence_export import export_manifest, verify_manifest
+from .evidence_transport import fetch_manifest, publish_manifest
+from .delivery_loop import deliver_pending
 
 
 def doctor(cfg) -> dict:
@@ -73,6 +75,29 @@ def status(cfg) -> dict:
     return {"repo": cfg.repo, **snapshot}
 
 
+def _write_private_output(output: Path, data: bytes) -> None:
+    if output.parent.resolve() != output.parent.absolute() or output.is_symlink():
+        raise ValueError("unsafe evidence output path")
+    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    created = os.fstat(descriptor)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            current = output.lstat()
+            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                output.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local issue-to-PR workflow")
     parser.add_argument("--config", type=Path, required=True)
@@ -101,6 +126,11 @@ def main(argv: list[str] | None = None) -> int:
     verify_parser = commands.add_parser("verify-evidence")
     verify_parser.add_argument("pr", type=int)
     verify_parser.add_argument("--input", type=Path, required=True)
+    publish_parser = commands.add_parser("publish-evidence")
+    publish_parser.add_argument("pr", type=int)
+    fetch_parser = commands.add_parser("fetch-evidence")
+    fetch_parser.add_argument("pr", type=int)
+    fetch_parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -111,7 +141,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "admit":
             result = admit(cfg, args.issue)
         elif args.command == "run-once":
-            result = run_once(cfg)
+            try:
+                work = run_once(cfg)
+            except Exception:
+                if getattr(cfg, "evidence_publisher", None):
+                    try:
+                        deliver_pending(cfg)
+                    except Exception:
+                        pass
+                raise
+            result = ({"work": work, "delivery": deliver_pending(cfg)}
+                      if getattr(cfg, "evidence_publisher", None) else work)
         elif args.command == "storage":
             if args.apply and not args.cleanup:
                 raise ValueError("--apply requires --cleanup")
@@ -146,29 +186,14 @@ def main(argv: list[str] | None = None) -> int:
             result = merge(cfg, args.pr)
         elif args.command == "export-evidence":
             record = export_manifest(cfg, args.pr)
-            data = dumps_manifest(record)
-            output = args.output
-            if output.parent.resolve() != output.parent.absolute() or output.is_symlink():
-                raise ValueError("unsafe evidence output path")
-            descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            created = os.fstat(descriptor)
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    descriptor = -1
-                    stream.write(data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-            except BaseException:
-                if descriptor >= 0:
-                    os.close(descriptor)
-                try:
-                    current = output.lstat()
-                    if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
-                        output.unlink()
-                except FileNotFoundError:
-                    pass
-                raise
+            _write_private_output(args.output, dumps_manifest(record))
             result = {"pr": args.pr, "status": "exported", "sha256": record["sha256"]}
+        elif args.command == "publish-evidence":
+            result = publish_manifest(cfg, args.pr)
+        elif args.command == "fetch-evidence":
+            result, record = fetch_manifest(cfg, args.pr)
+            if result["status"] == "current" and record is not None:
+                _write_private_output(args.output, dumps_manifest(record))
         elif args.command == "verify-evidence":
             source = args.input
             if source.is_symlink():
@@ -188,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "merge" and result.get("status") == "incomplete":
             return 2
         if args.command == "verify-evidence" and result.get("status") != "current":
+            return 2
+        if args.command == "fetch-evidence" and result.get("status") != "current":
             return 2
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError) as exc:

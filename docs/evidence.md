@@ -16,4 +16,18 @@ Export checks the controller's private exact-HEAD check record before creating t
 
 Version 1 is canonical UTF-8 JSON with sorted keys, compact separators, ASCII escapes, and one trailing newline. `sha256` hashes the canonical object without its own `sha256` field. The file is limited to 16 KiB. Required fields are `version`, `repo`, `head_repository`, `issue`, `pr`, `branch`, `base`, `head`, `body_sha256`, `scope_sha256`, `checks_sha256`, `paths`, `checks`, `image`, `model`, `attempts`, `usage`, `unknowns`, and `sha256`. Each check contains its index, pass result, and private-log digest; the ordered commands are represented by `checks_sha256`. Missing usage is marked `unknown`, never zero. The file excludes the issue body, credentials, raw logs, task output, and local file paths. Its digest detects accidental or unsophisticated changes, but anyone who can edit the file can recompute the digest. The controller that produced it remains trusted.
 
-The manifest is intentionally a manual export. Automatic delivery to another installation and a consolidated review view are separate roadmap work.
+## GitHub delivery
+
+Set `"evidence_publisher": "PUBLISHER_LOGIN"` and `"evidence_publisher_id": PUBLISHER_NUMERIC_ID` in both installations' private configuration. Get both values from `gh api user --jq '{login,id}'` under the controller's upstream comment credential. The numeric ID binds the publisher even if its login changes. With this option enabled, each `run-once` or `poll` cycle publishes a bounded manifest as a PR timeline comment after a draft PR or correction is saved. A failed comment write leaves the PR awaiting review and is retried on the next cycle; the same HEAD is reconciled before another POST. A correction waits until the preceding HEAD's comment is confirmed. A private cursor rotates the bounded delivery queue so repeated failures for one PR do not prevent attempts for later PRs. The command output adds a `delivery` list alongside `work`.
+
+The publisher needs upstream `Issues: write` **or** `Pull requests: write`; the maintainer installation needs only repository read access to fetch the comment. Neither transport command needs upstream Contents write. Fetch the current record on the separate installation:
+
+```sh
+python3 -m ermik --config config.json fetch-evidence PR_NUMBER --output /private/pr-evidence.json
+```
+
+`fetch-evidence` checks the pinned numeric comment author ID, canonical digest, current GitHub identities, ordered check policy, and image ID. It reports `missing`, `duplicate`, or `stale` explicitly and writes the file only when status is `current`. A correction creates a new comment for its HEAD; the old comment remains identifiable but cannot validate the new HEAD. If automatic delivery needs a retry before the next cycle, run `python3 -m ermik --config config.json publish-evidence PR_NUMBER` on the controller. A comment is editable or removable by a sufficiently privileged GitHub account, so the comment author and transport do not independently attest to the check outcomes. The maintainer still reruns local checks before merge.
+
+Comment scanning stops after 1,000 timeline comments and reports an error rather than silently overlooking an older record. For a PR beyond that limit, use the manual file export and verification commands above.
+
+The comment carries a canonical version 1 record with the execution-model identifier withheld; the corresponding field is `null` and listed in `unknowns`. The controller keeps the full local record. The comment contains no raw logs, issue text, credentials, or local paths. Manual `export-evidence` and `verify-evidence` remain available when comment delivery is not configured. A consolidated review view is separate roadmap work.
