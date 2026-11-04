@@ -50,9 +50,14 @@ The maintainer admits an issue; the server's `run-once` or `poll` takes only adm
 
 ## Roadmap
 
-![Ermik milestones: verified foundation, open release gates, and planned work](assets/roadmap.svg)
+| Milestone | Focus | Closed issues | What remains |
+| --- | --- | ---: | --- |
+| [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Reliable operation | **17 / 21** | Clean-host setup, active-task reboot, provider failures, and source verification across supported hosts. |
+| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable review evidence | **5 / 5** | The restricted receiver credential and independent image check were **not verified**; [#32](https://github.com/greggubarev/ermik/issues/32) was closed as an accepted limit. |
+| [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **0 / 4** | Route outcomes, quota observations, and cost per accepted PR. |
+| [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Operator view and adoption | **0 / 4** | Maintainer queue view, diagnostics, and non-demo project trials. |
 
-The image is a snapshot of [GitHub milestones](https://github.com/greggubarev/ermik/milestones), not a release claim or schedule. v0.2 still has open clean-host, reboot, provider-failure, and source-verification gates. v0.3 has working evidence and review components, with independent cross-host delivery still open. Measured routing and optional operator views follow. [Acceptance criteria](docs/roadmap.md) and [current evidence](docs/readiness.md) distinguish completed slices from remaining work.
+Counts describe closed milestone issues as of 4 November 2026, not release readiness or a schedule. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
 
 ## Guides
 
