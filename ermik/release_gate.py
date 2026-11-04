@@ -62,7 +62,7 @@ SENSITIVE = (
     ("basic authentication URL", re.compile(r"(?i)\bhttps?://[^/\s:@]+:" + r"[^/\s@]{8,}@")),
     ("private home path", re.compile(
         r"(?i)(?:[A-Z]:[\\/]Users[\\/]|/" + r"Users/|/" +
-        r"home/(?!ermikctl/|ACCOUNT/|%i/)|/" + r"root/)[^\s/\\]+[/\\]"
+        r"home/(?!ermikctl/|ACCOUNT/|%i/|\{account\}/)|/" + r"root/)[^\s/\\]+[/\\]"
     )),
     ("unrelated project reference", re.compile(r"(?i)\b(?:special-equipment-" + r"pwa|wow " + r"modern)\b")),
 )
