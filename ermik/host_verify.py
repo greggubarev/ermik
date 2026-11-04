@@ -37,6 +37,10 @@ _WINDOWS_SKIPS = {
         "symlink creation unavailable",
     "test_workspace_recovery.WorkspaceRecoveryTests.test_symlink_issue_directory_is_not_followed":
         "directory symlinks unavailable",
+    "test_retention.RetentionTests.test_world_readable_evidence_in_public_parent_remains":
+        "POSIX file modes only",
+    "test_retention.RetentionTests.test_wrong_owner_refuses_cleanup":
+        "POSIX ownership only",
 }
 
 

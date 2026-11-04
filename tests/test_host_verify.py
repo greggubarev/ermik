@@ -7,6 +7,24 @@ from ermik import host_verify
 
 
 class HostVerifyTests(unittest.TestCase):
+    def test_windows_retention_skips_require_exact_case_and_reason(self):
+        expected = {
+            "test_retention.RetentionTests.test_world_readable_evidence_in_public_parent_remains":
+                "POSIX file modes only",
+            "test_retention.RetentionTests.test_wrong_owner_refuses_cleanup":
+                "POSIX ownership only",
+        }
+        with patch.object(host_verify.os, "name", "nt"):
+            for case, reason in expected.items():
+                with self.subTest(case=case):
+                    self.assertTrue(host_verify._allowed_skip(case, reason))
+                    self.assertFalse(host_verify._allowed_skip(case, "unexpected environment"))
+            self.assertFalse(host_verify._allowed_skip(
+                "test_retention.RetentionTests.test_unlisted_case", "POSIX file modes only"))
+        with patch.object(host_verify.os, "name", "posix"):
+            for case, reason in expected.items():
+                self.assertFalse(host_verify._allowed_skip(case, reason))
+
     def test_empty_unit_suite_fails(self):
         with patch.object(host_verify.unittest.TestLoader, "discover",
                           return_value=unittest.TestSuite()):
