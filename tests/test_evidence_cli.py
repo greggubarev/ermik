@@ -52,6 +52,18 @@ class EvidenceCliTests(unittest.TestCase):
             self.assertEqual(code, 1)
             parse.assert_not_called()
 
+    def test_unsupported_manifest_version_is_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "future.json"
+            path.write_bytes(b'{"version":2,"future_required":"value"}\n')
+            error = StringIO()
+            with (patch.object(cli, "load_config", return_value=object()),
+                  redirect_stderr(error)):
+                code = cli.main(["--config", "unused", "verify-evidence", "19",
+                                 "--input", str(path)])
+        self.assertEqual(code, 1)
+        self.assertIn("unsupported manifest version", error.getvalue())
+
     def test_fetch_writes_only_current_record(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "fetched.json"
@@ -69,6 +81,21 @@ class EvidenceCliTests(unittest.TestCase):
                 self.assertEqual(cli.main(["--config", "unused", "fetch-evidence", "19",
                                            "--output", str(path)]), 0)
             self.assertEqual(path.read_bytes(), b"record\n")
+
+    def test_fetch_reports_unsupported_version_without_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fetched.json"
+            output = StringIO()
+            with (patch.object(cli, "load_config", return_value=object()),
+                  patch.object(cli, "fetch_manifest", return_value=(
+                      {"status": "unsupported_version"}, None)),
+                  redirect_stdout(output)):
+                code = cli.main(["--config", "unused", "fetch-evidence", "19",
+                                 "--output", str(path)])
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(output.getvalue())["status"],
+                             "unsupported_version")
+            self.assertFalse(path.exists())
 
     def test_run_once_delivers_when_publisher_is_configured(self):
         cfg = type("ConfigStub", (), {"evidence_publisher": "keeper"})()

@@ -4,11 +4,74 @@ import copy
 import hashlib
 import json
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from ermik.evidence import dumps_manifest, loads_manifest, make_manifest, validate_manifest
+from ermik.config import Config
+from ermik.evidence import (UnsupportedManifestVersion, dumps_manifest,
+                            loads_manifest, make_manifest, validate_manifest)
+from ermik.evidence_export import verify_manifest
+from ermik.policy import parse_issue
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "evidence"
+BODY = ("## Goal\nUpdate the example.\n\n## Allowed paths\nsrc\n\n"
+        "## Acceptance\nThe check passes.\n")
 
 
 class EvidenceTests(unittest.TestCase):
+    def fixture(self, head):
+        return (FIXTURES / f"{head}.v1.json").read_bytes()
+
+    def test_fixture_correction_and_stale_head(self):
+        h1 = loads_manifest(self.fixture("h1"))
+        h2 = loads_manifest(self.fixture("h2"))
+        self.assertEqual(dumps_manifest(h1), self.fixture("h1"))
+        self.assertEqual(dumps_manifest(h2), self.fixture("h2"))
+        self.assertEqual((h1["head"], h2["head"]), ("1" * 40, "2" * 40))
+        self.assertEqual((h1["sha256"], h2["sha256"]), (
+            "4a0019e844b5377f98f62c1131459054431ae59cf362692db8829f8c50e4f81b",
+            "7c9018f0aae721c3f2b85b0ab5f93021ff90a188f484877f3c50397a7df3cf3d"))
+        cfg = Config("owner/example", "maintainer", Path("state"), Path("work"),
+                     h2["image"], ("run",), (("check", "example"),), 1, 60, (), "main")
+        pr = {"headRefName": h2["branch"], "baseRefOid": h2["base"],
+              "headRefOid": h2["head"], "body": "synthetic"}
+        spec = parse_issue(BODY)
+        with (patch("ermik.evidence_export._github"),
+              patch("ermik.evidence_export._live", return_value=(pr, 1, spec, h2["paths"])),
+              patch("ermik.evidence_export.published_image_id", return_value=h2["image"]),
+              patch("ermik.evidence_export._resolve_image_id", return_value=h2["image"])):
+            self.assertEqual(verify_manifest(cfg, 2, h2)["status"], "current")
+            self.assertEqual(verify_manifest(cfg, 2, h1),
+                             {"status": "stale", "reason": "identity_changed"})
+            changed_checks = Config("owner/example", "maintainer", Path("state"),
+                                    Path("work"), h2["image"], ("run",),
+                                    (("check", "different"),), 1, 60, (), "main")
+            self.assertEqual(verify_manifest(changed_checks, 2, h2),
+                             {"status": "stale", "reason": "identity_changed"})
+
+    def test_fixture_version_dispatch_and_rejections(self):
+        raw = self.fixture("h1")
+        record = loads_manifest(raw)
+        for version in (2, 0, 1.0, "1", True):
+            changed = {**record, "version": version, "future_required": "value"}
+            with self.subTest(version=version), self.assertRaisesRegex(
+                    UnsupportedManifestVersion, "unsupported manifest version"):
+                validate_manifest(changed)
+            with self.subTest(version=version, input="bytes"), self.assertRaisesRegex(
+                    UnsupportedManifestVersion, "unsupported manifest version"):
+                loads_manifest(json.dumps(changed).encode() + b"\n")
+        for changed in ({**record, "future_required": "value"},
+                        {**record, "raw_log": "private output"},
+                        {**record, "paths": ["C:/private/file"]},
+                        {**record, "sha256": "0" * 64}):
+            with self.subTest(keys=set(changed)), self.assertRaises(ValueError):
+                validate_manifest(changed)
+        with self.assertRaisesRegex(ValueError, "duplicate manifest key"):
+            loads_manifest(raw.replace(b'"pr":2', b'"pr":2,"pr":2'))
+        with self.assertRaisesRegex(ValueError, "manifest size"):
+            loads_manifest(raw + b" " * 16384)
+
     def fields(self):
         scope = hashlib.sha256(json.dumps(
             ["src", "tests"], separators=(",", ":"), ensure_ascii=False
