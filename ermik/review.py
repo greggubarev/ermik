@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 
 from .config import Config
+from .decision_trail import append_decision, check_decision, review_digest
 from .evidence_store import read_evidence, write_evidence
 from .github import GitHub, GitHubError
 from .git_tree import verify_changed_tree
@@ -115,6 +116,12 @@ def _load(cfg: Config, number: int) -> dict:
     return record
 
 
+def _record_decision(cfg: Config, record: dict, decision: str) -> dict:
+    """Append a local observation; the private review record remains the gate."""
+    review_digest(cfg, record)
+    return append_decision(cfg, record, decision)
+
+
 def review(cfg: Config, number: int) -> dict:
     with state.exclusive(cfg.state_dir):
         return _review_locked(cfg, number)
@@ -124,8 +131,12 @@ def _review_locked(cfg: Config, number: int) -> dict:
     gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
           if cfg.publish_repo else GitHub(cfg.repo))
     record_path = cfg.state_dir / "reviews" / f"pr-{number}.json"
-    if record_path.exists() and _load(cfg, number).get("merge_attempt") is not None:
-        raise WorkflowError("review cannot replace a pending merge attempt")
+    if record_path.exists():
+        prior = _load(cfg, number)
+        if prior.get("merge_attempt") is not None:
+            raise WorkflowError("review cannot replace a pending merge attempt")
+        if "ci" in prior:
+            _record_decision(cfg, prior, "reviewed")
     pr, issue_num, issue = _identity(cfg, gh, number)
     if pr["baseRefOid"] != main_sha(gh, cfg):
         raise WorkflowError("PR base is not current base branch")
@@ -167,6 +178,7 @@ def _review_locked(cfg: Config, number: int) -> dict:
               "ci": proof, "checks_sha256": _checks_sha256(cfg),
               "image_id": image_id, "decision": "reviewed"}
     _save(cfg, number, result)
+    _record_decision(cfg, result, "reviewed")
     return result
 
 
@@ -189,14 +201,28 @@ def _request_changes_locked(cfg: Config, number: int, note_file: Path) -> dict:
     note = note_file.read_text(encoding="utf-8").strip()
     if not 10 <= len(note) <= 4000:
         raise WorkflowError("review note must be 10..4000 characters")
+    _record_decision(cfg, record, "reviewed")
+    check_decision(cfg, record, "changes_requested")
     marker = f"SEMI_REWORK issue={issue_num} head={record['head']}"
     body = marker + "\n\n" + note
-    existing = [row for row in gh.comments(number) if row.get("body") == body and
+    comments = gh.comments(number)
+    existing = [row for row in comments if row.get("body") == body and
                 row.get("user", {}).get("login") == cfg.maintainer]
-    if not existing:
+    already_present = bool(existing)
+    if not already_present:
+        if any(marker in (row.get("body") or "") and
+               row.get("user", {}).get("login") == cfg.maintainer
+               for row in comments):
+            _record_decision(cfg, record, "changes_requested")
+            raise WorkflowError("exact-head correction request already exists")
         gh.comment(number, body)
+        existing = [row for row in gh.comments(number) if row.get("body") == body and
+                    row.get("user", {}).get("login") == cfg.maintainer]
+        if not existing:
+            raise WorkflowError("exact-head correction comment is not confirmed")
+    _record_decision(cfg, record, "changes_requested")
     return {"pr": number, "issue": issue_num, "head": record["head"],
-            "request": "already-present" if existing else "posted"}
+            "request": "already-present" if already_present else "posted"}
 
 
 def _merged_identity(cfg: Config, gh: GitHub, number: int,
@@ -316,10 +342,13 @@ def _merge_locked(cfg: Config, number: int) -> dict:
                                     base_branch=cfg.base_branch, number=number,
                                     head_sha=record["head"], base_sha=record["base"],
                                     state="OPEN")
+            _record_decision(cfg, record, "reviewed")
+            _record_decision(cfg, record, "merge_intent")
             result = _incomplete(number, issue_num, "merge outcome is unconfirmed")
             if record.get("merge_pending") != result:
                 record["merge_pending"] = result
                 _save(cfg, number, record)
+            _record_decision(cfg, record, "merge_incomplete")
             return result
         pr, issue_num, issue = _identity(cfg, gh, number)
         if (record["branch"] != pr["headRefName"]
@@ -336,6 +365,8 @@ def _merge_locked(cfg: Config, number: int) -> dict:
         if published_image_id(pr.get("body") or "") != _review_policy(
                 cfg, record, check_reference=True):
             raise WorkflowError("published execution image changed since review")
+        _record_decision(cfg, record, "reviewed")
+        check_decision(cfg, record, "merge_intent")
         if pr["isDraft"]:
             gh.command(["pr", "ready", str(number), "-R", cfg.repo])
             pr = gh.pr(number)
@@ -358,6 +389,7 @@ def _merge_locked(cfg: Config, number: int) -> dict:
         record["merge_attempt"] = {"head": record["head"],
                                    "base": record["base"],
                                    "branch": record["branch"]}
+        _record_decision(cfg, record, "merge_intent")
         _save(cfg, number, record)
         try:
             gh.command(["pr", "merge", str(number), "-R", cfg.repo,
@@ -374,10 +406,13 @@ def _merge_locked(cfg: Config, number: int) -> dict:
         result = _incomplete(number, issue_num, "merge outcome is unconfirmed")
         record["merge_pending"] = result
         _save(cfg, number, record)
+        _record_decision(cfg, record, "merge_incomplete")
         return result
     if observed["state"] != "MERGED":
         raise WorkflowError("PR closed without a confirmed merge")
     merge_commit = _merged_identity(cfg, gh, number, record, observed)
+    _record_decision(cfg, record, "reviewed")
+    _record_decision(cfg, record, "merge_intent")
     if record.get("merge_commit") != merge_commit or "merge_pending" in record:
         record["merge_commit"] = merge_commit
         record.pop("merge_pending", None)
@@ -385,6 +420,7 @@ def _merge_locked(cfg: Config, number: int) -> dict:
     completed = record.get("merged")
     if (isinstance(completed, dict) and completed.get("merge_commit") == merge_commit
             and completed.get("status", "complete") == "complete"):
+        _record_decision(cfg, record, "merged")
         return completed
     try:
         proof = _post_merge_verification(cfg, gh, number, record, merge_commit)
@@ -395,4 +431,6 @@ def _merge_locked(cfg: Config, number: int) -> dict:
         result = _incomplete(number, issue_num, str(exc),
                              merge_commit)
     _save(cfg, number, {**record, "merged": result})
+    _record_decision(cfg, record, "merged" if result["status"] == "complete"
+                     else "merge_incomplete")
     return result

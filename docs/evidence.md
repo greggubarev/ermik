@@ -43,3 +43,14 @@ python3 -m ermik --config config.json review-packet PR_NUMBER
 ```
 
 The read-only command checks the current Issue admission, PR base and HEAD, changed paths, evidence comment, configured checks, and image identity. Its `diff_url` opens GitHub's comparison of the two exact commits; inspect the full diff there. It separates the controller's reported check results from a local exact-HEAD review. A missing or stale record is reported explicitly with a nonzero exit status. The packet is a review aid; it does not run checks, write a review record, or authorize merge. Run `review PR_NUMBER` on the current HEAD before merging.
+
+## Decision history
+
+The maintainer installation keeps a bounded private record of reviewed HEADs, requested corrections, and explicit merge decisions. Each entry contains repository, Issue, PR, base, HEAD, a digest of the local check evidence, decision, and UTC timestamp. The digest is calculated from the local check results and log digests, excluding timestamps and log paths. It is not a signature and does not replace a current review.
+
+```sh
+python3 -m ermik --config config.json decision-history PR_NUMBER
+```
+
+This read-only summary is historical (`approval: none`). It contains no correction note, issue body, raw log, credential, or local path. A changed HEAD keeps earlier entries for audit but requires a new exact-HEAD review. A missing or malformed local check record cannot supply a decision digest.
+The journal holds at most 128 entries or 64 KiB per PR and does not silently prune history. An invalid or full journal stops new decisions until it is inspected and repaired from trusted records.

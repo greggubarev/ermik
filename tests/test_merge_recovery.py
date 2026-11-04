@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from ermik import review, runtime
 from ermik.config import Config
+from ermik.decision_trail import read_decisions
 from ermik.github import GitHub, GitHubError
 from ermik.policy import parse_issue
 
@@ -109,7 +110,11 @@ class MergeRecoveryTests(unittest.TestCase):
                        "body_sha256": parse_issue(BODY).body_sha256,
                        "paths": ["src/a.py"], "decision": "reviewed",
                        "checks_sha256": review._checks_sha256(self.cfg),
-                       "image_id": IMAGE}
+                       "image_id": IMAGE,
+                       "ci": {"head": HEAD, "committed_diff_base": BASE,
+                              "image_id": IMAGE, "result": "passed",
+                              "checks": [{"command": ["true"], "exit_code": 0,
+                                          "log_sha256": "e" * 64}]}}
         review._save(self.cfg, PR, self.record)
         for target, value in (("GitHub", self.hub),
                               ("_approved_on_github", True),
@@ -155,6 +160,14 @@ class MergeRecoveryTests(unittest.TestCase):
         self.assertTrue(result["issue_closed"])
         self.assertEqual(review._load(self.cfg, PR)["merged"], result)
         self.assertEqual(self.hub.merge_calls, 1)
+        entries = read_decisions(self.cfg, PR)["entries"]
+        decisions = [entry["decision"] for entry in entries]
+        self.assertEqual(decisions[:2], ["reviewed", "merge_intent"])
+        self.assertEqual(decisions[-1], "merged")
+        self.assertEqual(decisions.count("merged"), 1)
+        self.assertTrue(set(decisions[2:-1]) <= {"merge_incomplete"})
+        self.assertTrue(all(entry["head"] == HEAD and entry["base"] == BASE
+                            for entry in entries))
         return result
 
     def test_lost_response_after_github_merge_reconciles_and_retry_is_read_only(self):
