@@ -7,6 +7,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 | Area | Evidence |
 | --- | --- |
 | State and policy | Unit tests cover admission, path reservations, provider routing, publication, review, and recovery transitions. |
+| Source host gate | At commit `fe1233c9b4ba899a4d1c20dd04bacbdb7e129873`, a [manual clean-host run](https://github.com/greggubarev/ermik/issues/4#issuecomment-6642136455) passed on fresh Ubuntu and Windows runners with clean checkouts. Ubuntu executed 483 unit cases and passed Docker smoke and container recovery; Windows executed 472 cases with 11 documented platform skips and no unexpected skips. This verifies the source gate on those hosts, not the full installation exercise in #5. |
 | SQLite state upgrade | Nine migration tests use populated, synthetic preview state. They cover an idempotent upgrade to schema version 1, preserved admissions, jobs, retry and usage rows and review evidence files, refusal of an unknown newer version, an interrupted transaction, backup/restore, and preservation of a version 1 manifest that now fails current image-identity verification. Run `python3 -m unittest tests.test_state_migrations -v`. The [setup guide](setup.md#stop-update-and-roll-back) gives the stopped-service backup and rollback procedure. |
 | Demo runner | The Docker host smoke covers a failed check, task execution, correction, and local checks. |
 | Container cleanup | A host smoke removes only a stopped run's labelled container. |
