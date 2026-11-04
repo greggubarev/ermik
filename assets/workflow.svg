@@ -42,7 +42,7 @@
   <rect x="45" y="155" width="260" height="7" rx="3" fill="#4779c5"/>
   <text class="step" x="68" y="194">01 · MAINTAINER</text>
   <text class="card-title" x="68" y="232">Prepare issue</text>
-  <text class="body" x="68" y="264">Goal and allowed files</text>
+  <text class="body" x="68" y="264">Goal, paths, acceptance</text>
   <text class="body" x="68" y="290">Approve admission</text>
 
   <g filter="url(#shadow)"><rect x="355" y="155" width="260" height="174" rx="18" fill="#fff"/></g>
@@ -51,14 +51,14 @@
   <text class="card-title" x="378" y="232">Issue queue</text>
   <rect x="378" y="252" width="188" height="32" rx="16" fill="#e9f2ff"/>
   <text class="badge" x="391" y="273" fill="#245793">queue:worker · ready</text>
-  <text class="body" x="378" y="309">Verify issue hash</text>
+  <text class="body" x="378" y="309">Approval stored on issue</text>
 
   <g filter="url(#shadow)"><rect x="665" y="155" width="260" height="174" rx="18" fill="#fff"/></g>
   <rect x="665" y="155" width="260" height="7" rx="3" fill="#765eb7"/>
   <text class="step" x="688" y="194">03 · SERVER</text>
   <text class="card-title" x="688" y="232">Execute task</text>
-  <text class="body" x="688" y="264">Container and local CI</text>
-  <text class="body" x="688" y="290">Branch and draft PR</text>
+  <text class="body" x="688" y="264">Verify admission hash</text>
+  <text class="body" x="688" y="290">Container, checks, draft PR</text>
 
   <g filter="url(#shadow)"><rect x="975" y="155" width="300" height="174" rx="18" fill="#fff"/></g>
   <rect x="975" y="155" width="300" height="7" rx="3" fill="#318f92"/>

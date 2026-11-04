@@ -31,6 +31,7 @@ Ermik is a preview. The execution host prepares draft pull requests; a maintaine
 
 ## Not yet verified
 
+- [Issue #32](https://github.com/greggubarev/ermik/issues/32) is closed as `not planned` by maintainer decision; closure does not verify its remaining permission and image boundaries.
 - PR evidence fetching with a credential restricted to repository read access, and image validation against an independent maintainer-host image.
 - Reboot of the execution host while a task is active.
 - Live disk-pressure, interrupted artifact cleanup, and repeated cleanup on a real long-running installation.
