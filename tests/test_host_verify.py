@@ -61,6 +61,9 @@ class HostVerifyTests(unittest.TestCase):
         self.assertEqual(result["result"], "failed")
         self.assertEqual({row["type"] for row in result["failure_types"]},
                          {"AssertionError", "ValueError"})
+        self.assertTrue(all(row["sites"] for row in result["failure_types"]))
+        self.assertTrue(all("/" not in site["file"] and "\\" not in site["file"]
+                            for row in result["failure_types"] for site in row["sites"]))
         self.assertNotIn("private", str(result))
 
     def test_unit_only_records_docker_as_not_requested(self):
