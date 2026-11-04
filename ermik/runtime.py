@@ -763,10 +763,18 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
 
 def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                reserved: dict[str, int] | None = None,
-               selected: dict[int, str] | None = None) -> tuple[int, str, IssueSpec] | None:
+               selected: dict[int, str] | None = None,
+               recovered: dict[str, list[int]] | None = None) -> tuple[int, str, IssueSpec] | None:
+    if recovered is None:
+        recovered = recover_stale_worktrees(cfg.workspace, conn)
+    published = {row[0] for row in conn.execute(
+        "SELECT issue FROM jobs WHERE status IN ('awaiting_review','merged')")}
+    retained = frozenset(published.intersection(recovered["preserved"]))
     resources = resource_guard(cfg.workspace,
                                min_free_bytes=cfg.min_free_gb * 1024**3,
-                               max_worktrees=cfg.max_parallel)
+                               max_worktrees=cfg.max_parallel,
+                               state_dir=cfg.state_dir,
+                               retained_issues=retained)
     if not resources["admit"]:
         return None
     for number in gh.ready_issues():
@@ -1415,7 +1423,7 @@ def run_once(cfg: Config) -> list[dict]:
         review_budget = [min(10, max(1, cfg.poll_seconds // 5))]
         with state.connect(cfg.state_dir) as conn:
             _reconcile_interrupted(gh, cfg, conn)
-            recover_stale_worktrees(cfg.workspace, conn)
+            recovered = recover_stale_worktrees(cfg.workspace, conn)
             # Reconcile merged PRs before reserving new paths.
             # An explicit rebase-only request needs no provider slot.
             cycle_capacity = (min(cfg.max_parallel, max(1, available_capacity(conn, cfg.models)))
@@ -1499,7 +1507,7 @@ def run_once(cfg: Config) -> list[dict]:
                     work.append((row["issue"], row["branch"], spec, note, row["pr"], None))
                     continue
                 claimed = _claim_new(gh, cfg, conn, reserved_providers,
-                                     selected_providers)
+                                     selected_providers, recovered)
                 if not claimed:
                     break
                 number, branch, spec = claimed

@@ -57,12 +57,12 @@ def _verified_published_checkout(path: Path, issue: int, row: tuple) -> bool:
 
 
 def recover_stale_worktrees(workspace: Path, conn: sqlite3.Connection) -> dict[str, list[int]]:
-    """Remove clean stale issue worktrees under the controller's exclusive lock.
+    """Classify stale issue worktrees under the controller's exclusive lock.
 
-    Call after interrupted jobs are reconciled. Only published or merged jobs
-    with a recorded PR and a matching, clean local HEAD are eligible. A crash
-    checkout may hold the sole copy of an unpushed commit, even if Git calls it
-    clean. Git performs the actual removal without --force.
+    Call after interrupted jobs are reconciled. Published and merged trees are
+    retained for explicit, bounded cleanup after its retention and remote
+    identity gates. A crash checkout may hold the sole copy of an unpushed
+    commit, even if Git calls it clean.
     """
     workspace = Path(workspace)
     result: dict[str, list[int]] = {
@@ -101,12 +101,5 @@ def recover_stale_worktrees(workspace: Path, conn: sqlite3.Connection) -> dict[s
         if row is None or not _verified_published_checkout(path, issue, row):
             result["requires_inspection"].append(issue)
             continue
-        try:
-            # Without --force, Git refuses dirty checkouts and keeps their data.
-            subprocess.run(["git", "-C", str(source), "worktree", "remove", str(path)],
-                           check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError:
-            result["requires_inspection"].append(issue)
-        else:
-            result["removed"].append(issue)
+        result["preserved"].append(issue)
     return result

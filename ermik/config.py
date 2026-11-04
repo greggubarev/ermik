@@ -14,7 +14,7 @@ _REQUIRED = {"repo", "maintainer", "state_dir", "workspace", "image",
              "worker_command", "checks", "max_parallel", "poll_seconds"}
 _OPTIONAL = {"worker_env", "base_branch", "models", "min_free_gb",
              "publish_repo", "publish_token_env", "routes", "draft_pr_socket",
-             "draft_pr_evidence_dir"}
+             "draft_pr_evidence_dir", "retention_days", "artifact_warn_mb"}
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ROUTE = re.compile(r"^route:[a-z][a-z0-9_-]{0,39}$")
 
@@ -39,6 +39,8 @@ class Config:
     routes: dict[str, str] = field(default_factory=dict)
     draft_pr_socket: Path | None = None
     draft_pr_evidence_dir: Path | None = None
+    retention_days: int = 30
+    artifact_warn_mb: int = 1024
 
 
 def _command(value: object, name: str) -> tuple[str, ...]:
@@ -131,6 +133,12 @@ def load_config(path: Path) -> Config:
     min_free_gb = raw.get("min_free_gb", 2)
     if type(min_free_gb) is not int or not 0 <= min_free_gb <= 1000:
         raise ValueError("min_free_gb must be 0..1000")
+    retention_days = raw.get("retention_days", 30)
+    if type(retention_days) is not int or not 1 <= retention_days <= 3650:
+        raise ValueError("retention_days must be 1..3650")
+    artifact_warn_mb = raw.get("artifact_warn_mb", 1024)
+    if type(artifact_warn_mb) is not int or not 0 <= artifact_warn_mb <= 1000000:
+        raise ValueError("artifact_warn_mb must be 0..1000000")
     draft_pr_socket = raw.get("draft_pr_socket")
     if draft_pr_socket is not None:
         if (not publish_repo or not isinstance(draft_pr_socket, str)
@@ -152,4 +160,4 @@ def load_config(path: Path) -> Config:
                   worker_command, commands, max_parallel, poll_seconds,
                   tuple(worker_env), base_branch, models, min_free_gb,
                   publish_repo, publish_token_env, dict(routes), draft_pr_socket,
-                  draft_pr_evidence_dir)
+                  draft_pr_evidence_dir, retention_days, artifact_warn_mb)
