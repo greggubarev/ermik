@@ -52,12 +52,12 @@ The maintainer admits an issue; the server's `run-once` or `poll` takes only adm
 
 | Milestone | Focus | Closed issues | What remains |
 | --- | --- | ---: | --- |
-| [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Reliable operation | **17 / 21** | Clean-host setup, active-task reboot, provider failures, and source verification across supported hosts. |
+| [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Reliable operation | **18 / 21** | Independent clean-host setup, active-task reboot, and provider failure trials. |
 | [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable review evidence | **6 / 6** | Read-only handoff [#32](https://github.com/greggubarev/ermik/issues/32) and cross-store image review [#69](https://github.com/greggubarev/ermik/issues/69) passed their documented trials. |
 | [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **0 / 4** | Route outcomes, quota observations, and cost per accepted PR. |
 | [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Operator view and adoption | **0 / 4** | Maintainer queue view, diagnostics, and non-demo project trials. |
 
-Counts describe closed milestone issues as of 4 November 2026, not release readiness or a schedule. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
+Counts describe closed milestone issues as of 5 November 2026, not release readiness or a schedule. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
 
 ## Guides
 

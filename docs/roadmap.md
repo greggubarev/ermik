@@ -10,7 +10,7 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 | Order | Issue | Required observation |
 | --- | --- | --- |
-| 1 | [#4](https://github.com/greggubarev/ermik/issues/4), [#5](https://github.com/greggubarev/ermik/issues/5) | Run the existing gate on fresh Linux and Windows hosts; have an operator follow setup through a complete disposable Issue and PR on fresh Linux. Reuse the same Linux setup for both issues. |
+| 1 | [#5](https://github.com/greggubarev/ermik/issues/5) | Have an operator follow setup through a complete disposable Issue and PR on fresh Linux. The separate [source host gate](https://github.com/greggubarev/ermik/issues/4#issuecomment-6642136455) passed on clean Linux and Windows runners. |
 | 2 | [#6](https://github.com/greggubarev/ermik/issues/6) | On each advertised route, record a successful disposable task and bounded auth, quota, timeout, and malformed-response failures, including slot release and redaction. |
 | 3 | [#7](https://github.com/greggubarev/ermik/issues/7) | Reboot a supported Linux host during an active disposable worker and broker request; confirm one PR or an explicit blocked state after recovery. |
 
