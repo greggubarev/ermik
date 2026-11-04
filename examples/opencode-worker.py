@@ -202,7 +202,8 @@ def main() -> int:
         print("WORKER_CONFIGURATION_ERROR")
         return 78
 
-    with tempfile.TemporaryDirectory(prefix="opencode-", dir="/tmp") as temp:
+    with tempfile.TemporaryDirectory(prefix="opencode-",
+                                     dir="/tmp" if os.name == "posix" else None) as temp:
         config_path = Path(temp) / "opencode.json"
         config_path.write_text(json.dumps(_config(candidate)), encoding="utf-8")
         config_path.chmod(0o600)
