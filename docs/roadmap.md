@@ -6,6 +6,16 @@ Phases below are ordered by evidence needed, not by release date. The v0.2 relia
 
 The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks recovery, credential isolation, image identity, upgrades and release gates. [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) tracks portable evidence and review handoff; [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) tracks measured routing; [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) tracks optional operator experience and adoption trials. Closed Issues remain in their milestone as evidence of completed steps. Listing work here does not mark it complete.
 
+## Next release gates
+
+| Order | Issue | Required observation |
+| --- | --- | --- |
+| 1 | [#4](https://github.com/greggubarev/ermik/issues/4), [#5](https://github.com/greggubarev/ermik/issues/5) | Run the existing gate on fresh Linux and Windows hosts; have an operator follow setup through a complete disposable Issue and PR on fresh Linux. Reuse the same Linux setup for both issues. |
+| 2 | [#6](https://github.com/greggubarev/ermik/issues/6) | On each advertised route, record a successful disposable task and bounded auth, quota, timeout, and malformed-response failures, including slot release and redaction. |
+| 3 | [#7](https://github.com/greggubarev/ermik/issues/7) | Reboot a supported Linux host during an active disposable worker and broker request; confirm one PR or an explicit blocked state after recovery. |
+
+These are the remaining v0.2 acceptance gates. Do not repeat completed tests merely to increase activity; attach each run to the exact Issue, host, versions, and commit it verifies.
+
 ## 0. Verified handoff baseline
 
 **Current evidence:** One documented trial completed admission, task execution, draft PR publication, a correction in the same PR, review of the new HEAD, explicit merge, and a check on the resulting default branch. Host smoke tests cover a failed check and container cleanup. Two configured provider routes each completed a live task. See [release status](readiness.md) and the [first-project exercise](first-project.md).
