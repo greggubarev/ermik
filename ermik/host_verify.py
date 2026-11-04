@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import unittest
@@ -53,14 +54,23 @@ class _Results(unittest.TextTestResult):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.failure_ids: list[str] = []
+        self.failure_types: list[dict[str, str]] = []
+
+    def _record_type(self, test, err) -> None:
+        name = getattr(err[0], "__name__", "")
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name):
+            name = "Exception"
+        self.failure_types.append({"case": test.id(), "type": name})
 
     def addFailure(self, test, err):  # noqa: N802 - unittest callback
         super().addFailure(test, err)
         self.failure_ids.append(test.id())
+        self._record_type(test, err)
 
     def addError(self, test, err):  # noqa: N802 - unittest callback
         super().addError(test, err)
         self.failure_ids.append(test.id())
+        self._record_type(test, err)
 
 
 def _allowed_skip(test_id: str, reason: str) -> bool:
@@ -88,6 +98,8 @@ def _unit_suite() -> dict:
         "unexpected_successes": len(result.unexpectedSuccesses),
         "failure_cases": failures[:_MAX_CASES],
         "failure_cases_truncated": len(failures) > _MAX_CASES,
+        "failure_types": result.failure_types[:_MAX_CASES],
+        "failure_types_truncated": len(result.failure_types) > _MAX_CASES,
         "skipped": len(skipped),
         "allowed_skips": len(skipped) - len(unexpected),
         "unexpected_skips": [{"case": name, "reason": reason[:_MAX_TEXT]}
