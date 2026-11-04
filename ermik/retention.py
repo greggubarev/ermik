@@ -195,6 +195,25 @@ def _remote_merged(cfg, gh: GitHub, row, cutoff: float) -> bool:
         return False
 
 
+def _remote_pr_heads(gh: GitHub, pr: int) -> set[str] | None:
+    """Read a bounded, complete commit list for one PR; uncertainty blocks cleanup."""
+    heads: set[str] = set()
+    try:
+        for page in range(1, 11):
+            commits = gh.api(f"pulls/{pr}/commits?per_page=100&page={page}")
+            if type(commits) is not list or len(commits) > 100:
+                return None
+            if any(type(commit) is not dict or type(commit.get("sha")) is not str
+                   or _HEAD.fullmatch(commit["sha"]) is None for commit in commits):
+                return None
+            heads.update(commit["sha"] for commit in commits)
+            if len(commits) < 100:
+                return heads
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None
+    return None
+
+
 def _prune_empty(parent: Path, root: Path) -> None:
     if parent != root:
         try:
@@ -203,7 +222,7 @@ def _prune_empty(parent: Path, root: Path) -> None:
             pass
 
 
-def _valid_evidence(path: Path, row) -> bool:
+def _valid_evidence(path: Path, row, *, head: str | None = None) -> bool:
     try:
         proof = read_evidence(path)
     except (OSError, ValueError):
@@ -211,7 +230,7 @@ def _valid_evidence(path: Path, row) -> bool:
     return (proof.get("issue") == row["issue"]
             and proof.get("pr") == row["pr"]
             and proof.get("branch") == row["branch"]
-            and proof.get("head") == row["head_sha"]
+            and proof.get("head") == (head or row["head_sha"])
             and proof.get("base") == row["base_sha"])
 
 
@@ -280,10 +299,24 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
         with state.connect(cfg.state_dir) as conn:
             rows = {row["issue"]: row for row in state.jobs(conn)}
         items = _items(cfg, current)
+        # A correction can supersede the ledger HEAD. Its private publication
+        # record supplies the exact old Issue/PR/branch/base/HEAD binding.
+        old_proofs: dict[str, list] = {}
+        unbound_heads: set[str] = set()
+        for proof_item in items:
+            if proof_item["kind"] != "evidence":
+                continue
+            row = rows.get(proof_item["issue"])
+            if row is None or not _valid_evidence(proof_item["path"], row,
+                                                  head=proof_item["head"]):
+                unbound_heads.add(proof_item["head"])
+            elif proof_item["head"] != row["head_sha"]:
+                old_proofs.setdefault(proof_item["head"], []).append(row)
         client = gh or GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
         source = Path(cfg.workspace) / "source"
         registered = None
         remote_cache: dict[tuple[int, int, str], bool] = {}
+        old_head_cache: dict[int, set[str] | None] = {}
         unsafe_checkout_issues: set[int] = set()
         worktrees = [item for item in items if item["kind"] == "worktrees"]
         if worktrees:
@@ -306,7 +339,11 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
         for item in items:
             issue = item["issue"]
             if item["kind"] == "logs":
+                if item["head"] in unbound_heads:
+                    result["skipped"] += 1
+                    continue
                 refs = [row for row in rows.values() if row["head_sha"] == item["head"]]
+                refs.extend(old_proofs.get(item["head"], []))
                 if not refs:
                     result["skipped"] += 1
                     continue
@@ -315,8 +352,8 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
                 refs = [row] if row is not None else []
             if (not refs or item["mtime"] > cutoff
                     or any(row["issue"] in unsafe_checkout_issues for row in refs)
-                    or any(row["head_sha"] != item["head"] for row in refs
-                           if item["kind"] == "evidence")):
+                    or (item["kind"] == "evidence" and not _valid_evidence(
+                        item["path"], refs[0], head=item["head"]))):
                 result["skipped"] += 1
                 continue
             for row in refs:
@@ -327,7 +364,21 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
                    or not _review_allows_cleanup(cfg, row) for row in refs):
                 result["skipped"] += 1
                 continue
-            if item["kind"] == "evidence" and not _valid_evidence(item["path"], refs[0]):
+            if item["kind"] in ("logs", "evidence"):
+                for row in refs:
+                    if item["head"] == row["head_sha"]:
+                        continue
+                    if row["pr"] not in old_head_cache:
+                        old_head_cache[row["pr"]] = _remote_pr_heads(client, row["pr"])
+                if any(item["head"] != row["head_sha"]
+                       and (old_head_cache[row["pr"]] is None
+                            or item["head"] not in old_head_cache[row["pr"]])
+                       for row in refs):
+                    result["skipped"] += 1
+                    continue
+            if (item["kind"] == "evidence" and item["head"] != refs[0]["head_sha"]
+                    and any(other["kind"] == "logs" and other["head"] == item["head"]
+                            and other["path"].exists() for other in items)):
                 result["skipped"] += 1
                 continue
             if item["kind"] == "worktrees":
@@ -351,7 +402,10 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
             # replacing paths. Check the target again immediately before removal.
             try:
                 if item["kind"] == "worktrees":
-                    _tree(item["path"], [_MAX_SCAN])
+                    current_size, _ = _tree(item["path"], [_MAX_SCAN])
+                    if (current_size != item["bytes"]
+                            or current_size > max_bytes - result["bytes"]):
+                        raise ValueError("checkout size changed or exceeds cleanup limit")
                     if not _verified_published_checkout(item["path"], issue, legacy):
                         raise ValueError("checkout changed before cleanup")
                     subprocess.run(["git", "-C", str(source), "worktree", "remove",
@@ -362,7 +416,7 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
                     if info.st_size != item["bytes"] or info.st_mtime != item["mtime"]:
                         raise ValueError("artifact changed before cleanup")
                     if item["kind"] == "evidence" and not _valid_evidence(
-                            item["path"], refs[0]):
+                            item["path"], refs[0], head=item["head"]):
                         raise ValueError("evidence changed before cleanup")
                     item["path"].unlink()
                     _prune_empty(item["path"].parent,

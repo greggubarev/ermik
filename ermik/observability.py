@@ -138,26 +138,44 @@ def status_snapshot(state_dir: Path, *, max_parallel: int,
 
 
 def resource_guard(workspace: Path, *, min_free_bytes: int,
-                   max_worktrees: int, disk_free_bytes: int | None = None) -> dict:
+                   max_worktrees: int, disk_free_bytes: int | None = None,
+                   state_dir: Path | None = None,
+                   state_disk_free_bytes: int | None = None,
+                   retained_issues: frozenset[int] = frozenset()) -> dict:
     """Preflight signal for callers to check before claiming another job.
 
-    No cleanup is performed. A missing workspace is measured at its nearest
-    existing parent; only direct issue-* directories under jobs are counted.
+    No cleanup is performed. Missing roots are measured at their nearest
+    existing parents; only direct issue-* directories under jobs are counted.
+    A caller may exclude independently verified, retained published checkouts
+    from the active slot count; they still consume disk space.
     """
     if min_free_bytes < 0 or max_worktrees < 0:
         raise ValueError("resource thresholds must be nonnegative")
-    if workspace.is_symlink():
-        raise ValueError("workspace cannot be a symlink")
-    probe = workspace
-    while not probe.exists():
-        if probe.parent == probe:
-            raise ValueError("no existing parent for workspace")
-        probe = probe.parent
-    if not probe.is_dir():
-        raise ValueError("workspace parent is not a directory")
+    def existing_probe(root: Path, name: str) -> Path:
+        if root.is_symlink():
+            raise ValueError(f"{name} cannot be a symlink")
+        probe = root
+        while not probe.exists():
+            if probe.parent == probe:
+                raise ValueError(f"no existing parent for {name}")
+            probe = probe.parent
+        if not probe.is_dir():
+            raise ValueError(f"{name} parent is not a directory")
+        return probe
+
+    probe = existing_probe(workspace, "workspace")
     free = shutil.disk_usage(probe).free if disk_free_bytes is None else disk_free_bytes
     if free < 0:
         raise ValueError("disk_free_bytes must be nonnegative")
+    state_free = None
+    if state_dir is not None:
+        state_probe = existing_probe(state_dir, "state_dir")
+        state_free = (shutil.disk_usage(state_probe).free
+                      if state_disk_free_bytes is None else state_disk_free_bytes)
+        if state_free < 0:
+            raise ValueError("state_disk_free_bytes must be nonnegative")
+    elif state_disk_free_bytes is not None:
+        raise ValueError("state_dir required for state_disk_free_bytes")
     jobs_dir = workspace / "jobs"
     if jobs_dir.is_symlink():
         raise ValueError("jobs directory cannot be a symlink")
@@ -166,14 +184,22 @@ def resource_guard(workspace: Path, *, min_free_bytes: int,
         if not jobs_dir.is_dir():
             raise ValueError("jobs path is not a directory")
         worktrees = sum(child.is_dir() and not child.is_symlink()
-                        and child.name.startswith("issue-") for child in jobs_dir.iterdir())
+                        and child.name.startswith("issue-")
+                        and (not child.name.removeprefix("issue-").isdigit()
+                             or int(child.name.removeprefix("issue-")) not in retained_issues)
+                        for child in jobs_dir.iterdir())
     reasons = []
     if free < min_free_bytes:
         reasons.append("low_disk_space")
+    if state_free is not None and state_free < min_free_bytes:
+        reasons.append("low_state_disk_space")
     if worktrees >= max_worktrees:
         reasons.append("worktree_limit")
-    return {"admit": not reasons, "disk_free_bytes": free,
-            "worktrees": worktrees, "reasons": reasons}
+    result = {"admit": not reasons, "disk_free_bytes": free,
+              "worktrees": worktrees, "reasons": reasons}
+    if state_free is not None:
+        result["state_disk_free_bytes"] = state_free
+    return result
 
 
 def log_window_metadata(path: Path, *, max_bytes: int = MAX_LOG_WINDOW) -> dict:

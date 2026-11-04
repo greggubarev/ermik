@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ import unittest
 from ermik.observability import resource_guard
 from ermik.evidence_store import write_evidence
 from ermik.retention import cleanup, inventory
+from ermik import retention
 from ermik.state import initialize
 from tests.test_state_migrations import create_preview
 
@@ -39,7 +41,19 @@ class MergedHub:
             "baseRefName": "main", "body": f"Closes #{issue}",
             "mergedAt": merged_at.isoformat() if merged_at else None,
             "issue": issue, "issue_state": issue_state,
+            "commits": [head],
         }
+
+    def api(self, endpoint):
+        self.calls.append(("api", endpoint))
+        match = re.fullmatch(
+            r"pulls/([1-9][0-9]*)/commits\?per_page=100&page=([1-9][0-9]*)",
+            endpoint)
+        if match is None:
+            raise ValueError("unexpected endpoint")
+        commits = self.rows[int(match.group(1))]["commits"]
+        page = int(match.group(2))
+        return [{"sha": sha} for sha in commits[(page - 1) * 100:page * 100]]
 
     def pr(self, number):
         self.calls.append(("pr", number))
@@ -381,6 +395,79 @@ class RetentionTests(unittest.TestCase):
                          max_bytes=1 << 30, now=NOW)
         self.assertTrue(shared_log.exists())
         self.assertFalse(any(item["kind"] == "logs" for item in result["removed"]))
+
+    def test_superseded_correction_head_log_and_evidence_are_reclaimed(self):
+        paths = self.job(1, pr=101, log=True, evidence=True)
+        old_head = self.git("rev-parse", "HEAD", cwd=paths["worktree"])
+        (paths["worktree"] / "tracked.txt").write_text("correction\n", encoding="utf-8")
+        self.git("add", "tracked.txt", cwd=paths["worktree"])
+        self.git("commit", "-m", "correction", cwd=paths["worktree"])
+        new_head = self.git("rev-parse", "HEAD", cwd=paths["worktree"])
+        self.conn.execute("UPDATE jobs SET head_sha=? WHERE issue=1", (new_head,))
+        self.conn.commit()
+        self.hub.rows[101]["headRefOid"] = new_head
+        self.hub.rows[101]["commits"] = [old_head, new_head]
+        self.age(paths["worktree"])
+        first = cleanup(self.cfg, gh=self.hub, dry_run=False,
+                        max_bytes=1 << 30, now=NOW)
+        self.assertFalse(paths["log"].exists())
+        self.assertFalse(paths["evidence"].exists())
+        self.assertTrue(any(item["kind"] == "logs" and item["head"] == old_head
+                            for item in first["removed"]))
+        self.assertEqual(len([call for call in self.hub.calls if call[0] == "api"]), 1)
+
+    def test_superseded_log_requires_exact_old_publication_record(self):
+        paths = self.job(1, pr=101, log=True, evidence=True)
+        new_head = "f" * 40
+        self.conn.execute("UPDATE jobs SET head_sha=? WHERE issue=1", (new_head,))
+        self.conn.commit()
+        self.hub.rows[101]["headRefOid"] = new_head
+        paths["evidence"].write_text(json.dumps({
+            "issue": 1, "pr": 999, "head": paths["evidence"].stem,
+            "branch": "work/issue-1-delivery", "base": "a" * 40,
+        }), encoding="utf-8")
+        self.age(paths["evidence"])
+        result = cleanup(self.cfg, gh=self.hub, dry_run=False,
+                         max_bytes=1 << 30, now=NOW)
+        self.assertFalse(any(item["kind"] == "logs" for item in result["removed"]))
+        self.assertTrue(paths["log"].exists())
+        self.assertTrue(paths["evidence"].exists())
+
+    def test_superseded_head_absent_from_remote_pr_is_preserved(self):
+        paths = self.job(1, pr=101, log=True, evidence=True)
+        old_head = self.git("rev-parse", "HEAD", cwd=paths["worktree"])
+        (paths["worktree"] / "tracked.txt").write_text("correction\n", encoding="utf-8")
+        self.git("add", "tracked.txt", cwd=paths["worktree"])
+        self.git("commit", "-m", "correction", cwd=paths["worktree"])
+        new_head = self.git("rev-parse", "HEAD", cwd=paths["worktree"])
+        self.conn.execute("UPDATE jobs SET head_sha=? WHERE issue=1", (new_head,))
+        self.conn.commit()
+        self.hub.rows[101]["headRefOid"] = new_head
+        self.hub.rows[101]["commits"] = [new_head]
+        self.age(paths["worktree"])
+        result = cleanup(self.cfg, gh=self.hub, dry_run=False,
+                         max_bytes=1 << 30, now=NOW)
+        self.assertFalse(any(item["head"] == old_head for item in result["removed"]))
+        self.assertTrue(paths["log"].exists())
+        self.assertTrue(paths["evidence"].exists())
+
+    def test_worktree_growth_at_removal_stays_within_byte_limit(self):
+        paths = self.job(1, pr=101)
+        measured = retention._tree(paths["worktree"], [retention._MAX_SCAN])[0]
+        original_tree = retention._tree
+        calls = 0
+
+        def growing_tree(path, budget):
+            nonlocal calls
+            calls += 1
+            size, newest = original_tree(path, budget)
+            return (size + 2 if calls > 1 else size), newest
+
+        with patch("ermik.retention._tree", side_effect=growing_tree):
+            result = cleanup(self.cfg, gh=self.hub, dry_run=False,
+                             max_bytes=measured + 1, now=NOW)
+        self.assertEqual(result["removed"], [])
+        self.assertTrue(paths["worktree"].exists())
 
     def test_interruption_after_unlink_recovers_on_retry(self):
         paths = self.job(1, pr=101, log=True, evidence=True)

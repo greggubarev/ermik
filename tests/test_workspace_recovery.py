@@ -9,6 +9,9 @@ import unittest
 
 from ermik.observability import resource_guard
 from ermik.resources import recover_stale_worktrees
+from ermik.config import Config
+from ermik.policy import parse_issue
+from ermik.runtime import _admission_marker, _claim_new
 from ermik.state import initialize
 
 
@@ -49,18 +52,65 @@ class WorkspaceRecoveryTests(unittest.TestCase):
         )
         self.conn.commit()
 
-    def test_verified_published_tree_releases_guard_capacity(self):
+    def test_verified_published_tree_is_retained_without_using_active_slot(self):
         path = self.worktree(1)
         self.job(1, "awaiting_review", head=self.git("rev-parse", "HEAD", cwd=path).strip(),
                  pr=101)
         self.assertFalse(resource_guard(self.workspace, min_free_bytes=0,
                                         max_worktrees=1)["admit"])
         result = recover_stale_worktrees(self.workspace, self.conn)
-        self.assertEqual(result, {"removed": [1], "preserved": [],
+        self.assertEqual(result, {"removed": [], "preserved": [1],
                                   "requires_inspection": []})
-        self.assertFalse(path.exists())
+        self.assertTrue(path.exists())
         self.assertTrue(resource_guard(self.workspace, min_free_bytes=0,
-                                       max_worktrees=1)["admit"])
+                                       max_worktrees=1,
+                                       retained_issues=frozenset(result["preserved"]))["admit"])
+
+    def test_dirty_published_tree_still_uses_slot(self):
+        path = self.worktree(12)
+        self.job(12, "awaiting_review", head=self.git("rev-parse", "HEAD", cwd=path).strip(),
+                 pr=112)
+        (path / "uncommitted.txt").write_text("keep", encoding="utf-8")
+        result = recover_stale_worktrees(self.workspace, self.conn)
+        self.assertEqual(result["requires_inspection"], [12])
+        self.assertFalse(resource_guard(self.workspace, min_free_bytes=0,
+                                        max_worktrees=1,
+                                        retained_issues=frozenset(result["preserved"]))["admit"])
+
+    def test_retained_review_tree_does_not_block_next_claim(self):
+        path = self.worktree(1)
+        self.job(1, "awaiting_review", head=self.git("rev-parse", "HEAD", cwd=path).strip(),
+                 pr=101)
+        body = ("## Goal\nAnother task\n\n## Allowed paths\nsrc/new\n\n"
+                "## Acceptance\nCheck it\n")
+        spec = parse_issue(body)
+
+        class Hub:
+            def ready_issues(self):
+                return [2]
+
+            def issue(self, number):
+                return {"body": body, "labels": [{"name": "queue:worker"},
+                        {"name": "state:ready"}]}
+
+            def comments(self, number):
+                return [{"body": _admission_marker(2, spec),
+                         "user": {"login": "keeper"}}]
+
+            def api(self, endpoint):
+                return {"object": {"sha": "a" * 40}}
+
+            def label(self, number, **kwargs):
+                pass
+
+        cfg = Config("owner/project", "keeper", self.root / "state", self.workspace,
+                     "image", ("run",), (("check",),), 1, 60, (), "main",
+                     min_free_gb=0)
+        self.conn.row_factory = sqlite3.Row
+        recovered = recover_stale_worktrees(self.workspace, self.conn)
+        claimed = _claim_new(Hub(), cfg, self.conn, recovered=recovered)
+        self.assertEqual(claimed[0], 2)
+        self.assertTrue(path.exists())
 
     def test_missing_workspace_is_a_noop(self):
         missing = self.root / "new-workspace"
