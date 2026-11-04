@@ -53,6 +53,7 @@ def review_digest(cfg: Config, record: dict) -> str:
             or not isinstance(image_config_digest, str)
             or not _IMAGE.fullmatch(image_config_digest)
             or record.get("image_id") != image
+            or record.get("image_config_digest") != image_config_digest
             or ci.get("head") != head
             or ci.get("committed_diff_base") != base):
         raise ValueError("local CI identity is missing or changed")

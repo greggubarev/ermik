@@ -165,17 +165,29 @@ class ResolverTests(unittest.TestCase):
     def test_returns_local_id_and_portable_digest(self):
         archive, expected = fixture()
         with patch("ermik.image_identity._inspect", side_effect=[INSPECT] * 3) as inspect, \
-                patch("ermik.image_identity.subprocess.Popen", return_value=_Process(archive)) as popen:
+                patch("ermik.image_identity.subprocess.Popen",
+                      side_effect=[_Process(archive), _Process(archive)]) as popen:
             self.assertEqual(resolve_image_identity("demo:latest"), (INSPECT["Id"], expected))
         self.assertEqual([call.args[0] for call in inspect.call_args_list],
                          ["demo:latest", "demo:latest", INSPECT["Id"]])
-        self.assertEqual(popen.call_args.args[0][-1], "demo:latest")
+        self.assertEqual([call.args[0][-1] for call in popen.call_args_list],
+                         ["demo:latest", INSPECT["Id"]])
+
+    def test_tag_swap_away_and_back_cannot_bind_wrong_config(self):
+        pinned, _ = fixture()
+        moved, _ = fixture(config_update=lambda config: config["config"].update(Cmd=["false"]))
+        with patch("ermik.image_identity._inspect", side_effect=[INSPECT] * 3), \
+                patch("ermik.image_identity.subprocess.Popen",
+                      side_effect=[_Process(moved), _Process(pinned)]):
+            with self.assertRaisesRegex(ImageIdentityError, "changed during save"):
+                resolve_image_identity("demo:latest")
 
     def test_tag_replacement_after_save_fails(self):
         archive, _ = fixture()
         replaced = {**INSPECT, "Id": "sha256:" + "b" * 64}
         with patch("ermik.image_identity._inspect", side_effect=[INSPECT, replaced]), \
-                patch("ermik.image_identity.subprocess.Popen", return_value=_Process(archive)):
+                patch("ermik.image_identity.subprocess.Popen",
+                      side_effect=[_Process(archive), _Process(archive)]):
             with self.assertRaises(ImageIdentityError):
                 resolve_image_identity("demo:latest")
 

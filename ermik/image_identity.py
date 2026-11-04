@@ -9,6 +9,7 @@ import re
 import subprocess
 import tarfile
 import tempfile
+import threading
 
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -257,12 +258,8 @@ def _portable_digest(archive, inspected: dict) -> str:
     return config_digest
 
 
-def resolve_image_identity(image: str) -> tuple[str, str]:
-    """Return (local immutable Docker ID, portable config-byte SHA-256 digest)."""
-    if not isinstance(image, str) or not image or "\x00" in image:
-        raise ImageIdentityError("Invalid Docker image reference")
-    before = _inspect(image)
-    local_id = before["Id"]
+def _saved_portable_digest(image: str, inspected: dict) -> str:
+    """Verify one saved reference, with a deadline across the archive stream."""
     with tempfile.TemporaryFile() as stderr:
         try:
             process = subprocess.Popen(
@@ -271,11 +268,14 @@ def resolve_image_identity(image: str) -> tuple[str, str]:
             )
         except OSError as exc:
             raise ImageIdentityError("Docker image save failed") from exc
+        watchdog = threading.Timer(300, process.kill)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             if process.stdout is None:
                 raise ImageIdentityError("Docker image save has no stream")
             with process.stdout:
-                portable = _portable_digest(process.stdout, before)
+                portable = _portable_digest(process.stdout, inspected)
             if process.wait(timeout=60) != 0:
                 raise ImageIdentityError("Docker image save failed")
         except BaseException:
@@ -283,6 +283,22 @@ def resolve_image_identity(image: str) -> tuple[str, str]:
                 process.kill()
             process.wait()
             raise
+        finally:
+            watchdog.cancel()
+    return portable
+
+
+def resolve_image_identity(image: str) -> tuple[str, str]:
+    """Return (local immutable Docker ID, portable config-byte SHA-256 digest)."""
+    if not isinstance(image, str) or not image or "\x00" in image:
+        raise ImageIdentityError("Invalid Docker image reference")
+    before = _inspect(image)
+    local_id = before["Id"]
+    # Saving the tag detects ambiguous platform selections. Saving the pinned ID
+    # separately binds the chosen config even if a tag moves away and back.
+    portable = _saved_portable_digest(image, before)
+    if image != local_id and _saved_portable_digest(local_id, before) != portable:
+        raise ImageIdentityError("Docker image reference changed during save")
     if _inspect(image)["Id"] != local_id or _inspect(local_id)["Id"] != local_id:
         raise ImageIdentityError("Docker image reference changed during save")
     return local_id, portable

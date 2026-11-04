@@ -30,6 +30,7 @@ class DecisionTrailTests(unittest.TestCase):
     def record(self, first_hash="d" * 64):
         return {"repo": self.cfg.repo, "issue": 7, "pr": 12,
                 "base": BASE, "head": HEAD, "image_id": IMAGE,
+                "image_config_digest": IMAGE_CONFIG_DIGEST,
                 "ci": {"head": HEAD, "committed_diff_base": BASE,
                        "image_id": IMAGE,
                        "image_config_digest": IMAGE_CONFIG_DIGEST,
@@ -66,6 +67,7 @@ class DecisionTrailTests(unittest.TestCase):
         first = append_decision(self.cfg, record, "reviewed")
         changed = self.record()
         changed["ci"]["image_config_digest"] = "sha256:" + "0" * 64
+        changed["image_config_digest"] = changed["ci"]["image_config_digest"]
         second = append_decision(self.cfg, changed, "reviewed")
         self.assertNotEqual(first["evidence_sha256"], second["evidence_sha256"])
         self.assertEqual(read_decisions(self.cfg, 12)["version"], 1)
@@ -116,6 +118,7 @@ class DecisionTrailTests(unittest.TestCase):
                 lambda row: row["ci"]["checks"].reverse(),
                 lambda row: row.update(image_id="sha256:" + "0" * 64),
                 lambda row: row["ci"].pop("image_config_digest"),
+                lambda row: row.update(image_config_digest="sha256:" + "0" * 64),
                 lambda row: row["ci"].update(image_config_digest="sha256:" + "A" * 64)):
             with self.subTest(change=change):
                 bad = self.record()
