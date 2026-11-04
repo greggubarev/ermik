@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import traceback
 import unittest
 
 
@@ -60,7 +61,16 @@ class _Results(unittest.TextTestResult):
         name = getattr(err[0], "__name__", "")
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name):
             name = "Exception"
-        self.failure_types.append({"case": test.id(), "type": name})
+        frames = traceback.extract_tb(err[2])[-2:]
+        sites = []
+        for frame in frames:
+            filename = Path(frame.filename).name
+            function = frame.name
+            if (re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", filename)
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", function)):
+                sites.append({"file": filename, "function": function,
+                              "line": frame.lineno})
+        self.failure_types.append({"case": test.id(), "type": name, "sites": sites})
 
     def addFailure(self, test, err):  # noqa: N802 - unittest callback
         super().addFailure(test, err)
