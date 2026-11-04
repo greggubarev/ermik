@@ -284,7 +284,7 @@ def classify_failure(stdout: str, stderr: str, returncode: int) -> Failure:
                 break
             payload = nested
     # CLI stderr may carry an HTTP status when JSON events could not be emitted.
-    status_match = re.search(r"(?:HTTP(?:/\d(?:\.\d)?)?\s*|status(?:Code)?\s*[:=]\s*)(429|401|403)\b",
+    status_match = re.search(r"(?:HTTP(?:/\d(?:\.\d)?)?\s*|status(?:Code)?\s*[:=]\s*|request failed with status(?:Code)?\s+)(429|401|403)\b",
                              stderr, flags=re.IGNORECASE)
     if status_match:
         return "quota" if status_match.group(1) == "429" else "auth"
