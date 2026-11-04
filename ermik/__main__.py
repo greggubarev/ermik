@@ -23,6 +23,7 @@ from .evidence_export import export_manifest, verify_manifest
 from .evidence_transport import fetch_manifest, publish_manifest
 from .delivery_loop import deliver_pending
 from .review_packet import build_review_packet
+from .decision_trail import read_decisions
 
 
 def doctor(cfg) -> dict:
@@ -118,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     review_parser.add_argument("pr", type=int)
     packet_parser = commands.add_parser("review-packet")
     packet_parser.add_argument("pr", type=int)
+    history_parser = commands.add_parser("decision-history")
+    history_parser.add_argument("pr", type=int)
     correction_parser = commands.add_parser("request-changes")
     correction_parser.add_argument("pr", type=int)
     correction_parser.add_argument("--note-file", type=Path, required=True)
@@ -185,6 +188,10 @@ def main(argv: list[str] | None = None) -> int:
             result = review(cfg, args.pr)
         elif args.command == "review-packet":
             result = build_review_packet(cfg, args.pr)
+        elif args.command == "decision-history":
+            history = read_decisions(cfg, args.pr)
+            result = {"status": "historical_only", "approval": "none",
+                      **history}
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "merge":

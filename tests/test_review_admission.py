@@ -21,6 +21,7 @@ class Hub:
         self.author = "maintainer"
         self.marker = runtime._admission_marker(7, runtime.parse_issue(BODY))
         self.writes = []
+        self.requests = []
 
     def identity(self):
         return "maintainer"
@@ -33,7 +34,7 @@ class Hub:
     def comments(self, number):
         if number == 7:
             return [{"body": self.marker, "user": {"login": self.author}}]
-        return []
+        return self.requests if number == 19 else []
 
     def pr(self, number):
         assert number == 19
@@ -49,6 +50,8 @@ class Hub:
 
     def comment(self, number, body):
         self.writes.append((number, body))
+        if number == 19:
+            self.requests.append({"body": body, "user": {"login": "maintainer"}})
 
     def command(self, args, **_kwargs):
         self.writes.append(tuple(args))
@@ -77,9 +80,14 @@ class ReviewAdmissionTests(unittest.TestCase):
             review._identity(self.cfg, self.gh, 19)
 
     def test_request_changes_requires_current_approval_and_reviewed_body(self):
-        record = {"head": HEAD, "base": BASE,
+        record = {"pr": 19, "issue": 7, "repo": self.cfg.repo,
+                  "head": HEAD, "base": BASE, "image_id": IMAGE,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
-                  "paths": ["src/a.py"]}
+                  "paths": ["src/a.py"],
+                  "ci": {"head": HEAD, "committed_diff_base": BASE,
+                         "image_id": IMAGE, "result": "passed",
+                         "checks": [{"command": ["true"], "exit_code": 0,
+                                     "log_sha256": "d" * 64}]}}
         note = Path(self.temp.name) / "note.txt"
         note.write_text("Please fix the edge case.", encoding="utf-8")
         with patch.object(review, "GitHub", return_value=self.gh), patch.object(

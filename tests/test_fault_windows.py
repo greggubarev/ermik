@@ -589,9 +589,14 @@ class FaultWindowTests(unittest.TestCase):
         note_file.write_text("Please fix the negative case.", encoding="utf-8")
         pr = {"headRefOid": HEAD, "baseRefOid": BASE,
               "files": [{"path": "src/example.py"}]}
-        record = {"head": HEAD, "base": BASE,
+        record = {"pr": 10, "issue": 1, "repo": self.cfg.repo,
+                  "head": HEAD, "base": BASE, "image_id": IMAGE,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
-                  "paths": ["src/example.py"]}
+                  "paths": ["src/example.py"],
+                  "ci": {"head": HEAD, "committed_diff_base": BASE,
+                         "image_id": IMAGE, "result": "passed",
+                         "checks": [{"command": ["true"], "exit_code": 0,
+                                     "log_sha256": "d" * 64}]}}
         self.gh.comment_loss = True
         with patch.object(review, "GitHub", return_value=self.gh), patch.object(
                 review, "_identity", return_value=(pr, 1, self.gh.issue(1))), patch.object(

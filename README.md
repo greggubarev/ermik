@@ -21,6 +21,7 @@ The controller can export a bounded record of checks and task identity for the m
 - `export-evidence` creates a bounded record for one PR HEAD; `verify-evidence` checks it against current GitHub and local policy before maintainer review. [The manifest guide](docs/evidence.md) explains its trust limits.
 - Optional `publish-evidence` and `fetch-evidence` transfer that record through a PR comment. The receiver checks the current HEAD and pinned publisher identity; the transport does not attest to the controller's check results.
 - `review-packet` gives the maintainer a read-only view of one PR's current evidence, earlier HEAD, manual criteria, and local review status. It marks stale or missing evidence explicitly and never merges.
+- `decision-history` shows a bounded private trail of exact-HEAD reviews, correction requests, and explicit merge outcomes. Its digest comes from local check evidence; the history is never an approval signal.
 - A deterministic demo task command and a configurable task runner are included. Provider routing can retry an eligible route after a confirmed rate limit. Each new project must supply suitable task and check commands and verify its own complete issue-to-merge cycle.
 
 The [documented trial](docs/readiness.md) completed admission, a draft PR, correction on the same PR, a second review, explicit merge, and a check on the resulting default branch in a separate GitHub repository. The two configured provider routes also completed live tasks. These results apply to the trial configuration.
