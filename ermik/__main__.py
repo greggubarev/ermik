@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import time
 
@@ -16,6 +17,8 @@ from .review import merge, request_changes, review
 from .runtime import admit, checked, main_sha, poll, run_once
 from .observability import status_snapshot
 from .dashboard import create_server
+from .evidence import MAX_BYTES, dumps_manifest, loads_manifest
+from .evidence_export import export_manifest, verify_manifest
 
 
 def doctor(cfg) -> dict:
@@ -86,6 +89,12 @@ def main(argv: list[str] | None = None) -> int:
     correction_parser.add_argument("--note-file", type=Path, required=True)
     merge_parser = commands.add_parser("merge")
     merge_parser.add_argument("pr", type=int)
+    export_parser = commands.add_parser("export-evidence")
+    export_parser.add_argument("pr", type=int)
+    export_parser.add_argument("--output", type=Path, required=True)
+    verify_parser = commands.add_parser("verify-evidence")
+    verify_parser.add_argument("pr", type=int)
+    verify_parser.add_argument("--input", type=Path, required=True)
     args = parser.parse_args(argv)
     try:
         cfg = load_config(args.config)
@@ -122,10 +131,50 @@ def main(argv: list[str] | None = None) -> int:
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "merge":
             result = merge(cfg, args.pr)
+        elif args.command == "export-evidence":
+            record = export_manifest(cfg, args.pr)
+            data = dumps_manifest(record)
+            output = args.output
+            if output.parent.resolve() != output.parent.absolute() or output.is_symlink():
+                raise ValueError("unsafe evidence output path")
+            descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = os.fstat(descriptor)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor = -1
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            except BaseException:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                try:
+                    current = output.lstat()
+                    if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                        output.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+            result = {"pr": args.pr, "status": "exported", "sha256": record["sha256"]}
+        elif args.command == "verify-evidence":
+            source = args.input
+            if source.is_symlink():
+                raise ValueError("invalid evidence input file")
+            descriptor = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(descriptor, "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise ValueError("invalid evidence input file")
+                data = stream.read(MAX_BYTES + 2)
+            if len(data) > MAX_BYTES + 1:
+                raise ValueError("invalid evidence input file")
+            record = loads_manifest(data)
+            result = verify_manifest(cfg, args.pr, record)
         else:
             raise AssertionError("unhandled command")
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         if args.command == "merge" and result.get("status") == "incomplete":
+            return 2
+        if args.command == "verify-evidence" and result.get("status") != "current":
             return 2
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError) as exc:

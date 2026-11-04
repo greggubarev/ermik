@@ -10,9 +10,18 @@ from ermik.evidence import dumps_manifest, loads_manifest, make_manifest, valida
 
 class EvidenceTests(unittest.TestCase):
     def fields(self):
-        return {"repo": "owner/project", "issue": 7, "pr": 12,
+        scope = hashlib.sha256(json.dumps(
+            ["src", "tests"], separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        checks = hashlib.sha256(json.dumps(
+            (("python3", "-m", "unittest"),), separators=(",", ":"),
+            ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        return {"repo": "owner/project", "head_repository": "fork/project",
+                "issue": 7, "pr": 12, "branch": "work/issue-7-delivery",
                 "base": "a" * 40, "head": "b" * 40,
-                "body_sha256": "c" * 64,
+                "body_sha256": "c" * 64, "scope_sha256": scope,
+                "checks_sha256": checks,
                 "paths": ["src/one.py", "tests/test_one.py"],
                 "checks": [{"index": 1, "result": "passed", "log_sha256": "d" * 64}],
                 "image": "sha256:" + "e" * 64, "model": "provider/model",
@@ -43,7 +52,12 @@ class EvidenceTests(unittest.TestCase):
         record = make_manifest(**self.fields())
         for mutation in (lambda r: r.update(head="f" * 40),
                          lambda r: r.pop("pr"),
+                         lambda r: r.pop("branch"),
+                         lambda r: r.pop("head_repository"),
+                         lambda r: r.pop("scope_sha256"),
+                         lambda r: r.pop("checks_sha256"),
                          lambda r: r.update(secret="token"),
+                         lambda r: r.update(commands=[["private", "command"]]),
                          lambda r: r["checks"][0].update(log="/private/ci.log")):
             changed = copy.deepcopy(record)
             mutation(changed)
@@ -51,7 +65,13 @@ class EvidenceTests(unittest.TestCase):
                 validate_manifest(changed)
 
     def test_reject_invalid_identities_and_private_data(self):
-        for key, value in (("repo", "../project"), ("issue", True),
+        for key, value in (("repo", "../project"),
+                           ("head_repository", "../fork"),
+                           ("branch", "work/issue-8-delivery"),
+                           ("branch", "work/issue-7-../secret"),
+                           ("scope_sha256", "A" * 64),
+                           ("checks_sha256", ["python3", "-m", "unittest"]),
+                           ("issue", True),
                            ("pr", 0), ("base", "ABC"),
                            ("image", "image:latest"),
                            ("paths", ["C:/private/file"]),
