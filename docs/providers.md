@@ -47,6 +47,14 @@ OpenCode Go access depends on the subscription and permitted models; verify mode
 
 Exit code 75 means confirmed quota exhaustion. Code 77 is authentication failure, 1 is another execution failure, and 78 is configuration failure. Only code 75 permits failover to another key; other outcomes stop the task for investigation. Commit, CI, scope validation, and publication remain controller responsibilities.
 
+## Route verification status
+
+On 5 November 2026, separate disposable file tasks completed through the pinned OpenCode 1.18.35 image on Docker Engine 29.8.0. `kimi-code/k3-256k` and `opencode-go/kimi-k3` each returned `WORKER_OK` (exit 0) and wrote the requested exact file content. An invalid credential on Kimi Code returned `WORKER_AUTH_FAILURE` (exit 77). An invalid-credential OpenCode Go attempt was stopped after about 35 seconds without a provider response; its exit 137 does not establish an authentication result.
+
+The following checks used controlled local responses, not provider endpoints: a request failure with status 429 returned `WORKER_QUOTA_EXHAUSTED` (exit 75); a malformed response returned `WORKER_EXECUTION_ERROR` (exit 1); a two-second Docker CLI timeout raised `TransientFailure`. Direct classifier checks mapped structured and HTTP 401/403 errors to authentication failure and ignored a non-error text event. Worker output contained only an outcome code and aggregate or unavailable usage data, without raw error text. Unit tests cover slot release after quota fallback and bounded transient retries; these were not observed in a live controller cycle.
+
+Both built-in routes remain **experimental for failure handling** until provider-origin 403, 429, timeout, and malformed responses and a complete controller retry/cooldown cycle are observed. OpenCode Go authentication rejection also remains unverified. Additional compatible endpoints have no live coverage under this trial and remain experimental until tested separately. See [Issue #6](https://github.com/greggubarev/ermik/issues/6) for the remaining matrix.
+
 OpenCode may read and change worktree files. Shell commands, subagents, external directories, and other tools are disabled, and the repository is mounted as an isolated checkout. These tool limits supplement container isolation and the controller's final file validation. The selected provider key is still available to the networked worker process. Use a key with bounded cost and assess provider exposure before processing confidential repositories.
 
 References: [OpenCode CLI](https://docs.opencode.ai/docs/cli/), [providers](https://docs.opencode.ai/docs/providers/), [permissions](https://docs.opencode.ai/docs/permissions/), [OpenCode Go](https://docs.opencode.ai/docs/go/).
