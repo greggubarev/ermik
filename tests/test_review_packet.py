@@ -171,6 +171,13 @@ class ReviewPacketTests(unittest.TestCase):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "stale")
 
+    def test_unsupported_evidence_version_stays_explicit(self):
+        with patch("ermik.review_packet.fetch_manifest", return_value=(
+                {"status": "unsupported_version"}, None)):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "unsupported_version")
+        self.assertEqual(packet["evidence"], {"status": "unsupported_version"})
+
 
 if __name__ == "__main__":
     unittest.main()

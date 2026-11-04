@@ -99,7 +99,8 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         packet.update(status="incomplete", evidence={"status": "unavailable"})
         return packet
     status = fetched.get("status")
-    if status not in {"current", "missing", "duplicate", "stale"}:
+    if status not in {"current", "missing", "duplicate", "stale",
+                      "unsupported_version"}:
         packet.update(status="incomplete", evidence={"status": "unavailable"})
         return packet
     if status == "current" and not isinstance(record, dict):

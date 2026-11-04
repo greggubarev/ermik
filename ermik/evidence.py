@@ -27,6 +27,10 @@ _FIELDS = {"version", "repo", "head_repository", "issue", "pr", "branch",
 _TOKENS = ("input", "output", "reasoning", "cache_read", "cache_write", "total")
 
 
+class UnsupportedManifestVersion(ValueError):
+    """The manifest declares a version this reader does not support."""
+
+
 def _canonical(value: dict) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"),
                       ensure_ascii=True, allow_nan=False).encode("utf-8")
@@ -48,10 +52,10 @@ def _valid_path(path: object) -> bool:
 
 def validate_manifest(record: dict) -> dict:
     """Validate a complete v1 record and return an independent plain-data copy."""
-    _require(type(record) is dict and set(record) == _FIELDS | {"sha256"},
-             "invalid manifest fields")
-    _require(type(record["version"]) is int and record["version"] == VERSION,
-             "unsupported manifest version")
+    _require(type(record) is dict and "version" in record, "invalid manifest fields")
+    if type(record["version"]) is not int or record["version"] != VERSION:
+        raise UnsupportedManifestVersion("unsupported manifest version")
+    _require(set(record) == _FIELDS | {"sha256"}, "invalid manifest fields")
     for key in ("repo", "head_repository"):
         _require(type(record[key]) is str and bool(_REPO.fullmatch(record[key]))
                  and record[key].split("/", 1)[1] not in {".", ".."},

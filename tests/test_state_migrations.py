@@ -7,9 +7,15 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ermik import state
+from ermik.config import Config
+from ermik.evidence import make_manifest
+from ermik.evidence_export import _scope_sha256, verify_manifest
+from ermik.evidence_store import read_evidence, write_evidence
+from ermik.review import _checks_sha256
 
 
 # Frozen v0.1.0-preview.1 ledger, deliberately independent of state.SCHEMA.
@@ -161,6 +167,71 @@ class StateMigrationTests(unittest.TestCase):
         self.assertEqual(ledger(root), before)
         with state.connect(root) as conn:
             self.assertEqual(state.job(conn, 7)["image_id"], image_id)
+
+    def test_v1_manifest_pr_head_decision_survives_populated_upgrade(self):
+        root = self.base / "manifest-preview"
+        create_preview(root, with_image=True)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.row_factory = sqlite3.Row
+            job = conn.execute("SELECT * FROM jobs WHERE issue=7").fetchone()
+            admission = conn.execute("SELECT * FROM admissions WHERE issue=7").fetchone()
+            identity = {key: job[key] for key in
+                        ("issue", "pr", "branch", "base_sha", "head_sha", "image_id")}
+            body_sha = admission["body_sha"]
+            allowed = tuple(json.loads(admission["allowed_json"]))
+        cfg = Config("owner/project", "keeper", root, self.base / "work",
+                     identity["image_id"], ("run",), (("check", "all"),),
+                     1, 60, (), "main")
+        manifest = make_manifest(
+            repo=cfg.repo, head_repository=cfg.repo, issue=identity["issue"],
+            pr=identity["pr"], branch=identity["branch"],
+            base=identity["base_sha"], head=identity["head_sha"],
+            body_sha256=body_sha, scope_sha256=_scope_sha256(allowed),
+            checks_sha256=_checks_sha256(cfg), paths=["src/worker.py"],
+            checks=[{"index": 1, "result": "passed", "log_sha256": "e" * 64}],
+            image=identity["image_id"], model="provider/second", attempts=3,
+            usage={"observation": "unknown"}, unknowns=["usage"])
+        manifest_path = root / "evidence" / "7" / "manifest-v1.json"
+        write_evidence(manifest_path, manifest)
+        manifest_bytes = manifest_path.read_bytes()
+
+        def decisions():
+            saved = read_evidence(manifest_path)
+            with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+                conn.row_factory = sqlite3.Row
+                job = conn.execute("SELECT * FROM jobs WHERE issue=7").fetchone()
+                admission = conn.execute(
+                    "SELECT * FROM admissions WHERE issue=7").fetchone()
+                current_identity = {key: job[key] for key in identity}
+                current_body_sha = admission["body_sha"]
+                current_allowed = tuple(json.loads(admission["allowed_json"]))
+            pr = {"headRefName": current_identity["branch"],
+                  "baseRefOid": current_identity["base_sha"],
+                  "headRefOid": current_identity["head_sha"],
+                  "body": (f"Closes #7\nExecution image: "
+                           f"`{current_identity['image_id']}`")}
+            spec = SimpleNamespace(body_sha256=current_body_sha,
+                                   allowed_paths=current_allowed)
+            with patch("ermik.evidence_export._github"), \
+                 patch("ermik.evidence_export._live",
+                       return_value=(pr, current_identity["issue"], spec,
+                                     ["src/worker.py"])), \
+                 patch("ermik.evidence_export._resolve_image_id",
+                       return_value=current_identity["image_id"]):
+                current = verify_manifest(cfg, current_identity["pr"], saved)
+                pr["headRefOid"] = "e" * 40
+                stale = verify_manifest(cfg, current_identity["pr"], saved)
+            return current, stale, current_identity
+
+        before = decisions()
+        self.assertEqual(before[0]["status"], "current")
+        self.assertEqual(before[0]["pr"], identity["pr"])
+        self.assertEqual(before[0]["head"], identity["head_sha"])
+        self.assertEqual(before[1], {"status": "stale", "reason": "identity_changed"})
+        state.initialize(root)
+        self.assertEqual(self.version(root), state.SCHEMA_VERSION)
+        self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+        self.assertEqual(decisions(), before)
 
     def test_interrupted_migration_rolls_back_schema_rows_and_version(self):
         original = state._migrate_preview

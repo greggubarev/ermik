@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 
 from .config import Config
-from .evidence import MAX_BYTES, dumps_manifest, loads_manifest, make_manifest
+from .evidence import (MAX_BYTES, UnsupportedManifestVersion, dumps_manifest,
+                       loads_manifest, make_manifest)
 from .evidence_export import export_manifest, verify_manifest
 from .github import GitHub, GitHubError
 
@@ -17,6 +19,10 @@ MAX_COMMENTS = 1000
 
 class EvidenceRecordError(GitHubError):
     """A claimed publisher record cannot be trusted."""
+
+
+class UnsupportedEvidenceVersion(EvidenceRecordError):
+    """The pinned publisher supplied an evidence version this reader cannot use."""
 
 
 def _publisher_id(cfg: Config) -> int:
@@ -67,14 +73,32 @@ def _published_records(cfg: Config, gh: GitHub, pr_number: int) -> list[tuple[di
     found: list[tuple[dict, dict]] = []
     for row in _comments(gh, pr_number):
         body = row.get("body")
-        if not isinstance(body, str) or not body.startswith(MARKER):
+        if not isinstance(body, str):
             continue
         user = row.get("user")
         if (not isinstance(user, dict) or type(user.get("id")) is not int
                 or user["id"] != publisher_id):
             continue
+        marker = re.match(r"Ermik evidence v([0-9]+)(?:\n|\Z)", body)
+        if body.startswith("Ermik evidence v") and marker is None:
+            raise EvidenceRecordError("publisher evidence comment is malformed")
+        if marker:
+            try:
+                bounded = len(body.encode("utf-8")) <= MAX_BYTES + 1 + len(MARKER) + len(_SUFFIX)
+            except UnicodeError:
+                bounded = False
+            if not bounded:
+                raise EvidenceRecordError("publisher evidence comment is malformed")
+            if marker.group(1) != "1":
+                raise UnsupportedEvidenceVersion("publisher evidence version is unsupported")
+        if not body.startswith(MARKER):
+            if marker:
+                raise EvidenceRecordError("publisher evidence comment is malformed")
+            continue
         try:
             record = _record(body)
+        except UnsupportedManifestVersion as exc:
+            raise UnsupportedEvidenceVersion("publisher evidence version is unsupported") from exc
         except (ValueError, UnicodeError) as exc:
             raise EvidenceRecordError("publisher evidence comment is malformed") from exc
         if record["repo"].casefold() != cfg.repo.casefold() or record["pr"] != pr_number:
@@ -148,6 +172,8 @@ def fetch_manifest(cfg: Config, pr_number: int) -> tuple[dict, dict | None]:
     gh = GitHub(cfg.repo)
     try:
         found = _published_records(cfg, gh, pr_number)
+    except UnsupportedEvidenceVersion:
+        return {"status": "unsupported_version"}, None
     except EvidenceRecordError:
         return {"status": "stale", "reason": "invalid_record"}, None
     if not found:

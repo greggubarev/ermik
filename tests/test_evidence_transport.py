@@ -7,8 +7,9 @@ from unittest.mock import patch
 
 from ermik.config import Config
 from ermik.evidence import make_manifest
-from ermik.evidence_transport import (MARKER, _body, _record, fetch_manifest,
-                                      publish_manifest)
+from ermik.evidence_transport import (MARKER, UnsupportedEvidenceVersion,
+                                      _body, _published_records, _record,
+                                      fetch_manifest, publish_manifest)
 from ermik.github import GitHubError
 
 
@@ -142,6 +143,35 @@ class EvidenceTransportTests(unittest.TestCase):
                         for n in range(1001)]
         with self.assertRaises(GitHubError):
             fetch_manifest(self.cfg, 12)
+
+    def test_future_marker_from_pinned_publisher_is_unsupported(self):
+        body = "Ermik evidence v2\n\n```json\n{}\n```"
+        self.gh.rows.append({"id": 1, "body": body,
+                             "user": {"login": "publisher", "id": 99}})
+        self.assertEqual(fetch_manifest(self.cfg, 12), ({"status": "missing"}, None))
+        self.gh.rows[0]["user"]["id"] = 42
+        with self.assertRaises(UnsupportedEvidenceVersion):
+            _published_records(self.cfg, self.gh, 12)
+        self.assertEqual(fetch_manifest(self.cfg, 12),
+                         ({"status": "unsupported_version"}, None))
+        for marker in ("Ermik evidence v2", "Ermik evidence v01"):
+            with self.subTest(marker=marker):
+                self.gh.rows[0]["body"] = marker
+                self.assertEqual(fetch_manifest(self.cfg, 12),
+                                 ({"status": "unsupported_version"}, None))
+        self.gh.rows[0]["body"] = "Ermik evidence v2.0"
+        self.assertEqual(fetch_manifest(self.cfg, 12),
+                         ({"status": "stale", "reason": "invalid_record"}, None))
+        self.gh.rows[0]["body"] = body + "x" * 17000
+        self.assertEqual(fetch_manifest(self.cfg, 12),
+                         ({"status": "stale", "reason": "invalid_record"}, None))
+
+    def test_v2_payload_under_v1_marker_is_unsupported(self):
+        body = _body(manifest(model=None)).replace('"version":1', '"version":2')
+        self.gh.rows.append({"id": 1, "body": body,
+                             "user": {"login": "publisher", "id": 42}})
+        self.assertEqual(fetch_manifest(self.cfg, 12),
+                         ({"status": "unsupported_version"}, None))
 
     def test_lost_post_response_reconciles_without_second_comment(self):
         self.gh.fail_after_post = True
