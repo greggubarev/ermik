@@ -122,6 +122,19 @@ class ContainerCleanupTests(unittest.TestCase):
         remove.assert_called_once_with(self.cfg, name)
         self.assertEqual(list(self.cfg.state_dir.glob("check-git-*")), [])
 
+    def test_container_cpu_limit_fits_single_cpu_host(self):
+        checkout = self.cfg.workspace / "job"
+        checkout.mkdir()
+        (checkout / ".git").write_text("gitdir: source\n")
+        issue = self.cfg.state_dir / "issue.md"
+        issue.parent.mkdir(parents=True)
+        issue.write_text("task\n")
+        with patch.object(runtime.os, "cpu_count", return_value=1), patch.object(
+                runtime, "_run_capped", return_value=(0, b"")) as run:
+            runtime._docker(self.cfg, checkout, ("true",),
+                            issue_file=issue, network=False, timeout=1)
+        self.assertIn("--cpus=1", run.call_args.args[0])
+
     def test_check_receives_only_base_and_checkout_git_history(self):
         checkout = self.create_checkout()
         head = runtime.git(checkout, "rev-parse", "HEAD")

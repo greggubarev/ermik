@@ -4,7 +4,7 @@ This project coordinates scoped GitHub issues with an explicit concurrency limit
 
 ## Prerequisites
 
-- Python 3.11 or newer, `git`, `gh` CLI, and Docker with a working daemon.
+- Python 3.11 or newer, `git`, `gh` CLI, and Docker with a working daemon. One CPU is sufficient for the demo; task containers request the lesser of two CPUs and the count reported by Python.
 - A repository you maintain. Use a disposable private repository for the first end-to-end trial.
 - A dedicated host account or service identity for the trusted controller. Access to the Docker daemon is privileged; limit this account and its filesystem access accordingly.
 - A task image containing the command named by `worker_command`. The included image and script are a deterministic demonstration only. Supply an image and command suited to your project before using real tasks.
