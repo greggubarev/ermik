@@ -145,6 +145,21 @@ class RuntimeRecoveryTests(unittest.TestCase):
         self.assertEqual(runtime.run_once(self.cfg), [])
         self.assertEqual(len(Hub.opened), 1)
 
+    def test_auth_failure_comment_excludes_provider_diagnostics(self):
+        secret = "provider-credential-canary"
+        failure = runtime.WorkerFailure(77)
+        failure.args = (f"provider response included {secret}",)
+        with patch.object(runtime, "_perform", side_effect=failure):
+            result = runtime.run_once(self.cfg)
+
+        self.assertEqual(result[0]["status"], "blocked")
+        comment = Hub.comments_by_number[1][-1]["body"]
+        self.assertEqual(comment, "Execution blocked: WorkerFailure. Inspect local controller state.")
+        self.assertNotIn(secret, comment)
+        self.assertNotIn(secret, str(result))
+        with state.connect(self.cfg.state_dir) as conn:
+            self.assertEqual(state.job(conn, 1)["error"], "WorkerFailure")
+
     def test_changed_issue_identity_blocks_due_retry(self):
         due = self._first_failure()
         Hub.issues[1]["body"] = BODY.replace("src/example.py", "src/other.py")
