@@ -183,10 +183,10 @@ def resource_guard(workspace: Path, *, min_free_bytes: int,
     if jobs_dir.exists():
         if not jobs_dir.is_dir():
             raise ValueError("jobs path is not a directory")
-        worktrees = sum(child.is_dir() and not child.is_symlink()
-                        and child.name.startswith("issue-")
+        worktrees = sum(child.name.startswith("issue-")
                         and (not child.name.removeprefix("issue-").isdigit()
-                             or int(child.name.removeprefix("issue-")) not in retained_issues)
+                             or int(child.name.removeprefix("issue-")) not in retained_issues
+                             or child.is_symlink() or not child.is_dir())
                         for child in jobs_dir.iterdir())
     reasons = []
     if free < min_free_bytes:

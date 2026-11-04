@@ -84,6 +84,29 @@ class ObservabilityTests(unittest.TestCase):
         self.assertFalse(workspace.exists())
         self.assertFalse(state_dir.exists())
 
+    def test_unknown_issue_entry_uses_slot_even_when_not_a_directory(self):
+        workspace = self.root / "work"
+        jobs = workspace / "jobs"
+        jobs.mkdir(parents=True)
+        entry = jobs / "issue-7"
+        entry.write_text("unexpected", encoding="utf-8")
+        value = resource_guard(workspace, min_free_bytes=0, max_worktrees=1,
+                               disk_free_bytes=100,
+                               retained_issues=frozenset({7}))
+        self.assertEqual(value["reasons"], ["worktree_limit"])
+        entry.unlink()
+        outside = self.root / "outside"
+        outside.mkdir()
+        try:
+            entry.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks unavailable")
+        value = resource_guard(workspace, min_free_bytes=0, max_worktrees=1,
+                               disk_free_bytes=100,
+                               retained_issues=frozenset({7}))
+        self.assertEqual(value["reasons"], ["worktree_limit"])
+        self.assertTrue(outside.exists())
+
     def test_log_metadata_bounds_read_without_exposing_content(self):
         path = self.root / "check.log"
         path.write_bytes(b"secret=" + b"x" * 30)
