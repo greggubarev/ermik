@@ -56,6 +56,8 @@ class ReviewPacketTests(unittest.TestCase):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
         self.assertEqual(packet["review"], {"status": "missing"})
+        self.assertEqual(packet["diff_url"],
+                         f"https://github.com/owner/project/compare/{BASE}...{HEAD}")
         self.assertEqual(packet["goal"], "Fix the parser")
         self.assertEqual(packet["acceptance"], "Checks pass")
         self.assertEqual(packet["evidence"]["observation"], "publisher_claim")
@@ -109,6 +111,20 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertNotIn("checks", packet["evidence"])
         history.assert_not_called()
 
+    def test_head_moves_during_comment_history_read(self):
+        moved = {**self.pr, "headRefOid": "e" * 40}
+        with (patch("ermik.review_packet._live", side_effect=[
+                  (self.pr, 7, self.spec, ["src/one.py"]),
+                  (moved, 7, self.spec, ["src/one.py"])]),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "current"}, self.record())),
+              patch("ermik.review_packet._published_records", return_value=[])):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "stale")
+        self.assertEqual(packet["evidence"], {"status": "stale",
+                                              "reason": "identity_changed"})
+        self.assertNotIn("checks", packet["evidence"])
+
     def test_correction_marks_old_review_stale_and_shows_both_heads(self):
         (self.cfg.state_dir / "reviews").mkdir(parents=True)
         (self.cfg.state_dir / "reviews" / "pr-12.json").write_text("{}")
@@ -139,6 +155,16 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(packet["goal"], "See Issue #7")
         self.assertEqual(packet["status"], "missing")
         self.assertNotIn("ghp_private_value", str(packet))
+
+    def test_bidi_and_non_ascii_issue_text_stay_in_issue(self):
+        spec = parse_issue(BODY.replace("Fix the parser", "Fix \u202e parser"))
+        with (patch("ermik.review_packet._live", return_value=(self.pr, 7, spec,
+                                                                ["src/one.py"])),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "missing"}, None))):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["goal"], "See Issue #7")
+        self.assertNotIn("\u202e", str(packet))
 
     def test_live_identity_failure_cannot_be_current(self):
         with patch("ermik.review_packet._live", side_effect=WorkflowError("base stale")):

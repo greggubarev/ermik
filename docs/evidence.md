@@ -40,4 +40,4 @@ On the maintainer installation, inspect a draft PR before deciding whether to ru
 python3 -m ermik --config config.json review-packet PR_NUMBER
 ```
 
-The read-only command checks the current Issue admission, PR base and HEAD, changed paths, evidence comment, configured checks, and image identity. It separates the controller's reported check results from a local exact-HEAD review. A missing or stale record is reported explicitly with a nonzero exit status. The packet is a review aid; it does not run checks, write a review record, or authorize merge. Run `review PR_NUMBER` on the current HEAD before merging.
+The read-only command checks the current Issue admission, PR base and HEAD, changed paths, evidence comment, configured checks, and image identity. Its `diff_url` opens GitHub's comparison of the two exact commits; inspect the full diff there. It separates the controller's reported check results from a local exact-HEAD review. A missing or stale record is reported explicitly with a nonzero exit status. The packet is a review aid; it does not run checks, write a review record, or authorize merge. Run `review PR_NUMBER` on the current HEAD before merging.

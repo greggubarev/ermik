@@ -17,6 +17,7 @@ _UNSAFE_TEXT = re.compile(
     r"authorization|private[ _-]?key)\b|\b[A-Za-z0-9_+=.-]{32,}\b)"
 )
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_SAFE_PROSE = re.compile(r"[A-Za-z0-9 .,;:!?()'\"-]+\Z")
 
 
 def _excerpt(value: str, issue: int, limit: int) -> str:
@@ -24,7 +25,7 @@ def _excerpt(value: str, issue: int, limit: int) -> str:
     if not isinstance(value, str) or _UNSAFE_TEXT.search(value):
         return f"See Issue #{issue}"
     text = " ".join(value.split())
-    if (len(text) > limit or any(ord(char) < 32 or ord(char) == 127 for char in text)):
+    if not text or len(text) > limit or not _SAFE_PROSE.fullmatch(text):
         return f"See Issue #{issue}"
     return text
 
@@ -65,12 +66,17 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     try:
         pr, issue, spec, paths = _live(cfg, _github(cfg), pr_number)
         image = published_image_id(pr.get("body") or "")
+        if not (_SHA.fullmatch(pr["baseRefOid"])
+                and _SHA.fullmatch(pr["headRefOid"])):
+            raise WorkflowError("invalid commit identity")
     except (WorkflowError, GitHubError, ValueError, KeyError, TypeError):
         return {"status": "stale", "reason": "remote_identity"}
     packet = {
         "status": "incomplete", "repo": cfg.repo, "issue": issue, "pr": pr_number,
         "branch": pr["headRefName"], "base": pr["baseRefOid"],
         "head": pr["headRefOid"], "previous_head": None,
+        "diff_url": f"https://github.com/{cfg.repo}/compare/"
+                    f"{pr['baseRefOid']}...{pr['headRefOid']}",
         "goal": _excerpt(spec.goal, issue, 240),
         "acceptance": _excerpt(spec.acceptance, issue, 400),
         "paths": paths,
@@ -139,4 +145,22 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
             packet["previous_head"] = prior
     packet["evidence"] = evidence
     packet["status"] = status
+    if status == "current":
+        try:
+            final_pr, final_issue, final_spec, final_paths = _live(
+                cfg, _github(cfg), pr_number)
+            final_image = published_image_id(final_pr.get("body") or "")
+            unchanged = (
+                final_issue == issue
+                and final_spec.body_sha256 == spec.body_sha256
+                and final_pr["headRefName"] == pr["headRefName"]
+                and final_pr["baseRefOid"] == pr["baseRefOid"]
+                and final_pr["headRefOid"] == pr["headRefOid"]
+                and final_paths == paths and final_image == image
+            )
+        except (WorkflowError, GitHubError, ValueError, KeyError, TypeError):
+            unchanged = False
+        if not unchanged:
+            packet["status"] = "stale"
+            packet["evidence"] = {"status": "stale", "reason": "identity_changed"}
     return packet
