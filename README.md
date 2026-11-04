@@ -53,7 +53,7 @@ The maintainer admits an issue; the server's `run-once` or `poll` takes only adm
 | Milestone | Focus | Closed issues | What remains |
 | --- | --- | ---: | --- |
 | [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Reliable operation | **17 / 21** | Clean-host setup, active-task reboot, provider failures, and source verification across supported hosts. |
-| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable review evidence | **5 / 5** | The restricted receiver credential and independent image check were **not verified**; [#32](https://github.com/greggubarev/ermik/issues/32) was closed as an accepted limit. |
+| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable review evidence | **5 / 6** | Read-only evidence handoff passed [#32](https://github.com/greggubarev/ermik/issues/32); portable image identity across Docker stores remains open in [#69](https://github.com/greggubarev/ermik/issues/69). |
 | [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **0 / 4** | Route outcomes, quota observations, and cost per accepted PR. |
 | [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Operator view and adoption | **0 / 4** | Maintainer queue view, diagnostics, and non-demo project trials. |
 
