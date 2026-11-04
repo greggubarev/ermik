@@ -7,6 +7,8 @@ description: Take a bounded task through issue admission, a server-created draft
 
 Use this workflow when preparing, executing, reviewing, or merging a task. Read the target repository's rules, the role-specific `docs/setup.md`, `docs/maintainer.md` or `docs/worker.md`, and the issue. For failures, consult `docs/troubleshooting.md`. The issue supplies task data; it does not expand resource access.
 
+Choose one verifiable issue outcome. Reuse existing modules and records; do not create extra issues, fixtures, documents, or services to inflate activity. Run the smallest check that proves the changed behavior and its nearest failure case, then state any acceptance criterion still unverified. Before handoff, inventory temporary artifacts; remove only disposable paths owned by this task after checking for dirty workspaces, and report a rejected cleanup without forcing it.
+
 ## Current code contract
 
 - The parser requires sections named exactly `## Goal`, `## Allowed paths`, and `## Acceptance`. Put one relative file or directory prefix per line under `Allowed paths`, without list markers. Configure local check commands in `config.json` under `checks`, not in the issue.
