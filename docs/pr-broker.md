@@ -17,9 +17,40 @@ python3 -m ermik.pr_broker serve \
 
 `--token-env NAME` replaces `--token-file` for local use. The token file must be regular, owned by root or the broker user, and not group- or world-writable. The token must see both private repositories; read issues, comments, refs, comparisons, Git trees, and PRs; and create upstream PRs. The broker validates both full repository names and numeric IDs, plus the fork's exact parent. Obtain numeric IDs from GitHub during setup and keep them out of issue text.
 
+### Start at host boot
+
+The [system service template](../examples/systemd/ermik-pr-broker@.service) runs the broker under a dedicated Linux account and recreates its private socket directory under `/run` at boot. Use a broker account with a matching primary group and a separate checkout at `/home/ACCOUNT/ermik`, pinned to the same reviewed source commit as the controller. If either path differs, edit the unit copy before installing it. Add only the controller account to the broker group so it can traverse the runtime directory and connect to the socket. The broker still checks the controller's exact UID with `SO_PEERCRED`.
+
+As administrator, install a root-owned `0600` environment file at `/etc/ermik-pr-broker/ACCOUNT.env` with these nonsecret values, replacing every example identity and path with verified values:
+
+```ini
+ERMIK_BROKER_REPO=ORG/UPSTREAM
+ERMIK_BROKER_REPO_ID=123456
+ERMIK_BROKER_FORK=PERSON/FORK
+ERMIK_BROKER_FORK_ID=234567
+ERMIK_BROKER_MAINTAINER=MAINTAINER
+ERMIK_BROKER_CONTROLLER_UID=1001
+ERMIK_BROKER_SOCKET_GID=1234
+ERMIK_BROKER_EVIDENCE_DIR=/var/lib/ermik-pr-broker/evidence
+ERMIK_BROKER_TOKEN_FILE=/var/lib/ermik-pr-broker/private/github.token
+```
+
+`ERMIK_BROKER_SOCKET_GID` must be the broker group's numeric GID. Keep the environment file under a root-owned `0700` directory. Keep the credential itself only in the `0600` regular token file owned by the broker account, under a broker-owned `0700` private directory. The environment file contains its path, not its value. Prepare the shared evidence directory as described below before starting the unit, and set the controller's `draft_pr_socket` to `/run/ermik-pr-broker-ACCOUNT/create.sock`. Use one service instance and one socket for this installation.
+
+```sh
+sudo install -m 0644 examples/systemd/ermik-pr-broker@.service /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/ermik-pr-broker@.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ermik-pr-broker@ACCOUNT.service
+sudo systemctl status ermik-pr-broker@ACCOUNT.service --no-pager
+sudo test -S /run/ermik-pr-broker-ACCOUNT/create.sock
+```
+
+Verify the socket is group-owned by the broker group and mode `0660`, then confirm the controller account can connect before enabling polling. After a reboot, check that this unit is active, the socket is present, and its journal shows a fresh start. A crash may leave a socket path; the unit preserves its runtime directory across service restarts and the broker refuses to bind over that path. Stop the unit and investigate ownership and active listeners before removing a confirmed stale socket. A genuine host reboot clears `/run` and recreates the directory. The unit uses a static token file; rotate an expiring token through a separate protected procedure and restart the unit. For automatic GitHub App token renewal, use the token-store procedure below with a corresponding reviewed unit change.
+
 For a separate broker UID, create a shared read-only evidence directory outside `state_dir`. The administrator sets the controller as owner, the shared broker group, and mode `2750` (setgid). Set `draft_pr_evidence_dir` in controller configuration and `--evidence-dir` for the broker to this path. The controller creates issue subdirectories with `0750` and files with `0640`; the broker can read but cannot edit them. Parent directories must be traversable by both users. The controller's `0700` `state_dir` cannot serve as evidence storage for another UID. If the broker runs as root, `draft_pr_evidence_dir` may be omitted and `--evidence-dir` must equal `<state_dir>/evidence`.
 
-The administrator creates the socket directory in advance and prevents writes by unrelated users. The service does not remove an existing socket at startup. After binding, it sets `--socket-gid` and mode `0660`. Linux `SO_PEERCRED` must match the exact `--controller-uid`; group membership alone does not authorize a request.
+For manual starts, the administrator creates the socket directory in advance and prevents writes by unrelated users; the systemd template creates its runtime directory. The service does not remove an existing socket at startup. After binding, it sets `--socket-gid` and mode `0660`. Linux `SO_PEERCRED` must match the exact `--controller-uid`; group membership alone does not authorize a request.
 
 ### Private repositories under different owners
 

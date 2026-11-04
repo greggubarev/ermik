@@ -1,0 +1,24 @@
+[Unit]
+Description=Ermik draft PR broker for %i
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/ermik
+EnvironmentFile=/etc/ermik-pr-broker/%i.env
+ExecStart=/usr/bin/python3 -m ermik.pr_broker serve --socket /run/ermik-pr-broker-%i/create.sock --socket-gid ${ERMIK_BROKER_SOCKET_GID} --repo ${ERMIK_BROKER_REPO} --repo-id ${ERMIK_BROKER_REPO_ID} --fork ${ERMIK_BROKER_FORK} --fork-id ${ERMIK_BROKER_FORK_ID} --maintainer ${ERMIK_BROKER_MAINTAINER} --controller-uid ${ERMIK_BROKER_CONTROLLER_UID} --evidence-dir ${ERMIK_BROKER_EVIDENCE_DIR} --token-file ${ERMIK_BROKER_TOKEN_FILE}
+RuntimeDirectory=ermik-pr-broker-%i
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+Restart=on-failure
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
