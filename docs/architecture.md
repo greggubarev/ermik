@@ -40,4 +40,4 @@ The maintainer checks the exact PR HEAD locally. `merge` requires a current revi
 
 The controller reconciles local SQLite state with remote Issue, branch and PR state after restart. It reuses a clean registered checkout only when its branch and commit match the recorded remote state. Dirty or ambiguous state blocks the task. Only containers labelled for the current installation are reclaimed.
 
-One controller owns one state directory. The system does not coordinate multiple controller hosts against the same queue. Tests cover recovery transitions, but a live kill at every remote-write boundary and reboot during an active task remain open validation work. See [release readiness](readiness.md).
+One controller owns one state directory. The system does not coordinate multiple controller hosts against the same queue. Live process-kill matrices cover documented remote-write and merge boundaries; reboot during an active task remains open validation work. See [release readiness](readiness.md).

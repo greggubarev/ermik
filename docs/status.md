@@ -9,3 +9,15 @@ Events and attempt counters persist in SQLite. `attempts.total` counts retry sta
 `resource_guard(workspace, state_dir=..., min_free_bytes=..., max_worktrees=...)` checks free space under both configured roots and the active checkout count. The controller calls it before claiming a new issue, using `min_free_gb` and `max_parallel` from configuration. Clean, registered worktrees for published or merged jobs remain stored until [explicit bounded cleanup](storage.md); they do not consume an active slot. Interrupted, modified, unregistered, or unexpected-path worktrees remain for investigation and count against the worktree limit. Low free space under either root keeps the new issue queued. This check does not reserve disk space.
 
 `log_window_metadata(path, max_bytes=...)` returns the size, truncation flag, and SHA-256 of up to the last 64 KiB of a private log without exposing its text. Captured container output is limited to 1 MiB; output beyond that limit is not retained in full. Raw check logs remain under the private `state_dir/ci-logs/` directory.
+
+## Optional local dashboard
+
+Run from the source checkout:
+
+```sh
+python3 -m ermik --config config.json dashboard --port 8765
+```
+
+Open `http://127.0.0.1:8765/`. JSON is available at `/api/status`. The page is read-only and refreshes every 10 seconds. GitHub queue data is fetched at most once every 60 seconds; a read failure returns 503. It shows queue and job states, occupied slots, selected and result routes, attempts, usage observations, cooldowns, and recent events. It does not show a verified remaining subscription balance. Issue text, errors, branches, SHAs, logs, local paths, and secrets are omitted. Responses are bounded and use `Cache-Control: no-store`.
+
+The server binds only to `127.0.0.1` and accepts `Host: 127.0.0.1` or `localhost`. It has no authentication, so use it only on a trusted host; other local processes may reach it. Remote viewing needs a separately configured secure channel. Closing the command stops the page without affecting the controller.

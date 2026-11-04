@@ -1,98 +1,68 @@
 # Ermik
 
-Ermik is a coined name inspired by the [ermine](https://www.nature.scot/plants-animals-and-fungi/mammals/land-mammals/other-carnivores/stoat-and-weasel): the stoat in its white winter coat. It is not an acronym.
+Ermik is a self-hosted queue that turns approved GitHub Issues into draft pull requests. A trusted controller runs a configured task command in an isolated container, checks the result locally, and publishes the PR. A separate maintainer installation reviews the current commit and decides whether to request changes or merge. GitHub Actions and a paid GitHub plan are not required.
 
-Ermik is a self-hosted path from scoped GitHub Issues to draft pull requests. A maintainer admits an issue; a trusted controller runs the configured task command in a separate Docker container, validates the changed paths, and runs local checks without requiring GitHub Actions. The maintainer reviews the exact PR commit and is the only party that initiates a merge. This is a preview: the documented end-to-end trial verifies one disposable repository and its configuration, not every project or failure mode.
+The name is inspired by the [ermine](https://www.nature.scot/plants-animals-and-fungi/mammals/land-mammals/other-carnivores/stoat-and-weasel), the stoat in its white winter coat. It is not an acronym.
 
-![Workflow: issue admission, server execution, review, correction or merge](assets/workflow.svg)
+![Issue admission, isolated execution, draft PR, and maintainer decision](assets/workflow.svg)
 
-## What we are building
+## Design focus
 
-The goal is a reusable execution queue that can work through admitted Issues while the maintainer is away. Each task gets an isolated checkout, a configured runner and local checks. The controller publishes one draft PR per Issue and sends requested changes back to the same PR. Safe resumption after interruptions is a v0.2 goal still under test. A separate maintainer installation verifies the current HEAD and decides when to merge. The execution loop does not merge; the [security model](docs/security.md) explains the credentials needed to enforce that boundary.
+Issue-to-PR automation already exists. Ermik's distinct focus is the handoff around execution: who admitted the exact task, what paths and checks were allowed, which commit was reviewed, what happened after interruption, and who may merge.
 
-The controller can export a bounded record of checks and task identity for the maintainer. Optional GitHub comment delivery is under verification. Later releases aim to compare provider routes by accepted PR outcomes and cost and explain blocked or waiting work through optional local views. The [release status](docs/readiness.md) lists what has actually been verified.
+- **An explicit handoff.** Admission binds the issue body and allowed paths. The controller publishes one draft PR per issue; a correction continues on that PR. A changed HEAD invalidates the previous review.
+- **A real publication boundary.** The task container receives neither GitHub credentials nor the Docker socket. Fork mode can keep upstream Contents write and merge permission off the execution host; the [security guide](docs/security.md) states the trusted parts and remaining limits.
+- **Checks without hosted CI.** Each project supplies its own task image and check commands. The controller runs checks locally before publication; the maintainer runs them again on the exact PR HEAD.
+- **Recoverable, portable decisions.** The controller reconciles interrupted writes with GitHub. Versioned evidence, a review packet, and a private exact-HEAD decision trail help a separate maintainer installation detect missing or stale results. [Verified trials and limits](docs/readiness.md) are recorded separately from planned work.
 
-## Current capabilities
+Ermik is a workflow controller. The included demo command proves the handoff; a real project must provide an appropriate `worker_command`, image, and checks.
 
-- Admission is tied to the issue body and allowed paths through a maintainer comment. Only open issues with `queue:worker` and `state:ready` are eligible.
-- A configured worker runs in an isolated checkout. The controller validates changed paths, runs configured checks without network access, pushes the branch, and opens one draft PR.
-- `review` reruns checks on the exact PR HEAD. `request-changes` continues in the same PR. `merge` requires a current review record and checks the new base commit after merging.
-- `storage` inventories private task artifacts and previews bounded retention cleanup. Deletion requires a verified merged record and explicit `--apply` limits.
-- `export-evidence` creates a bounded record for one PR HEAD; `verify-evidence` checks it against current GitHub and local policy before maintainer review. [The manifest guide](docs/evidence.md) explains its trust limits.
-- Optional `publish-evidence` and `fetch-evidence` transfer that record through a PR comment. The receiver checks the current HEAD and pinned publisher identity; the transport does not attest to the controller's check results.
-- `review-packet` gives the maintainer a read-only view of one PR's current evidence, earlier HEAD, manual criteria, and local review status. It marks stale or missing evidence explicitly and never merges.
-- `decision-history` shows a bounded private trail of exact-HEAD reviews, correction requests, and explicit merge outcomes. Its digest comes from local check evidence; the history is never an approval signal.
-- A deterministic demo task command and a configurable task runner are included. Provider routing can retry an eligible route after a confirmed rate limit. Each new project must supply suitable task and check commands and verify its own complete issue-to-merge cycle.
+## Run it separately from your project
 
-The [documented trial](docs/readiness.md) completed admission, a draft PR, correction on the same PR, a second review, explicit merge, and a check on the resulting default branch in a separate GitHub repository. The two configured provider routes also completed live tasks. These results apply to the trial configuration.
-
-## Five-step trial
-
-1. Follow the [first-project walkthrough](docs/first-project.md) for a disposable repository. For separate server and maintainer hosts, follow [setup](docs/setup.md) and [security](docs/security.md).
-2. Copy [the example configuration](examples/config.example.json) to `config.json` on each host. Set the same `owner/repo`, maintainer, image, worker command, and checks. Give each host its own private `state_dir` and `workspace`. Keep secrets outside JSON.
-3. Build the demo image, then inspect the read-only preflight. It verifies identity and prerequisites; publication write capability remains unverified until `run-once` or `poll`:
-
-   ```sh
-   docker build -f examples/Dockerfile.demo -t ermik-demo:latest .
-   python3 -m ermik --config config.json doctor
-   python3 -m ermik --config config.json status
-   ```
-
-4. Create an issue from [the example body](examples/issue.md) with `queue:worker` and `state:proposed`. Replace `ISSUE_NUMBER` with the number in its GitHub URL. The maintainer admits it on their computer; the server takes it:
-
-   ```sh
-   python3 -m ermik --config config.json admit ISSUE_NUMBER
-   python3 -m ermik --config config.json run-once
-   ```
-
-5. Inspect the draft PR and its diff. Replace `PR_NUMBER` with the number returned by `run-once` (also shown in the PR URL). Record review, request a correction if needed, then review the new HEAD before merging:
-
-   ```sh
-   python3 -m ermik --config config.json review PR_NUMBER
-   python3 -m ermik --config config.json request-changes PR_NUMBER --note-file /private/review.txt
-   python3 -m ermik --config config.json review PR_NUMBER
-   python3 -m ermik --config config.json merge PR_NUMBER
-   ```
-
-For a copyable example that creates the issue and captures both numbers automatically, follow the [first-project walkthrough](docs/first-project.md). For continuous operation, use `python3 -m ermik --config config.json poll`. Set `"max_parallel": 2` only after verifying independent file and resource scopes.
-
-## Limits and evidence
-
-One trusted controller owns each state directory. Configuration allows up to eight concurrent jobs and 32 model entries; a PR may change at most 100 files. A confirmed HTTP 429 puts the account on a 15-minute cooldown; another eligible model can take the task. Ambiguous remote writes require reconciliation before retry.
-
-The worker container receives no GitHub credential. The publishing controller remains trusted. For private repositories on GitHub Free, do not treat `main` branch protection as an enforced boundary. Passing checks establish only what those commands tested; manual or hardware gates remain maintainer decisions.
-
-Report security vulnerabilities through the [private reporting channel](SECURITY.md). Run the [source release gate](docs/release.md) on each reviewed release commit before publishing an archive.
+Install Ermik on a dedicated Ubuntu 24.04+ controller host. Keep its checkout, state, workspace, account, and service apart from the target repository and other applications. The maintainer uses a second installation with its own state and credentials. The two installations share the target repository, admission rules, and check policy; they do not share a SQLite database.
 
 ```sh
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q ermik
+sudo apt-get update
+sudo apt-get install -y git ca-certificates
+git clone https://github.com/greggubarev/ermik.git
+cd ermik
+git switch --detach HEAD
+git rev-parse HEAD
+sed -n '1,180p' scripts/bootstrap-ubuntu.sh
+bash scripts/bootstrap-ubuntu.sh --check
+sudo bash scripts/bootstrap-ubuntu.sh --apply
+cd ..
+test ! -e /home/ermikctl/ermik && test ! -L /home/ermikctl/ermik
+sudo mv ermik /home/ermikctl/ermik
+sudo chown -R ermikctl:ermikctl /home/ermikctl/ermik
 ```
+
+The bootstrap prepares host packages and a dedicated `ermikctl` account; the move puts this checkout at the path expected by the systemd unit. Stop if `/home/ermikctl/ermik` already exists. The script does not authenticate to GitHub, configure a project, grant Docker access, or start polling. Continue with the [standalone server and maintainer setup](docs/setup.md), then run the [first complete cycle](docs/first-project.md) in a disposable repository before enabling the service. For a real project, replace the demo image, command, and checks with project-specific ones. The [configuration example](examples/config.example.json) is a starting point, not a production policy.
+
+The minimum read-only preflight, after configuring each installation, is:
+
+```sh
+python3 -m ermik --config config.json doctor
+python3 -m ermik --config config.json status
+```
+
+The maintainer admits an issue; the server's `run-once` or `poll` takes only admitted `queue:worker` and `state:ready` issues. The maintainer reviews the draft PR, sends corrections to the same PR if needed, and explicitly merges after reviewing the new HEAD. [Maintainer commands](docs/maintainer.md) and [worker operation](docs/worker.md) give the exact steps.
 
 ## Roadmap
 
-The [phased roadmap](docs/roadmap.md) defines the acceptance gates. The milestones group concrete Issues; they are not release dates.
+![Ermik milestones: verified foundation, open release gates, and planned work](assets/roadmap.svg)
 
-| Milestone | Planned result |
+The image is a snapshot of [GitHub milestones](https://github.com/greggubarev/ermik/milestones), not a release claim or schedule. v0.2 still has open clean-host, reboot, provider-failure, and source-verification gates. v0.3 has working evidence and review components, with independent cross-host delivery still open. Measured routing and optional operator views follow. [Acceptance criteria](docs/roadmap.md) and [current evidence](docs/readiness.md) distinguish completed slices from remaining work.
+
+## Guides
+
+| Start here | For |
 | --- | --- |
-| [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Recover interrupted writes and merge decisions, prove separated credentials, pin execution identity, and validate upgrades and a clean installation. |
-| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Deliver portable evidence to a separate maintainer installation and make stale review decisions visible. |
-| [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measure provider outcomes, quota observations, context use and cost per accepted PR before changing routing policy. |
-| [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Add optional diagnostics and views, and validate the setup on unrelated projects. |
+| [Setup](docs/setup.md) · [first project](docs/first-project.md) | Dedicated controller and maintainer installations; full disposable trial |
+| [Security](docs/security.md) · [PR broker](docs/pr-broker.md) | Credential split, fork publication, and trust limits |
+| [Local checks](docs/local-ci.md) · [providers](docs/providers.md) | Project check policy and optional task-command routes |
+| [Status](docs/status.md) · [storage](docs/storage.md) | Queue visibility, local dashboard, and bounded artifact cleanup |
+| [Evidence](docs/evidence.md) · [troubleshooting](docs/troubleshooting.md) | Review handoff, stale results, and recovery |
+| [Release status](docs/readiness.md) · [roadmap](docs/roadmap.md) | Verified behavior and open gates |
 
-Ermik remains a preview while the v0.2 recovery and credential gates are open. See [release status](docs/readiness.md) for verified trials and [Releases](https://github.com/greggubarev/ermik/releases) when a version is published.
-
-## Documentation
-
-| Guide | Subject |
-| --- | --- |
-| [Setup](docs/setup.md) and [first project](docs/first-project.md) | Installation and complete trial |
-| [Maintainer](docs/maintainer.md) and [worker](docs/worker.md) | Issue admission, execution, review, and merge |
-| [Security policy](SECURITY.md), [security model](docs/security.md), and [PR broker](docs/pr-broker.md) | Private reporting, credentials, and publication boundaries |
-| [Local CI](docs/local-ci.md), [status](docs/status.md), [dashboard](docs/dashboard.md), and [storage](docs/storage.md) | Checks, observability, and local artifact retention |
-| [Providers](docs/providers.md) and [troubleshooting](docs/troubleshooting.md) | Model routing and recovery |
-| [Architecture](docs/architecture.md), [image continuity](docs/image-continuity.md), [evidence](docs/evidence.md), and [readiness](docs/readiness.md) | State machine, image identity, PR handoff record, verified behavior, and open work |
-| [Roadmap](docs/roadmap.md) | Phases and acceptance criteria |
-| [Source release](docs/release.md) | Archive, privacy scan, notices, and secret response |
-
-Source code is available under the [MIT License](LICENSE). Components added to a custom task image retain their own licenses and terms.
+Before publishing a source release, run the [release gate](docs/release.md) against the reviewed commit. Ermik is distributed under the [MIT License](LICENSE); custom task images retain their own dependency licenses.
