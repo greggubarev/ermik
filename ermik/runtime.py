@@ -739,6 +739,13 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                     or int(match.group(1)) != row["issue"]
                     or match.group(2) != row["head_sha"]):
                 continue
+            if cfg.evidence_publisher and not conn.execute(
+                    "SELECT 1 FROM events WHERE issue=? AND kind='evidence_delivered' "
+                    "AND head_sha=? LIMIT 1", (row["issue"], row["head_sha"])).fetchone():
+                # Keep the old HEAD exportable until its remote record exists.
+                conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
+                             (now + 60, row["issue"]))
+                break
             rebase_only = bool(REBASE_ONLY.search(comment.get("body") or ""))
             provider = None if rebase_only else _route_provider(conn, cfg, issue, reserved or {})
             if provider is None and not rebase_only:
@@ -1579,8 +1586,17 @@ def run_once(cfg: Config) -> list[dict]:
 def poll(cfg: Config) -> None:
     while True:
         try:
-            result = run_once(cfg)
+            work = run_once(cfg)
         except (GitHubError, TransientFailure, WorkflowError) as exc:
-            result = {"status": "error", "error": type(exc).__name__}
+            work = {"status": "error", "error": type(exc).__name__}
+        if cfg.evidence_publisher:
+            from .delivery_loop import deliver_pending
+            try:
+                delivery = deliver_pending(cfg)
+            except (OSError, ValueError, GitHubError) as exc:
+                delivery = {"status": "error", "error": type(exc).__name__}
+            result = {"work": work, "delivery": delivery}
+        else:
+            result = work
         print(json.dumps(result, sort_keys=True), flush=True)
         time.sleep(cfg.poll_seconds)
