@@ -30,4 +30,14 @@ python3 -m ermik --config config.json fetch-evidence PR_NUMBER --output /private
 
 Comment scanning stops after 1,000 timeline comments and reports an error rather than silently overlooking an older record. For a PR beyond that limit, use the manual file export and verification commands above.
 
-The comment carries a canonical version 1 record with the execution-model identifier withheld; the corresponding field is `null` and listed in `unknowns`. The controller keeps the full local record. The comment contains no raw logs, issue text, credentials, or local paths. Manual `export-evidence` and `verify-evidence` remain available when comment delivery is not configured. A consolidated review view is separate roadmap work.
+The comment carries a canonical version 1 record with the execution-model identifier withheld; the corresponding field is `null` and listed in `unknowns`. The controller keeps the full local record. The comment contains no raw logs, issue text, credentials, or local paths. Manual `export-evidence` and `verify-evidence` remain available when comment delivery is not configured.
+
+## Review packet
+
+On the maintainer installation, inspect a draft PR before deciding whether to run a local review:
+
+```sh
+python3 -m ermik --config config.json review-packet PR_NUMBER
+```
+
+The read-only command checks the current Issue admission, PR base and HEAD, changed paths, evidence comment, configured checks, and image identity. Its `diff_url` opens GitHub's comparison of the two exact commits; inspect the full diff there. It separates the controller's reported check results from a local exact-HEAD review. A missing or stale record is reported explicitly with a nonzero exit status. The packet is a review aid; it does not run checks, write a review record, or authorize merge. Run `review PR_NUMBER` on the current HEAD before merging.

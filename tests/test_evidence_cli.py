@@ -90,6 +90,16 @@ class EvidenceCliTests(unittest.TestCase):
             self.assertEqual(cli.main(["--config", "unused", "run-once"]), 1)
         deliver.assert_called_once_with(cfg)
 
+    def test_review_packet_noncurrent_exits_nonzero_without_writing(self):
+        output = StringIO()
+        with (patch.object(cli, "load_config", return_value=object()),
+              patch.object(cli, "build_review_packet", return_value={
+                  "status": "stale", "reason": "remote_identity"}),
+              redirect_stdout(output)):
+            self.assertEqual(cli.main(["--config", "unused", "review-packet", "19"]), 2)
+        self.assertEqual(json.loads(output.getvalue()),
+                         {"status": "stale", "reason": "remote_identity"})
+
 
 if __name__ == "__main__":
     unittest.main()

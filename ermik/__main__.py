@@ -22,6 +22,7 @@ from .evidence import MAX_BYTES, dumps_manifest, loads_manifest
 from .evidence_export import export_manifest, verify_manifest
 from .evidence_transport import fetch_manifest, publish_manifest
 from .delivery_loop import deliver_pending
+from .review_packet import build_review_packet
 
 
 def doctor(cfg) -> dict:
@@ -115,6 +116,8 @@ def main(argv: list[str] | None = None) -> int:
     admit_parser.add_argument("issue", type=int)
     review_parser = commands.add_parser("review")
     review_parser.add_argument("pr", type=int)
+    packet_parser = commands.add_parser("review-packet")
+    packet_parser.add_argument("pr", type=int)
     correction_parser = commands.add_parser("request-changes")
     correction_parser.add_argument("pr", type=int)
     correction_parser.add_argument("--note-file", type=Path, required=True)
@@ -180,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         elif args.command == "review":
             result = review(cfg, args.pr)
+        elif args.command == "review-packet":
+            result = build_review_packet(cfg, args.pr)
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "merge":
@@ -215,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "verify-evidence" and result.get("status") != "current":
             return 2
         if args.command == "fetch-evidence" and result.get("status") != "current":
+            return 2
+        if args.command == "review-packet" and result.get("status") != "current":
             return 2
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, KeyError, TypeError) as exc:
