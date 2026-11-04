@@ -17,6 +17,7 @@ Later releases aim to carry a portable record of checks and task identity to the
 - Admission is tied to the issue body and allowed paths through a maintainer comment. Only open issues with `queue:worker` and `state:ready` are eligible.
 - A configured worker runs in an isolated checkout. The controller validates changed paths, runs configured checks without network access, pushes the branch, and opens one draft PR.
 - `review` reruns checks on the exact PR HEAD. `request-changes` continues in the same PR. `merge` requires a current review record and checks the new base commit after merging.
+- `export-evidence` creates a bounded record for one PR HEAD; `verify-evidence` checks it against current GitHub and local policy before maintainer review. [The manifest guide](docs/evidence.md) explains its trust limits.
 - A deterministic demo task command and a configurable task runner are included. Provider routing can retry an eligible route after a confirmed rate limit. Each new project must supply suitable task and check commands and verify its own complete issue-to-merge cycle.
 
 The [documented trial](docs/readiness.md) completed admission, a draft PR, correction on the same PR, a second review, explicit merge, and a check on the resulting default branch in a separate GitHub repository. The two configured provider routes also completed live tasks. These results apply to the trial configuration.
@@ -86,7 +87,7 @@ Ermik remains a preview while the v0.2 recovery and credential gates are open. S
 | [Security policy](SECURITY.md), [security model](docs/security.md), and [PR broker](docs/pr-broker.md) | Private reporting, credentials, and publication boundaries |
 | [Local CI](docs/local-ci.md), [status](docs/status.md), and [dashboard](docs/dashboard.md) | Checks and observability |
 | [Providers](docs/providers.md) and [troubleshooting](docs/troubleshooting.md) | Model routing and recovery |
-| [Architecture](docs/architecture.md), [image continuity](docs/image-continuity.md), and [readiness](docs/readiness.md) | State machine, image identity, verified behavior, and open work |
+| [Architecture](docs/architecture.md), [image continuity](docs/image-continuity.md), [evidence](docs/evidence.md), and [readiness](docs/readiness.md) | State machine, image identity, PR handoff record, verified behavior, and open work |
 | [Roadmap](docs/roadmap.md) | Phases and acceptance criteria |
 | [Source release](docs/release.md) | Archive, privacy scan, notices, and secret response |
 

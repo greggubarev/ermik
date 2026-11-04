@@ -19,8 +19,10 @@ MAX_BYTES = 16384
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
+_BRANCH = re.compile(r"work/issue-([1-9][0-9]*)-[a-z0-9-]+\Z")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
-_FIELDS = {"version", "repo", "issue", "pr", "base", "head", "body_sha256",
+_FIELDS = {"version", "repo", "head_repository", "issue", "pr", "branch",
+           "base", "head", "body_sha256", "scope_sha256", "checks_sha256",
            "paths", "checks", "image", "model", "attempts", "usage", "unknowns"}
 _TOKENS = ("input", "output", "reasoning", "cache_read", "cache_write", "total")
 
@@ -50,18 +52,24 @@ def validate_manifest(record: dict) -> dict:
              "invalid manifest fields")
     _require(type(record["version"]) is int and record["version"] == VERSION,
              "unsupported manifest version")
-    _require(type(record["repo"]) is str and bool(_REPO.fullmatch(record["repo"]))
-             and record["repo"].split("/", 1)[1] not in {".", ".."},
-             "invalid repository")
+    for key in ("repo", "head_repository"):
+        _require(type(record[key]) is str and bool(_REPO.fullmatch(record[key]))
+                 and record[key].split("/", 1)[1] not in {".", ".."},
+                 f"invalid {key}")
     for key in ("issue", "pr"):
         _require(type(record[key]) is int and 1 <= record[key] <= 2**31 - 1,
                  f"invalid {key}")
+    branch = record["branch"]
+    match = _BRANCH.fullmatch(branch) if type(branch) is str else None
+    _require(match is not None and int(match.group(1)) == record["issue"],
+             "invalid branch")
     for key in ("base", "head"):
         _require(type(record[key]) is str and bool(_SHA.fullmatch(record[key])),
                  f"invalid {key}")
     _require(record["base"] != record["head"], "base and head must differ")
-    _require(type(record["body_sha256"]) is str
-             and bool(_DIGEST.fullmatch(record["body_sha256"])), "invalid body hash")
+    for key in ("body_sha256", "scope_sha256", "checks_sha256"):
+        _require(type(record[key]) is str and bool(_DIGEST.fullmatch(record[key])),
+                 f"invalid {key}")
     paths = record["paths"]
     _require(type(paths) is list and 1 <= len(paths) <= 100, "invalid paths")
     _require(all(_valid_path(path) for path in paths), "invalid path")
