@@ -9,7 +9,8 @@ from .evidence_export import _github, _live
 from .evidence_transport import _published_records, fetch_manifest
 from .github import GitHub, GitHubError
 from .review import _checks_sha256, _load, _review_policy
-from .runtime import WorkflowError, published_image_id
+from .runtime import (WorkflowError, published_image_id,
+                      published_image_config_digest)
 
 
 _UNSAFE_TEXT = re.compile(
@@ -66,6 +67,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     try:
         pr, issue, spec, paths = _live(cfg, _github(cfg), pr_number)
         image = published_image_id(pr.get("body") or "")
+        image_config_digest = published_image_config_digest(pr.get("body") or "")
         if not (_SHA.fullmatch(pr["baseRefOid"])
                 and _SHA.fullmatch(pr["headRefOid"])):
             raise WorkflowError("invalid commit identity")
@@ -87,7 +89,8 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         "branch": pr["headRefName"], "base": pr["baseRefOid"],
         "head": pr["headRefOid"], "body_sha256": spec.body_sha256,
         "paths": paths, "checks_sha256": _checks_sha256(cfg),
-        "image_id": image,
+        "published_image_id": image,
+        "image_config_digest": image_config_digest,
     }
     packet["review"] = _review_summary(cfg, pr_number, expected)
     old_head = packet["review"].get("head")
@@ -109,12 +112,14 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     evidence = {"status": status}
     if status == "current" and record is not None:
         manifest_identity = {
+            "version": 2,
             "repo": cfg.repo, "issue": issue, "pr": pr_number,
             "head_repository": cfg.publish_repo or cfg.repo,
             "branch": pr["headRefName"], "base": pr["baseRefOid"],
             "head": pr["headRefOid"], "body_sha256": spec.body_sha256,
             "paths": paths, "checks_sha256": _checks_sha256(cfg),
             "image": image,
+            "image_config_digest": image_config_digest,
         }
         if any(record.get(key) != value for key, value in manifest_identity.items()):
             packet.update(status="stale", evidence={"status": "stale",
@@ -138,7 +143,8 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     elif status == "stale":
         reason = fetched.get("reason")
         if reason in {"head_changed", "identity_changed", "remote_identity",
-                      "image_unavailable", "image_changed", "invalid_record"}:
+                      "image_unavailable", "image_changed", "image_identity_missing",
+                      "invalid_record"}:
             evidence["reason"] = reason
         prior = fetched.get("head")
         if (packet["previous_head"] is None and isinstance(prior, str)
@@ -151,6 +157,8 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
             final_pr, final_issue, final_spec, final_paths = _live(
                 cfg, _github(cfg), pr_number)
             final_image = published_image_id(final_pr.get("body") or "")
+            final_image_config_digest = published_image_config_digest(
+                final_pr.get("body") or "")
             unchanged = (
                 final_issue == issue
                 and final_spec.body_sha256 == spec.body_sha256
@@ -158,6 +166,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
                 and final_pr["baseRefOid"] == pr["baseRefOid"]
                 and final_pr["headRefOid"] == pr["headRefOid"]
                 and final_paths == paths and final_image == image
+                and final_image_config_digest == image_config_digest
             )
         except (WorkflowError, GitHubError, ValueError, KeyError, TypeError):
             unchanged = False

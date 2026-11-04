@@ -14,16 +14,17 @@ import re
 from .policy import _safe_path
 
 
-VERSION = 1
+VERSION = 2
 MAX_BYTES = 16384
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
 _BRANCH = re.compile(r"work/issue-([1-9][0-9]*)-[a-z0-9-]+\Z")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
-_FIELDS = {"version", "repo", "head_repository", "issue", "pr", "branch",
-           "base", "head", "body_sha256", "scope_sha256", "checks_sha256",
-           "paths", "checks", "image", "model", "attempts", "usage", "unknowns"}
+_V1_FIELDS = {"version", "repo", "head_repository", "issue", "pr", "branch",
+              "base", "head", "body_sha256", "scope_sha256", "checks_sha256",
+              "paths", "checks", "image", "model", "attempts", "usage", "unknowns"}
+_V2_FIELDS = _V1_FIELDS | {"image_config_digest"}
 _TOKENS = ("input", "output", "reasoning", "cache_read", "cache_write", "total")
 
 
@@ -51,11 +52,12 @@ def _valid_path(path: object) -> bool:
 
 
 def validate_manifest(record: dict) -> dict:
-    """Validate a complete v1 record and return an independent plain-data copy."""
+    """Validate an exact v1 or v2 record without changing its version."""
     _require(type(record) is dict and "version" in record, "invalid manifest fields")
-    if type(record["version"]) is not int or record["version"] != VERSION:
+    if type(record["version"]) is not int or record["version"] not in (1, 2):
         raise UnsupportedManifestVersion("unsupported manifest version")
-    _require(set(record) == _FIELDS | {"sha256"}, "invalid manifest fields")
+    fields = _V1_FIELDS if record["version"] == 1 else _V2_FIELDS
+    _require(set(record) == fields | {"sha256"}, "invalid manifest fields")
     for key in ("repo", "head_repository"):
         _require(type(record[key]) is str and bool(_REPO.fullmatch(record[key]))
                  and record[key].split("/", 1)[1] not in {".", ".."},
@@ -89,6 +91,11 @@ def validate_manifest(record: dict) -> dict:
     _require(type(record["image"]) is str
              and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", record["image"])),
              "invalid image identity")
+    if record["version"] == 2:
+        _require(type(record["image_config_digest"]) is str
+                 and bool(re.fullmatch(r"sha256:[0-9a-f]{64}",
+                                       record["image_config_digest"])),
+                 "invalid image config digest")
     unknowns = record["unknowns"]
     _require(type(unknowns) is list and all(type(item) is str for item in unknowns)
              and unknowns == sorted(set(unknowns))
@@ -113,7 +120,7 @@ def validate_manifest(record: dict) -> dict:
                  and 0 <= cost <= 10**9, "invalid usage cost")
     digest = record["sha256"]
     _require(type(digest) is str and bool(_DIGEST.fullmatch(digest)), "invalid digest")
-    payload = {key: record[key] for key in _FIELDS}
+    payload = {key: record[key] for key in fields}
     _require(hashlib.sha256(_canonical(payload)).hexdigest() == digest,
              "manifest digest mismatch")
     raw = _canonical(record)
@@ -122,8 +129,8 @@ def validate_manifest(record: dict) -> dict:
 
 
 def make_manifest(**fields: object) -> dict:
-    """Create a validated record from the exact v1 field set."""
-    _require(set(fields) == _FIELDS - {"version"}, "invalid manifest fields")
+    """Create a validated v2 record; historical v1 records remain read-only."""
+    _require(set(fields) == _V2_FIELDS - {"version"}, "invalid manifest fields")
     payload = {"version": VERSION, **fields}
     try:
         digest = hashlib.sha256(_canonical(payload)).hexdigest()

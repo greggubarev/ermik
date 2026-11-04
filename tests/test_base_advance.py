@@ -26,6 +26,7 @@ The example is updated.
 """
 BRANCH = "work/issue-1-delivery"
 IMAGE = "sha256:" + "e" * 64
+CONFIG_DIGEST = "sha256:" + "9" * 64
 
 
 def command(*args):
@@ -37,6 +38,10 @@ class BaseAdvanceTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "e" * 64)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest",
+                                return_value=CONFIG_DIGEST)
+        portable.start()
+        self.addCleanup(portable.stop)
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.remote = root / "remote.git"
@@ -101,7 +106,8 @@ class BaseAdvanceTests(unittest.TestCase):
                         "baseRefName": "main",
                         "changedFiles": 1,
                         "files": [{"path": "src/other.py" if bad_files else "src/example.py"}],
-                        "body": f"Closes #1\n\nExecution image: `{IMAGE}`",
+                        "body": (f"Closes #1\n\nExecution image: `{IMAGE}`\n"
+                                 f"Execution image config: `{CONFIG_DIGEST}`"),
                         "headRepository": {"nameWithOwner": "owner/repo"}}
 
             validate_pr_identity = GitHub.validate_pr_identity
@@ -123,7 +129,8 @@ class BaseAdvanceTests(unittest.TestCase):
                 runtime, "main_sha", side_effect=lambda gh, cfg: command(
                     "git", "--git-dir", str(self.remote), "rev-parse", "refs/heads/main")), patch.object(
                 runtime, "_docker", side_effect=worker) as docker_run, patch.object(
-                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE}) as checks, patch.object(
+                runtime, "local_checks", return_value={"result": "passed", "image_id": IMAGE,
+                                                       "image_config_digest": CONFIG_DIGEST}) as checks, patch.object(
                 runtime, "_approved_on_github", return_value=True):
             result = runtime._perform(self.cfg, 1, BRANCH, runtime.parse_issue(BODY),
                                       correction_note=("SEMI_REBASE_ONLY" if rebase_only else "Improve it"),

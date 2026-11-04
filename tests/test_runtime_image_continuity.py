@@ -24,6 +24,7 @@ HEAD = "b" * 40
 BRANCH = "work/issue-1-delivery"
 IMAGE_A = "sha256:" + "c" * 64
 IMAGE_B = "sha256:" + "d" * 64
+CONFIG = "sha256:" + "e" * 64
 
 
 class StopBeforeWorker(Exception):
@@ -37,7 +38,8 @@ class Hub:
     def pr(self, _number):
         return {"number": 10, "headRefOid": HEAD, "isDraft": True,
                 "changedFiles": 1, "files": [{"path": "src/example.py"}],
-                "body": f"Closes #1\n\nExecution image: `{IMAGE_A}`\n"}
+                "body": f"Closes #1\n\nExecution image: `{IMAGE_A}`\n"
+                        f"Execution image config: `{CONFIG}`\n"}
 
     def find_branch_pr(self, _branch):
         return 10
@@ -54,6 +56,9 @@ class RuntimeImageContinuityTests(unittest.TestCase):
         self.checkout = self.cfg.workspace / "jobs" / "issue-1"
         self.checkout.mkdir(parents=True)
         self.spec = runtime.parse_issue(BODY)
+        portable = patch.object(runtime, "_portable_image_digest", return_value=CONFIG)
+        portable.start()
+        self.addCleanup(portable.stop)
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
                          "VALUES(?,?,?,'running',?)",
@@ -115,7 +120,8 @@ class RuntimeImageContinuityTests(unittest.TestCase):
                "last_model": None, "image_id": image_id}
         pr = {"number": 10, "isDraft": True, "changedFiles": 1,
               "files": [{"path": "src/example.py"}],
-              "body": f"Closes #1\n\nExecution image: `{IMAGE_A}`\n",
+              "body": f"Closes #1\n\nExecution image: `{IMAGE_A}`\n"
+                      f"Execution image config: `{CONFIG}`\n",
               "headRefOid": HEAD}
         source = self.cfg.workspace / "source"
         source.mkdir(parents=True)
@@ -132,7 +138,8 @@ class RuntimeImageContinuityTests(unittest.TestCase):
         with patch.object(runtime, "mirror", return_value=source), patch.object(
                 runtime, "git", side_effect=git), patch.object(
                 runtime, "local_checks", return_value={"result": "passed",
-                                                      "image_id": IMAGE_A}) as checks:
+                                                      "image_id": IMAGE_A,
+                                                      "image_config_digest": CONFIG}) as checks:
             if image_id is None:
                 with self.assertRaises(runtime.WorkflowError):
                     runtime._rebuild_published_evidence(self.cfg, row, pr)
@@ -148,6 +155,7 @@ class RuntimeImageContinuityTests(unittest.TestCase):
         result = self._rebuild(IMAGE_A)
         self.assertEqual(result["head"], HEAD)
         self.assertEqual(result["ci"]["image_id"], IMAGE_A)
+        self.assertEqual(result["ci"]["image_config_digest"], CONFIG)
 
     def test_crash_recovery_rejects_missing_image_binding(self):
         self._rebuild(None)
@@ -174,7 +182,8 @@ class RuntimeImageContinuityTests(unittest.TestCase):
                 runtime, "_approved_on_github", return_value=True), patch.object(
                 runtime, "_require_initial_draft"), patch.object(
                 runtime, "local_checks", return_value={"result": "passed",
-                                                      "image_id": IMAGE_A}) as checks:
+                                                      "image_id": IMAGE_A,
+                                                      "image_config_digest": CONFIG}) as checks:
             result = runtime._recover_unacknowledged_push(
                 hub, self.cfg, row, hub.issue(1), self.spec,
                 f"{HEAD} refs/heads/{BRANCH}")

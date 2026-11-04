@@ -13,6 +13,7 @@ BODY = "## Allowed paths\nsrc/a.py\n\n## Goal\nFix a\n\n## Acceptance\nWorks\n"
 HEAD = "a" * 40
 BASE = "b" * 40
 IMAGE = "sha256:" + "c" * 64
+IMAGE_CONFIG = "sha256:" + "e" * 64
 
 
 class Hub:
@@ -42,7 +43,8 @@ class Hub:
                 "baseRefOid": BASE, "headRefName": "work/issue-7-delivery",
                 "headRefOid": HEAD, "changedFiles": 1,
                 "files": [{"path": "src/a.py"}],
-                "body": f"Closes #7\n\nExecution image: `{IMAGE}`",
+                "body": (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
+                         f"Execution image config: `{IMAGE_CONFIG}`"),
                 "isDraft": True}
 
     def validate_pr_identity(self, *_args, **_kwargs):
@@ -82,10 +84,14 @@ class ReviewAdmissionTests(unittest.TestCase):
     def test_request_changes_requires_current_approval_and_reviewed_body(self):
         record = {"pr": 19, "issue": 7, "repo": self.cfg.repo,
                   "head": HEAD, "base": BASE, "image_id": IMAGE,
+                  "published_image_id": IMAGE,
+                  "image_config_digest": IMAGE_CONFIG,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
                   "paths": ["src/a.py"],
                   "ci": {"head": HEAD, "committed_diff_base": BASE,
-                         "image_id": IMAGE, "result": "passed",
+                         "image_id": IMAGE,
+                         "image_config_digest": IMAGE_CONFIG,
+                         "result": "passed",
                          "checks": [{"command": ["true"], "exit_code": 0,
                                      "log_sha256": "d" * 64}]}}
         note = Path(self.temp.name) / "note.txt"
@@ -104,7 +110,9 @@ class ReviewAdmissionTests(unittest.TestCase):
                   "head_repository": self.cfg.repo,
                   "branch": "work/issue-7-delivery", "head": HEAD, "base": BASE,
                   "body_sha256": runtime.parse_issue(BODY).body_sha256,
-                  "paths": ["src/a.py"], "image_id": IMAGE}
+                  "paths": ["src/a.py"], "image_id": IMAGE,
+                  "published_image_id": IMAGE,
+                  "image_config_digest": IMAGE_CONFIG}
         with patch.object(review, "GitHub", return_value=self.gh), patch.object(
                 review, "_load", return_value=record):
             with self.assertRaisesRegex(runtime.WorkflowError, "admission"):

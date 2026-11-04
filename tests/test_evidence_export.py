@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from ermik.config import Config
 from ermik.evidence_export import export_manifest, verify_manifest
-from ermik.evidence import make_manifest
+from ermik.evidence import loads_manifest, make_manifest
 from ermik.evidence_store import read_evidence, write_evidence
 from ermik.policy import parse_issue
 from ermik.runtime import _admission_marker, WorkflowError
@@ -18,6 +18,8 @@ from ermik import state
 BASE = "a" * 40
 HEAD = "b" * 40
 IMAGE = "sha256:" + "c" * 64
+RECEIVER_IMAGE = "sha256:" + "e" * 64
+CONFIG_DIGEST = "sha256:" + "9" * 64
 BODY = "## Goal\nDo one thing\n\n## Allowed paths\nsrc\n\n## Acceptance\nCheck it\n"
 
 
@@ -34,7 +36,8 @@ class FakeGitHub:
                 "baseRefName": "main", "baseRefOid": self.base,
                 "headRefName": "work/issue-7-delivery", "headRefOid": self.head,
                 "headRepository": {"nameWithOwner": self.cfg.repo},
-                "body": f"Closes #7\nExecution image: `{IMAGE}`",
+                "body": (f"Closes #7\nExecution image: `{IMAGE}`\n"
+                         f"Execution image config: `{CONFIG_DIGEST}`"),
                 "files": [{"path": path} for path in self.paths],
                 "changedFiles": len(self.paths)}
 
@@ -81,19 +84,23 @@ class EvidenceExportTests(unittest.TestCase):
             "base": BASE, "head": HEAD, "body_sha256": self.spec.body_sha256,
             "paths": ["src/one.py"], "model": "provider/model",
             "ci": {"head": HEAD, "committed_diff_base": BASE, "result": "passed",
-                   "image_id": IMAGE,
+                   "image_id": IMAGE, "image_config_digest": CONFIG_DIGEST,
                    "checks": [{"command": ["check", "all"], "exit_code": 0,
                                "log_sha256": "d" * 64,
                                "log": "/private/secret.log"}]}})
 
     def _patches(self):
         return (patch("ermik.evidence_export._github", return_value=self.gh),
-                patch("ermik.evidence_export._resolve_image_id", return_value=IMAGE))
+                patch("ermik.evidence_export._resolve_image_id", return_value=IMAGE),
+                patch("ermik.evidence_export._portable_image_digest",
+                      return_value=CONFIG_DIGEST))
 
     def test_export_and_verify_without_controller_state(self):
-        gh_patch, image_patch = self._patches()
-        with gh_patch, image_patch:
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
             manifest = export_manifest(self.cfg, 12)
+            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(manifest["image_config_digest"], CONFIG_DIGEST)
             self.assertEqual(manifest["unknowns"], ["usage"])
             self.assertEqual(manifest["checks"][0]["log_sha256"], "d" * 64)
             self.assertNotIn("/private/", json.dumps(manifest))
@@ -103,9 +110,56 @@ class EvidenceExportTests(unittest.TestCase):
                            self.cfg.worker_command, self.cfg.checks, 1, 60, (), "main")
             self.assertEqual(verify_manifest(other, 12, manifest)["status"], "current")
 
+    def test_cross_host_local_id_may_differ_when_config_matches(self):
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
+            manifest = export_manifest(self.cfg, 12)
+            receiver = Config(self.cfg.repo, self.cfg.maintainer,
+                              Path(self.temp.name) / "receiver-state",
+                              Path(self.temp.name) / "receiver-work", "receiver:tag",
+                              self.cfg.worker_command, self.cfg.checks,
+                              1, 60, (), "main")
+            with patch("ermik.evidence_export._resolve_image_id",
+                       return_value=RECEIVER_IMAGE) as resolved:
+                result = verify_manifest(receiver, 12, manifest)
+            self.assertEqual(result["status"], "current")
+            self.assertNotEqual(RECEIVER_IMAGE, manifest["image"])
+            resolved.assert_called_once_with("receiver:tag")
+
+    def test_cross_host_changed_config_digest_rejected(self):
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
+            manifest = export_manifest(self.cfg, 12)
+            with patch("ermik.evidence_export._resolve_image_id",
+                       return_value=RECEIVER_IMAGE), patch(
+                           "ermik.evidence_export._portable_image_digest",
+                           return_value="sha256:" + "8" * 64):
+                result = verify_manifest(self.cfg, 12, manifest)
+            self.assertEqual(result,
+                             {"status": "stale", "reason": "image_changed"})
+
+    def test_legacy_manifest_without_portable_identity_is_stale(self):
+        fixture = (Path(__file__).parent / "fixtures" / "evidence"
+                   / "h1.v1.json").read_bytes()
+        legacy = loads_manifest(fixture)
+        self.assertEqual(legacy["version"], 1)
+        self.assertNotIn("image_config_digest", legacy)
+        self.assertEqual(verify_manifest(self.cfg, 12, legacy),
+                         {"status": "stale", "reason": "image_identity_missing"})
+
+    def test_missing_config_digest_in_saved_checks_blocks_export(self):
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
+            evidence_path = self.cfg.state_dir / "evidence" / "7" / f"{HEAD}.json"
+            saved = read_evidence(evidence_path)
+            del saved["ci"]["image_config_digest"]
+            write_evidence(evidence_path, saved)
+            with self.assertRaisesRegex(WorkflowError, "saved check evidence is stale"):
+                export_manifest(self.cfg, 12)
+
     def test_changed_remote_identity_rejects_old_record(self):
-        gh_patch, image_patch = self._patches()
-        with gh_patch, image_patch:
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
             manifest = export_manifest(self.cfg, 12)
             self.gh.head = "e" * 40
             self.assertEqual(verify_manifest(self.cfg, 12, manifest)["status"], "stale")
@@ -114,8 +168,8 @@ class EvidenceExportTests(unittest.TestCase):
             self.assertEqual(verify_manifest(self.cfg, 12, manifest)["status"], "stale")
 
     def test_changed_check_policy_and_missing_evidence_fail_closed(self):
-        gh_patch, image_patch = self._patches()
-        with gh_patch, image_patch:
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
             manifest = export_manifest(self.cfg, 12)
             altered = Config(self.cfg.repo, self.cfg.maintainer, self.cfg.state_dir,
                              self.cfg.workspace, IMAGE, self.cfg.worker_command,
@@ -126,8 +180,8 @@ class EvidenceExportTests(unittest.TestCase):
                 export_manifest(self.cfg, 12)
 
     def test_recomputed_digest_does_not_authenticate_observations(self):
-        gh_patch, image_patch = self._patches()
-        with gh_patch, image_patch:
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
             manifest = export_manifest(self.cfg, 12)
             fields = {key: value for key, value in manifest.items()
                       if key not in ("version", "sha256")}
@@ -140,8 +194,8 @@ class EvidenceExportTests(unittest.TestCase):
                          "controller_claim_not_independently_verified")
 
     def test_correction_on_same_pr_has_new_exact_head_record(self):
-        gh_patch, image_patch = self._patches()
-        with gh_patch, image_patch:
+        gh_patch, image_patch, digest_patch = self._patches()
+        with gh_patch, image_patch, digest_patch:
             before = export_manifest(self.cfg, 12)
             corrected_head = "e" * 40
             self.gh.head = corrected_head

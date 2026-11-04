@@ -14,6 +14,7 @@ from ermik.evidence_store import write_evidence
 HEAD = "b" * 40
 BASE = "a" * 40
 IMAGE = "sha256:" + "c" * 64
+IMAGE_CONFIG_DIGEST = "sha256:" + "f" * 64
 
 
 class DecisionTrailTests(unittest.TestCase):
@@ -29,8 +30,11 @@ class DecisionTrailTests(unittest.TestCase):
     def record(self, first_hash="d" * 64):
         return {"repo": self.cfg.repo, "issue": 7, "pr": 12,
                 "base": BASE, "head": HEAD, "image_id": IMAGE,
+                "image_config_digest": IMAGE_CONFIG_DIGEST,
                 "ci": {"head": HEAD, "committed_diff_base": BASE,
-                       "image_id": IMAGE, "result": "passed",
+                       "image_id": IMAGE,
+                       "image_config_digest": IMAGE_CONFIG_DIGEST,
+                       "result": "passed",
                        "checks": [
                            {"command": ["check", "one"], "exit_code": 0,
                             "log_sha256": first_hash, "log": "/private/one.log"},
@@ -57,6 +61,16 @@ class DecisionTrailTests(unittest.TestCase):
         self.assertNotEqual(first["evidence_sha256"], changed["evidence_sha256"])
         self.assertEqual(len(read_decisions(self.cfg, 12)["entries"]), 3)
         self.assertEqual(requested["decision"], "changes_requested")
+
+    def test_image_config_digest_changes_review_identity(self):
+        record = self.record()
+        first = append_decision(self.cfg, record, "reviewed")
+        changed = self.record()
+        changed["ci"]["image_config_digest"] = "sha256:" + "0" * 64
+        changed["image_config_digest"] = changed["ci"]["image_config_digest"]
+        second = append_decision(self.cfg, changed, "reviewed")
+        self.assertNotEqual(first["evidence_sha256"], second["evidence_sha256"])
+        self.assertEqual(read_decisions(self.cfg, 12)["version"], 1)
 
     def test_conflicting_transitions_fail_closed(self):
         record = self.record()
@@ -102,7 +116,10 @@ class DecisionTrailTests(unittest.TestCase):
                 lambda row: row["ci"]["checks"][0].update(exit_code=1),
                 lambda row: row["ci"]["checks"][0].update(log_sha256="wrong"),
                 lambda row: row["ci"]["checks"].reverse(),
-                lambda row: row.update(image_id="sha256:" + "0" * 64)):
+                lambda row: row.update(image_id="sha256:" + "0" * 64),
+                lambda row: row["ci"].pop("image_config_digest"),
+                lambda row: row.update(image_config_digest="sha256:" + "0" * 64),
+                lambda row: row["ci"].update(image_config_digest="sha256:" + "A" * 64)):
             with self.subTest(change=change):
                 bad = self.record()
                 change(bad)
@@ -156,6 +173,10 @@ class DecisionTrailTests(unittest.TestCase):
         bad["pr"] = True
         with self.assertRaises(ValueError):
             append_decision(self.cfg, bad, "reviewed")
+        legacy = self.record()
+        legacy["ci"].pop("image_config_digest")
+        with self.assertRaisesRegex(ValueError, "local CI identity"):
+            append_decision(self.cfg, legacy, "reviewed")
         self.assertFalse(self.path.exists())
 
 

@@ -16,6 +16,7 @@ from ermik.runtime import WorkflowError
 BASE = "a" * 40
 HEADS = ("b" * 40, "c" * 40, "d" * 40)
 IMAGE = "sha256:" + "e" * 64
+CONFIG_DIGEST = "sha256:" + "9" * 64
 BODY = "## Goal\nChange a file.\n\n## Allowed paths\nsrc/a.py\n\n## Acceptance\nWorks.\n"
 
 
@@ -34,7 +35,8 @@ class Hub:
                 "baseRefName": "main", "baseRefOid": BASE,
                 "headRefName": "work/issue-7-delivery", "headRefOid": self.head,
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
-                "body": f"Closes #7\n\nExecution image: `{IMAGE}`"}
+                "body": (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
+                         f"Execution image config: `{CONFIG_DIGEST}`")}
 
     def issue(self, _number):
         return {"body": BODY, "labels": [{"name": "queue:worker"},
@@ -68,6 +70,7 @@ class DecisionIntegrationTests(unittest.TestCase):
         for name, value in (("GitHub", self.hub),
                             ("_approved_on_github", True),
                             ("_resolve_image_id", IMAGE),
+                            ("_portable_image_digest", CONFIG_DIGEST),
                             ("main_sha", BASE),
                             ("_checkout_pr", self._checkout),
                             ("verify_changed_tree", ["src/a.py"]),
@@ -92,6 +95,7 @@ class DecisionIntegrationTests(unittest.TestCase):
     def _checks(self, *_args, **_kwargs):
         return {"result": "passed", "head": self.hub.head,
                 "committed_diff_base": BASE, "image_id": IMAGE,
+                "image_config_digest": CONFIG_DIGEST,
                 "checks": [{"command": ["true"], "exit_code": 0,
                             "log_sha256": self.log_hash, "log": "private.log"}]}
 

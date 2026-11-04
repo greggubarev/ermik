@@ -17,6 +17,8 @@ HEAD = "b" * 40
 MERGED = "c" * 40
 IMAGE = "sha256:" + "d" * 64
 OTHER_IMAGE = "sha256:" + "e" * 64
+IMAGE_CONFIG = "sha256:" + "1" * 64
+OTHER_CONFIG = "sha256:" + "2" * 64
 CHECKS = (("python", "-m", "unittest"), ("python", "-m", "compileall", "src"))
 
 
@@ -27,7 +29,8 @@ class Hub:
         self.head = HEAD
         self.writes = []
         self.on_ready = None
-        self.body = f"Closes #7\n\nExecution image: `{IMAGE}`"
+        self.body = (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
+                     f"Execution image config: `{IMAGE_CONFIG}`")
 
     def identity(self):
         return "maintainer"
@@ -77,6 +80,7 @@ class ReviewPolicyTests(unittest.TestCase):
                           CHECKS, 1, 60, (), "main")
         self.gh = Hub()
         self.image = IMAGE
+        self.config_digest = IMAGE_CONFIG
         self.image_error = None
         self.local_calls = []
         self.checkout = self.root / "work" / "reviews" / "pr-19"
@@ -95,6 +99,10 @@ class ReviewPolicyTests(unittest.TestCase):
         resolver = patch.object(review, "_resolve_image_id", side_effect=self._resolve_image)
         resolver.start()
         self.addCleanup(resolver.stop)
+        config_resolver = patch.object(review, "_portable_image_digest",
+                                       side_effect=lambda *_args: self.config_digest)
+        config_resolver.start()
+        self.addCleanup(config_resolver.stop)
 
     def _resolve_image(self, _reference):
         if self.image_error:
@@ -114,7 +122,9 @@ class ReviewPolicyTests(unittest.TestCase):
                 "checks": [{"command": list(command), "exit_code": 0,
                             "log_sha256": "f" * 64, "log": "check.log"}
                            for command in cfg.checks],
-                "image_id": self.image, "result": "passed"}
+                "image_id": self.image,
+                "image_config_digest": self.config_digest,
+                "result": "passed"}
 
     def _git(self, _path, *args, **_kwargs):
         if args[:2] == ("rev-parse", "HEAD"):
@@ -134,6 +144,8 @@ class ReviewPolicyTests(unittest.TestCase):
     def test_unchanged_policy_and_image_allow_merge(self):
         record = self._review()
         self.assertEqual(record["ci"]["image_id"], IMAGE)
+        self.assertEqual(record["published_image_id"], IMAGE)
+        self.assertEqual(record["image_config_digest"], IMAGE_CONFIG)
         self.assertEqual(len(record["ci"]["checks"]), 2)
         result = self._merge()
         self.assertEqual(result["merge_commit"], MERGED)
@@ -142,8 +154,28 @@ class ReviewPolicyTests(unittest.TestCase):
         self.assertEqual(self.local_calls[-1], {"image_id": IMAGE})
 
     def test_published_image_mismatch_blocks_review_before_checks(self):
-        self.image = OTHER_IMAGE
+        self.config_digest = OTHER_CONFIG
         with self.assertRaisesRegex(runtime.WorkflowError, "published execution image"):
+            self._review()
+        self.assertEqual(self.local_calls, [])
+
+    def test_different_local_image_id_with_matching_config_allows_review(self):
+        self.image = OTHER_IMAGE
+        record = self._review()
+        self.assertEqual(record["image_id"], OTHER_IMAGE)
+        self.assertEqual(record["published_image_id"], IMAGE)
+        self.assertEqual(record["image_config_digest"], IMAGE_CONFIG)
+        self.assertEqual(self.local_calls, [{"image_id": OTHER_IMAGE}])
+
+    def test_different_local_image_id_with_matching_config_allows_merge(self):
+        self.image = OTHER_IMAGE
+        self._review()
+        result = self._merge()
+        self.assertEqual(result["merge_commit"], MERGED)
+
+    def test_missing_published_config_blocks_review(self):
+        self.gh.body = f"Closes #7\n\nExecution image: `{IMAGE}`"
+        with self.assertRaisesRegex(runtime.WorkflowError, "config digest"):
             self._review()
         self.assertEqual(self.local_calls, [])
 
@@ -165,7 +197,22 @@ class ReviewPolicyTests(unittest.TestCase):
 
         def change_body(*args, **kwargs):
             proof = checks(*args, **kwargs)
-            self.gh.body = f"Closes #7\n\nExecution image: `{OTHER_IMAGE}`"
+            self.gh.body = (f"Closes #7\n\nExecution image: `{OTHER_IMAGE}`\n"
+                            f"Execution image config: `{IMAGE_CONFIG}`")
+            return proof
+
+        with patch.object(review, "local_checks", side_effect=change_body):
+            with self.assertRaisesRegex(runtime.WorkflowError, "during local review"):
+                self._review()
+        self.assertFalse((self.cfg.state_dir / "reviews" / "pr-19.json").exists())
+
+    def test_config_change_during_checks_blocks_review_record(self):
+        checks = self._local_checks
+
+        def change_body(*args, **kwargs):
+            proof = checks(*args, **kwargs)
+            self.gh.body = (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
+                            f"Execution image config: `{OTHER_CONFIG}`")
             return proof
 
         with patch.object(review, "local_checks", side_effect=change_body):
@@ -181,7 +228,8 @@ class ReviewPolicyTests(unittest.TestCase):
         def changed_on_final_fetch(number):
             count[0] += 1
             if count[0] == 4:
-                self.gh.body = f"Closes #7\n\nExecution image: `{OTHER_IMAGE}`"
+                self.gh.body = (f"Closes #7\n\nExecution image: `{OTHER_IMAGE}`\n"
+                                f"Execution image config: `{IMAGE_CONFIG}`")
             return original(number)
 
         self.gh.pr = changed_on_final_fetch
@@ -206,6 +254,13 @@ class ReviewPolicyTests(unittest.TestCase):
             self._merge()
         self.assertEqual(self.gh.writes, [])
 
+    def test_changed_image_config_invalidates_review_before_ready(self):
+        self._review()
+        self.config_digest = OTHER_CONFIG
+        with self.assertRaises(runtime.WorkflowError):
+            self._merge()
+        self.assertEqual(self.gh.writes, [])
+
     def test_moved_head_invalidates_review_before_ready(self):
         self._review()
         self.gh.head = "f" * 40
@@ -218,7 +273,10 @@ class ReviewPolicyTests(unittest.TestCase):
         self._review()
         original = review._load(self.cfg, 19)
         for key, value in (("checks_sha256", None), ("image_id", None),
-                           ("checks_sha256", 7), ("image_id", "demo:latest")):
+                           ("image_config_digest", None),
+                           ("published_image_id", None),
+                           ("checks_sha256", 7), ("image_id", "demo:latest"),
+                           ("image_config_digest", "demo:latest")):
             with self.subTest(key=key, value=value):
                 record = dict(original)
                 if value is None:

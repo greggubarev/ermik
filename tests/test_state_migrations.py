@@ -1,6 +1,7 @@
 """Upgrade and restore tests using the populated preview state format."""
 
 from contextlib import closing
+import hashlib
 import json
 from pathlib import Path
 import shutil
@@ -168,7 +169,7 @@ class StateMigrationTests(unittest.TestCase):
         with state.connect(root) as conn:
             self.assertEqual(state.job(conn, 7)["image_id"], image_id)
 
-    def test_v1_manifest_pr_head_decision_survives_populated_upgrade(self):
+    def test_v1_manifest_fails_closed_and_survives_populated_upgrade(self):
         root = self.base / "manifest-preview"
         create_preview(root, with_image=True)
         with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
@@ -189,8 +190,16 @@ class StateMigrationTests(unittest.TestCase):
             body_sha256=body_sha, scope_sha256=_scope_sha256(allowed),
             checks_sha256=_checks_sha256(cfg), paths=["src/worker.py"],
             checks=[{"index": 1, "result": "passed", "log_sha256": "e" * 64}],
-            image=identity["image_id"], model="provider/second", attempts=3,
+            image=identity["image_id"],
+            image_config_digest="sha256:" + "f" * 64,
+            model="provider/second", attempts=3,
             usage={"observation": "unknown"}, unknowns=["usage"])
+        manifest.pop("sha256")
+        manifest.pop("image_config_digest")
+        manifest["version"] = 1
+        manifest["sha256"] = hashlib.sha256(json.dumps(
+            manifest, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True).encode("utf-8")).hexdigest()
         manifest_path = root / "evidence" / "7" / "manifest-v1.json"
         write_evidence(manifest_path, manifest)
         manifest_bytes = manifest_path.read_bytes()
@@ -224,10 +233,9 @@ class StateMigrationTests(unittest.TestCase):
             return current, stale, current_identity
 
         before = decisions()
-        self.assertEqual(before[0]["status"], "current")
-        self.assertEqual(before[0]["pr"], identity["pr"])
-        self.assertEqual(before[0]["head"], identity["head_sha"])
-        self.assertEqual(before[1], {"status": "stale", "reason": "identity_changed"})
+        self.assertEqual(before[0], {"status": "stale",
+                                     "reason": "image_identity_missing"})
+        self.assertEqual(before[1], before[0])
         state.initialize(root)
         self.assertEqual(self.version(root), state.SCHEMA_VERSION)
         self.assertEqual(manifest_path.read_bytes(), manifest_bytes)

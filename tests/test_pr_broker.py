@@ -17,6 +17,7 @@ from ermik.pr_broker import Broker, BrokerError, handle_connection
 HEAD = "a" * 40
 BASE = "b" * 40
 IMAGE_ID = "sha256:" + "c" * 64
+IMAGE_CONFIG_DIGEST = "sha256:" + "e" * 64
 BRANCH = "work/issue-7-delivery"
 BODY = "## Allowed paths\nsrc/file.py\n\n## Goal\nFix it\n\n## Acceptance\nIt works\n"
 
@@ -27,7 +28,8 @@ class FakeApi:
         self.existing = None
         self.fail_post = False
         self.branch_sha = HEAD
-        self.pr_body = f"Execution image: `{IMAGE_ID}`"
+        self.pr_body = (f"Execution image: `{IMAGE_ID}`\n"
+                        f"Execution image config: `{IMAGE_CONFIG_DIGEST}`")
         self.issue_labels = [{"name": "queue:worker"}, {"name": "state:in-progress"}]
 
     def pr(self):
@@ -94,7 +96,8 @@ class BrokerTests(unittest.TestCase):
         self.record = {"issue": 7, "branch": BRANCH, "head": HEAD, "base": BASE,
                        "body_sha256": parse_issue(BODY).body_sha256,
                        "paths": ["src/file.py"],
-                       "ci": {"result": "passed", "image_id": IMAGE_ID}}
+                       "ci": {"result": "passed", "image_id": IMAGE_ID,
+                              "image_config_digest": IMAGE_CONFIG_DIGEST}}
         self.write_evidence()
         self.api = FakeApi()
         self.broker = Broker(repo="org/upstream", fork="person/fork",
@@ -119,6 +122,8 @@ class BrokerTests(unittest.TestCase):
         self.assertTrue(post["draft"])
         self.assertEqual(post["head"], "person:" + BRANCH)
         self.assertIn(f"Execution image: `{IMAGE_ID}`\n", post["body"])
+        self.assertIn(f"Execution image config: `{IMAGE_CONFIG_DIGEST}`\n",
+                      post["body"])
 
     def test_uncertain_post_reconciles_same_pr(self):
         self.api.fail_post = True
@@ -151,10 +156,35 @@ class BrokerTests(unittest.TestCase):
                     self.broker.create_draft(self.request)
         self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
 
+    def test_missing_or_invalid_image_config_digest_refuses_before_post(self):
+        for digest in (None, "demo:latest", "sha256:" + "A" * 64):
+            with self.subTest(digest=digest):
+                if digest is None:
+                    self.record["ci"].pop("image_config_digest", None)
+                else:
+                    self.record["ci"]["image_config_digest"] = digest
+                self.write_evidence()
+                with self.assertRaises(BrokerError):
+                    self.broker.create_draft(self.request)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
     def test_existing_pr_requires_matching_image_id(self):
         self.api.existing = self.api.pr()
         for body in ("No execution image", "Execution image: `sha256:" + "d" * 64 + "`",
                      f"Execution image: `{IMAGE_ID}`\nExecution image: `{IMAGE_ID}`"):
+            with self.subTest(body=body):
+                self.api.pr_body = body
+                with self.assertRaises(BrokerError):
+                    self.broker.create_draft(self.request)
+        self.assertFalse(any(method == "POST" for method, _, _ in self.api.calls))
+
+    def test_existing_pr_requires_matching_image_config_digest(self):
+        self.api.existing = self.api.pr()
+        image_line = f"Execution image: `{IMAGE_ID}`"
+        config_line = f"Execution image config: `{IMAGE_CONFIG_DIGEST}`"
+        for body in (image_line,
+                     image_line + "\nExecution image config: `sha256:" + "d" * 64 + "`",
+                     image_line + "\n" + config_line + "\n" + config_line):
             with self.subTest(body=body):
                 self.api.pr_body = body
                 with self.assertRaises(BrokerError):

@@ -20,6 +20,7 @@ KIMI = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY")
 GO = ModelCandidate("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY")
 BODY = "## Goal\nChange one file.\n\n## Allowed paths\nfile.txt\n\n## Acceptance\nThe file changes.\n"
 IMAGE = "sha256:" + "a" * 64
+CONFIG = "sha256:" + "e" * 64
 
 
 class StopAttempt(RuntimeError):
@@ -42,7 +43,8 @@ class Hub:
 
     def pr(self, number):
         return {"number": number,
-                "body": f"Closes #1\n\nExecution image: `{IMAGE}`"}
+                "body": f"Closes #1\n\nExecution image: `{IMAGE}`\n"
+                        f"Execution image config: `{CONFIG}`"}
 
 
 class QueueHub:
@@ -82,6 +84,9 @@ class RouteLabelTests(unittest.TestCase):
         resolver = patch.object(runtime, "_resolve_image_id", return_value="sha256:" + "a" * 64)
         resolver.start()
         self.addCleanup(resolver.stop)
+        portable = patch.object(runtime, "_portable_image_digest", return_value=CONFIG)
+        portable.start()
+        self.addCleanup(portable.stop)
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.cfg = Config("owner/repo", "owner", root / "state", root / "work",

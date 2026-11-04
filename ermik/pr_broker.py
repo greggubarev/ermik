@@ -26,6 +26,7 @@ _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _IMAGE_ID = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _PUBLISHED_IMAGE = re.compile(r"Execution image: `(sha256:[0-9a-f]{64})`\Z")
+_PUBLISHED_IMAGE_CONFIG = re.compile(r"Execution image config: `(sha256:[0-9a-f]{64})`\Z")
 _MAX_MESSAGE = 4096
 _MAX_PRIVATE_FILE_BYTES = 65536
 
@@ -124,7 +125,7 @@ class Broker:
         return matches[0] if matches else None
 
     def _validate_pr(self, row: dict, branch: str, head: str, base: str,
-                     image_id: str) -> int:
+                     image_id: str, image_config_digest: str) -> int:
         full = self.api.call("GET", f"repos/{self.repo}/pulls/{row['number']}")
         source, target = full.get("head") or {}, full.get("base") or {}
         _require(full.get("state") == "open" and full.get("draft") is True
@@ -139,14 +140,22 @@ class Broker:
         declarations = ([line for line in body.splitlines()
                          if line.startswith("Execution image:")]
                         if isinstance(body, str) else [])
+        config_declarations = ([line for line in body.splitlines()
+                                if line.startswith("Execution image config:")]
+                               if isinstance(body, str) else [])
         declaration = (_PUBLISHED_IMAGE.fullmatch(declarations[0])
                        if len(declarations) == 1 else None)
+        config_declaration = (_PUBLISHED_IMAGE_CONFIG.fullmatch(config_declarations[0])
+                              if len(config_declarations) == 1 else None)
         _require(declaration is not None and declaration.group(1) == image_id,
                  "existing PR execution image mismatch")
+        _require(config_declaration is not None
+                 and config_declaration.group(1) == image_config_digest,
+                 "existing PR execution image config mismatch")
         return full["number"]
 
     def _evidence(self, issue: int, branch: str, head: str, base: str,
-                  body_hash: str, paths: list[str]) -> str:
+                  body_hash: str, paths: list[str]) -> tuple[str, str]:
         directory = self.evidence_dir.resolve(strict=True)
         _require(directory == self.evidence_dir and directory.is_dir(),
                  "evidence directory is not canonical")
@@ -171,7 +180,11 @@ class Broker:
         image_id = evidence["ci"].get("image_id")
         _require(isinstance(image_id, str) and bool(_IMAGE_ID.fullmatch(image_id)),
                  "CI evidence lacks a valid execution image ID")
-        return image_id
+        image_config_digest = evidence["ci"].get("image_config_digest")
+        _require(isinstance(image_config_digest, str)
+                 and bool(_IMAGE_ID.fullmatch(image_config_digest)),
+                 "CI evidence lacks a valid execution image config digest")
+        return image_id, image_config_digest
 
     def create_draft(self, request: dict) -> dict:
         _require(isinstance(request, dict)
@@ -248,15 +261,18 @@ class Broker:
             for index in range(1, len(parts)):
                 _require((entries.get("/".join(parts[:index])) or {}).get("type") == "tree",
                          "nonregular parent path")
-        image_id = self._evidence(issue, branch, head, base, spec.body_sha256, paths)
+        image_id, image_config_digest = self._evidence(
+            issue, branch, head, base, spec.body_sha256, paths)
         existing = self._existing(branch)
         if existing is not None:
-            return {"pr": self._validate_pr(existing, branch, head, base, image_id),
+            return {"pr": self._validate_pr(existing, branch, head, base,
+                                            image_id, image_config_digest),
                     "created": False}
         _require(self._ref(self.repo, "main") == base
                  and self._ref(self.fork, branch) == head, "branch moved before PR")
         title = f"Issue #{issue}: {str(row.get('title') or '').strip()}"[:240]
         body = (f"Closes #{issue}\n\nExecution image: `{image_id}`\n"
+                f"Execution image config: `{image_config_digest}`\n"
                 f"Local checks passed on `{head}`.\n"
                 "Review the full diff and acceptance criteria.")
         try:
@@ -268,9 +284,11 @@ class Broker:
             existing = self._existing(branch)
             if existing is None:
                 raise
-            return {"pr": self._validate_pr(existing, branch, head, base, image_id),
+            return {"pr": self._validate_pr(existing, branch, head, base,
+                                            image_id, image_config_digest),
                     "created": False}
-        return {"pr": self._validate_pr(created, branch, head, base, image_id),
+        return {"pr": self._validate_pr(created, branch, head, base,
+                                        image_id, image_config_digest),
                 "created": True}
 
 

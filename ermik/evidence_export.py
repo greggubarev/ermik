@@ -13,8 +13,9 @@ from .evidence_store import read_evidence
 from .github import GitHub, GitHubError
 from .policy import parse_issue, validate_changed_paths
 from .review import _checks_sha256
-from .runtime import (_approved_on_github, _resolve_image_id, main_sha,
-                      published_image_id, WorkflowError)
+from .runtime import (_approved_on_github, _portable_image_digest,
+                      _resolve_image_id, main_sha, published_image_id,
+                      published_image_config_digest, WorkflowError)
 
 
 _BRANCH = re.compile(r"work/issue-(\d+)-[a-z0-9-]+\Z")
@@ -120,7 +121,11 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
                 or proof.get("head") != pr["headRefOid"]
                 or proof.get("committed_diff_base") != pr["baseRefOid"]
                 or proof.get("result") != "passed"
-                or proof.get("image_id") != job["image_id"]):
+                or proof.get("image_id") != job["image_id"]
+                or proof.get("image_config_digest") != published_image_config_digest(
+                    pr.get("body") or "")
+                or proof.get("image_config_digest") != _portable_image_digest(
+                    job["image_id"], job["image_id"])):
             raise WorkflowError("saved check evidence is stale")
         local_checks = proof.get("checks")
         if not isinstance(local_checks, list) or len(local_checks) != len(cfg.checks):
@@ -145,7 +150,9 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
                                  body_sha256=spec.body_sha256,
                                  scope_sha256=_scope_sha256(spec.allowed_paths),
                                  checks_sha256=_checks_sha256(cfg), paths=paths,
-                                 checks=checks, image=job["image_id"], model=model,
+                                 checks=checks, image=job["image_id"],
+                                 image_config_digest=proof["image_config_digest"],
+                                 model=model,
                                  attempts=attempts, usage=usage, unknowns=unknowns)
         current, _, current_spec, current_paths = _live(cfg, gh, pr_number)
         if (current["headRefOid"] != pr["headRefOid"]
@@ -153,7 +160,9 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
                 or current_paths != paths
                 or current_spec.body_sha256 != spec.body_sha256
                 or current_spec.allowed_paths != spec.allowed_paths
-                or published_image_id(current.get("body") or "") != job["image_id"]):
+                or published_image_id(current.get("body") or "") != job["image_id"]
+                or published_image_config_digest(current.get("body") or "")
+                != proof["image_config_digest"]):
             raise WorkflowError("PR changed during evidence export")
         return manifest
 
@@ -161,6 +170,8 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
 def verify_manifest(cfg: Config, pr_number: int, manifest: dict) -> dict:
     """Verify a portable observation against current GitHub and local policy."""
     record = validate_manifest(manifest)
+    if record["version"] < 2:
+        return {"status": "stale", "reason": "image_identity_missing"}
     gh = _github(cfg)
     try:
         pr, issue_number, spec, paths = _live(cfg, gh, pr_number)
@@ -168,6 +179,7 @@ def verify_manifest(cfg: Config, pr_number: int, manifest: dict) -> dict:
         return {"status": "stale", "reason": "remote_identity"}
     try:
         published_image = published_image_id(pr.get("body") or "")
+        published_config = published_image_config_digest(pr.get("body") or "")
     except WorkflowError:
         return {"status": "stale", "reason": "remote_identity"}
     expected = {"repo": cfg.repo, "issue": issue_number, "pr": pr_number,
@@ -177,15 +189,17 @@ def verify_manifest(cfg: Config, pr_number: int, manifest: dict) -> dict:
                 "body_sha256": spec.body_sha256,
                 "scope_sha256": _scope_sha256(spec.allowed_paths),
                 "checks_sha256": _checks_sha256(cfg), "paths": paths,
-                "image": published_image}
+                "image": published_image,
+                "image_config_digest": published_config}
     for key, value in expected.items():
         if record.get(key) != value:
             return {"status": "stale", "reason": "identity_changed"}
     try:
         image_id = _resolve_image_id(cfg.image)
+        image_config_digest = _portable_image_digest(cfg.image, image_id)
     except WorkflowError:
         return {"status": "stale", "reason": "image_unavailable"}
-    if image_id != record["image"]:
+    if image_config_digest != record["image_config_digest"]:
         return {"status": "stale", "reason": "image_changed"}
     return {"status": "current", "repo": cfg.repo, "issue": issue_number,
             "pr": pr_number, "head": record["head"], "sha256": record["sha256"],
