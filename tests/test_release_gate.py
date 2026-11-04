@@ -13,7 +13,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ermik.release_gate import ReleaseError, _git, build_release, main
+from ermik.release_gate import (ReleaseError, _allowed_path, _git,
+                                _sensitive_category, build_release, main)
 
 
 class ReleaseGateTests(unittest.TestCase):
@@ -59,6 +60,45 @@ class ReleaseGateTests(unittest.TestCase):
         with tarfile.open(first[0], "r:gz") as archive:
             names = archive.getnames()
         self.assertTrue(any(name.endswith("/README.md") for name in names))
+
+    def test_includes_exact_support_files(self) -> None:
+        files = {
+            ".gitattributes": "*.py text eol=lf\n",
+            ".github/workflows/release-host-verify.yml": "on: workflow_dispatch\n",
+            "scripts/bootstrap-ubuntu.sh": "#!/bin/sh\n",
+            "tests/fixtures/evidence/h1.v1.json": "{}\n",
+            "tests/fixtures/evidence/h2.v1.json": "{}\n",
+        }
+        for name, content in files.items():
+            self.write(name, content)
+        head = self.commit()
+        archive, _, _ = build_release(head, Path(self.temp.name) / "out", self.root)
+        with tarfile.open(archive, "r:gz") as contents:
+            for name, content in files.items():
+                member = next(item for item in contents if item.name.endswith("/" + name))
+                self.assertEqual(contents.extractfile(member).read(), content.encode())
+
+    def test_rejects_unlisted_support_paths(self) -> None:
+        for name in (
+            ".github/workflows/other.yml",
+            "scripts/other.sh",
+            "tests/fixtures/evidence/h3.v1.json",
+            ".git/config",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(_allowed_path(name))
+
+    def test_accepts_documented_service_home_paths(self) -> None:
+        self.write("docs/paths.md", "\n".join(
+            f"/home/{account}/ermik" for account in ("ermikctl", "ACCOUNT", "%i")) + "\n")
+        head = self.commit()
+        build_release(head, Path(self.temp.name) / "out", self.root)
+
+    def test_rejects_other_private_home_paths(self) -> None:
+        for path in ("/home/" + "alice/private/", "/root/" + "private/",
+                     "C:/Users/" + "alice/private/"):
+            with self.subTest(path=path):
+                self.assertEqual(_sensitive_category(path), "private home path")
 
     def test_rejects_dirty_checkout_and_wrong_head(self) -> None:
         head = self.git("rev-parse", "HEAD")

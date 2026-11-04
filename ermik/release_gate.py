@@ -23,8 +23,14 @@ class ReleaseError(Exception):
 
 MAX_SOURCE_BYTES = 2_000_000
 SOURCE_SUFFIXES = {".md", ".py", ".json", ".sh", ".service", ".svg"}
-ROOT_FILES = {".gitignore", "AGENTS.md", "LICENSE", "README.md", "SECURITY.md"}
+ROOT_FILES = {".gitattributes", ".gitignore", "AGENTS.md", "LICENSE", "README.md", "SECURITY.md"}
 DOCKERFILES = {"examples/Dockerfile.demo", "examples/Dockerfile.opencode"}
+SUPPORT_FILES = {
+    ".github/workflows/release-host-verify.yml",
+    "scripts/bootstrap-ubuntu.sh",
+    "tests/fixtures/evidence/h1.v1.json",
+    "tests/fixtures/evidence/h2.v1.json",
+}
 DISALLOWED_PARTS = {
     ".codex", ".env", ".git", ".local", ".secrets", "build", "dist",
     "htmlcov", "logs", "state", "workspace", "workspaces", "__pycache__",
@@ -55,7 +61,8 @@ SENSITIVE = (
     ("password assignment", re.compile(r"(?i)\bpassword\s*[:=]\s*['\"]" + r"[A-Za-z0-9_!@#$%^&*+=-]{7,}['\"]")),
     ("basic authentication URL", re.compile(r"(?i)\bhttps?://[^/\s:@]+:" + r"[^/\s@]{8,}@")),
     ("private home path", re.compile(
-        r"(?i)(?:[A-Z]:[\\/]Users[\\/]|/" + r"Users/|/" + r"home/|/" + r"root/)[^\s/\\]+[/\\]"
+        r"(?i)(?:[A-Z]:[\\/]Users[\\/]|/" + r"Users/|/" +
+        r"home/(?!ermikctl/|ACCOUNT/|%i/)|/" + r"root/)[^\s/\\]+[/\\]"
     )),
     ("unrelated project reference", re.compile(r"(?i)\b(?:special-equipment-" + r"pwa|wow " + r"modern)\b")),
 )
@@ -97,7 +104,7 @@ def _allowed_path(name: str) -> bool:
         return False
     if path.suffix.lower() in DISALLOWED_SUFFIXES:
         return False
-    if name in ROOT_FILES or name in DOCKERFILES:
+    if name in ROOT_FILES or name in DOCKERFILES or name in SUPPORT_FILES:
         return True
     if path.suffix.lower() not in SOURCE_SUFFIXES:
         return False
