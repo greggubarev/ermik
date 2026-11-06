@@ -68,6 +68,34 @@ class RoutingTests(unittest.TestCase):
                                 correction_note=None, pr_number=None,
                                 expected_base=BASE, expected_head=None)
 
+    def test_failure_reason_uses_typed_outcomes_only(self):
+        self.assertEqual(runtime._failure_reason(runtime.WorkerFailure(77)), "provider_auth")
+        self.assertEqual(runtime._failure_reason(
+            runtime.ProviderQuotaExhausted("quota")), "provider_quota")
+        self.assertEqual(runtime._failure_reason(
+            runtime.LocalCheckFailure("check")), "local_check_failed")
+        self.assertIsNone(runtime._failure_reason(runtime.WorkerFailure(75)))
+        self.assertIsNone(runtime._failure_reason(runtime.WorkflowError("secret auth failure")))
+
+    def test_only_confirmed_check_command_exit_has_typed_failure(self):
+        checkout = self.cfg.workspace / "checkout"
+        checkout.mkdir(parents=True)
+        with patch.object(runtime, "_cleanup_containers"), \
+             patch.object(runtime, "_check_git_snapshot",
+                          return_value=(checkout / "snapshot", checkout / ".git")), \
+             patch.object(runtime, "_run_capped", return_value=(1, b"check failed")):
+            with self.assertRaises(runtime.LocalCheckFailure):
+                runtime._docker(self.cfg, checkout, ("check",), issue_file=None,
+                                network=False, timeout=10, image_id=IMAGE_ID)
+        with patch.object(runtime, "_cleanup_containers"), \
+             patch.object(runtime, "_check_git_snapshot",
+                          return_value=(checkout / "snapshot", checkout / ".git")), \
+             patch.object(runtime, "_run_capped", return_value=(125, b"docker failed")):
+            with self.assertRaises(runtime.WorkflowError) as error:
+                runtime._docker(self.cfg, checkout, ("check",), issue_file=None,
+                                network=False, timeout=10, image_id=IMAGE_ID)
+        self.assertNotIsInstance(error.exception, runtime.LocalCheckFailure)
+
     def test_docker_passes_only_selected_credential_name(self):
         checkout = self.cfg.workspace / "checkout"
         checkout.mkdir(parents=True)

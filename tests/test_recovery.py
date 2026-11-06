@@ -77,6 +77,23 @@ class RecoveryTests(unittest.TestCase):
             self.assertEqual((result.status, result.next_retry_at), ("blocked", None))
             self.assertEqual(recovery.claim_due(conn, now=1000, policy=self.policy), [])
 
+    def test_retry_activation_and_new_failure_clear_old_reason(self):
+        with state.connect(self.root) as conn:
+            decision = recovery.record_failure(conn, 1, "provider", failure_id="quota-1",
+                                               resume_status="running", now=100,
+                                               policy=self.policy)
+            conn.execute("UPDATE jobs SET reason_code='provider_quota' WHERE issue=1")
+            claim = recovery.claim_due(conn, now=decision.next_retry_at,
+                                       policy=self.policy)[0]
+            self.assertTrue(recovery.activate_claim(conn, claim,
+                                                    now=decision.next_retry_at))
+            self.assertIsNone(state.job(conn, 1)["reason_code"])
+            conn.execute("UPDATE jobs SET reason_code='provider_auth' WHERE issue=1")
+            recovery.record_failure(conn, 1, "identity", failure_id="auth-2",
+                                    resume_status="running", lease_token=claim.token,
+                                    now=decision.next_retry_at, policy=self.policy)
+            self.assertIsNone(state.job(conn, 1)["reason_code"])
+
     def test_provider_quota_wait_does_not_terminally_exhaust_job(self):
         with state.connect(self.root) as conn:
             decision = recovery.record_failure(conn, 1, "provider", failure_id="quota-1",

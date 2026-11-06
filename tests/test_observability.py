@@ -88,6 +88,27 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("untrusted text", str(jobs))
         self.assertNotIn("retry_now", str(jobs))
 
+    def test_persisted_failure_reasons_override_only_matching_states(self):
+        state_dir = self.root / "typed-reasons"
+        db = initialize(state_dir)
+        with closing(sqlite3.connect(db)) as conn:
+            for issue, status, reason in ((1, "blocked", "provider_auth"),
+                                          (2, "retry_wait", "provider_quota"),
+                                          (3, "blocked", "local_check_failed"),
+                                          (4, "awaiting_review", "provider_auth")):
+                conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                             "reason_code,error) VALUES(?,?,?,?,?,?,?)",
+                             (issue, f"work-{issue}", "a" * 40, status, "[]", reason,
+                              "private token text"))
+            conn.commit()
+        jobs = {row["issue"]: row for row in status_snapshot(state_dir, max_parallel=2)["jobs"]}
+        self.assertEqual(jobs[1]["reason_code"], "provider_auth")
+        self.assertEqual(jobs[1]["next_action"], "verify_provider_credential_manually")
+        self.assertEqual(jobs[2]["reason_code"], "provider_quota")
+        self.assertEqual(jobs[3]["next_action"], "inspect_local_check_results")
+        self.assertEqual(jobs[4]["reason_code"], "pr_identity_unverified")
+        self.assertNotIn("private token text", str(jobs))
+
     def test_resource_guard_is_non_destructive(self):
         workspace = self.root / "work"
         worktrees = workspace / "jobs"

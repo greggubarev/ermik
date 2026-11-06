@@ -20,8 +20,15 @@ _RECORDED_ACTIONS = frozenset({"admitted", "claimed", "model_selected", "quota_p
                                "evidence_delivered"})
 
 
-def _job_guidance(status: str, category: str | None, pr: int | None) -> tuple[str | None, str | None]:
+def _job_guidance(status: str, category: str | None, pr: int | None,
+                  typed_reason: str | None = None) -> tuple[str | None, str | None]:
     """Offer only read-only or manual actions from durable, bounded state."""
+    if status == "blocked" and typed_reason == "provider_auth":
+        return "provider_auth", "verify_provider_credential_manually"
+    if status == "blocked" and typed_reason == "local_check_failed":
+        return "local_check_failed", "inspect_local_check_results"
+    if status == "retry_wait" and typed_reason == "provider_quota":
+        return "provider_quota", "wait_for_controller_reconciliation"
     if status == "blocked":
         return "requires_inspection", "reconcile_issue_branch_and_pr_manually"
     if status == "retry_wait":
@@ -49,7 +56,7 @@ def _read_jobs(db: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sql
         model_columns = ",".join(
             name if name in columns else f"NULL AS {name}"
             for name in ("last_model", "result_model", "attempts_count",
-                         "review_next_check_at"))
+                         "review_next_check_at", "reason_code"))
         rows = conn.execute(
             "SELECT issue, pr, status, updated_at, error IS NOT NULL AS has_error, "
             "(SELECT kind FROM events WHERE events.issue=jobs.issue AND kind IN "
@@ -136,7 +143,7 @@ def status_snapshot(state_dir: Path, *, max_parallel: int,
         job["next_retry_at"] = retry["next_retry_at"] if retry else None
         reason, next_action = _job_guidance(job["status"],
                                             retry["category"] if retry else None,
-                                            job["pr"])
+                                            job["pr"], row["reason_code"])
         job["reason_code"] = reason
         job["next_action"] = next_action
         recorded = row["last_recorded_action"]

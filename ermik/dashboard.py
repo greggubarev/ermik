@@ -28,6 +28,9 @@ _RECORDED_ACTIONS = {"admitted", "claimed", "model_selected", "quota_paused",
                      "checks_passed", "pr_published", "correction_started",
                      "evidence_delivered"}
 _GUIDANCE = {
+    "provider_auth": ("blocked", "verify_provider_credential_manually"),
+    "local_check_failed": ("blocked", "inspect_local_check_results"),
+    "provider_quota": ("retry_wait", "wait_for_controller_reconciliation"),
     "requires_inspection": ("blocked", "reconcile_issue_branch_and_pr_manually"),
     "provider_capacity_wait": ("retry_wait", "wait_for_controller_reconciliation"),
     "interrupted_retry_wait": ("retry_wait", "wait_for_controller_reconciliation"),

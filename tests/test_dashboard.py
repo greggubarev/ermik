@@ -67,14 +67,22 @@ class DashboardTests(unittest.TestCase):
              "next_action": "wait_for_controller_reconciliation",
              "last_recorded_action": ["private log"]},
             {"issue": 3, "status": "blocked", "reason_code": "<script>",
-             "next_action": "secret", "last_recorded_action": "private"}]}
+             "next_action": "secret", "last_recorded_action": "private"},
+            {"issue": 4, "status": "blocked", "reason_code": "provider_auth",
+             "next_action": "verify_provider_credential_manually"},
+            {"issue": 5, "status": "blocked", "reason_code": "local_check_failed",
+             "next_action": "inspect_local_check_results"},
+            {"issue": 6, "status": "retry_wait", "reason_code": "provider_quota",
+             "next_action": "wait_for_controller_reconciliation"}]}
         rows = public_snapshot(source)["jobs"]
         self.assertEqual(rows[0]["reason_code"], "provider_capacity_wait")
         self.assertEqual(rows[0]["last_recorded_action"], "quota_paused")
-        for row in rows[1:]:
+        for row in rows[1:3]:
             self.assertIsNone(row["reason_code"])
             self.assertIsNone(row["next_action"])
             self.assertIsNone(row["last_recorded_action"])
+        self.assertEqual([row["reason_code"] for row in rows[3:]],
+                         ["provider_auth", "local_check_failed", "provider_quota"])
         self.assertNotIn("private log", json.dumps(rows))
         self.assertNotIn("secret", json.dumps(rows))
 

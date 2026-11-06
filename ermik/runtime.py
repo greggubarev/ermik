@@ -156,11 +156,33 @@ class TransientFailure(WorkflowError):
     pass
 
 
+class LocalCheckFailure(WorkflowError):
+    pass
+
+
+class ProviderQuotaExhausted(WorkflowError):
+    pass
+
+
+class ProviderCapacityUnavailable(WorkflowError):
+    pass
+
+
 class WorkerFailure(WorkflowError):
     def __init__(self, returncode: int, usage: dict | None = None):
         self.returncode = returncode
         self.usage = usage
         super().__init__(f"worker command failed (exit {returncode})")
+
+
+def _failure_reason(exc: Exception) -> str | None:
+    if isinstance(exc, WorkerFailure) and exc.returncode == 77:
+        return "provider_auth"
+    if isinstance(exc, ProviderQuotaExhausted):
+        return "provider_quota"
+    if isinstance(exc, LocalCheckFailure):
+        return "local_check_failed"
+    return None
 
 
 def checked(args: list[str], *, cwd: Path | None = None,
@@ -551,6 +573,8 @@ def _docker(cfg: Config, checkout: Path, command: tuple[str, ...], *,
     if returncode:
         if issue_file:
             raise WorkerFailure(returncode, parse_worker_usage(output))
+        if 1 <= returncode < 125:
+            raise LocalCheckFailure("local check command failed")
         raise WorkflowError(f"Docker command failed (exit {returncode})")
     return parse_worker_usage(output) if issue_file else None
 
@@ -706,7 +730,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                         head_sha=row["head_sha"],
                         state_name="OPEN" if pr["state"] == "OPEN" else pr["state"])
         except (WorkflowError, KeyError, TypeError):
-            conn.execute("UPDATE jobs SET status='blocked',error='PR identity changed',"
+            conn.execute("UPDATE jobs SET status='blocked',error='PR identity changed',reason_code=NULL,"
                          "updated_at=CURRENT_TIMESTAMP WHERE issue=?", (row["issue"],))
             state.event(conn, row["issue"], "blocked")
             try:
@@ -715,7 +739,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 pass
             continue
         if pr["state"] == "MERGED":
-            conn.execute("UPDATE jobs SET status='merged',updated_at=CURRENT_TIMESTAMP WHERE issue=?", (row["issue"],))
+            conn.execute("UPDATE jobs SET status='merged',reason_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE issue=?", (row["issue"],))
             state.event(conn, row["issue"], "merged", head_sha=row["head_sha"])
             continue
         try:
@@ -741,7 +765,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
                 or not approved_on_github
                 or not {"queue:worker", expected_state}.issubset(labels(issue))):
-            conn.execute("UPDATE jobs SET status='blocked',error='Issue approval changed' "
+            conn.execute("UPDATE jobs SET status='blocked',error='Issue approval changed',reason_code=NULL "
                          "WHERE issue=?", (row["issue"],))
             state.event(conn, row["issue"], "blocked")
             try:
@@ -750,7 +774,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 pass
             continue
         if pr["state"] != "OPEN" or pr["headRefOid"] != row["head_sha"]:
-            conn.execute("UPDATE jobs SET status='blocked',error='PR identity changed' WHERE issue=?", (row["issue"],))
+            conn.execute("UPDATE jobs SET status='blocked',error='PR identity changed',reason_code=NULL WHERE issue=?", (row["issue"],))
             state.event(conn, row["issue"], "blocked")
             try:
                 gh.label(row["issue"], add="state:blocked", remove="state:in-progress")
@@ -1141,7 +1165,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 if leftover is not None:
                     _remove_checkout(cfg, leftover)
                 conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,"
-                             "error=NULL,result_model=?,updated_at=CURRENT_TIMESTAMP "
+                             "error=NULL,reason_code=NULL,result_model=?,updated_at=CURRENT_TIMESTAMP "
                              "WHERE issue=?",
                              (pr["headRefOid"], proof.get("base", row["base_sha"]),
                               pr_number, proof.get("model"), row["issue"]))
@@ -1189,7 +1213,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     if leftover is not None:
                         _remove_checkout(cfg, leftover)
                     conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,"
-                                 "pr=?,error=NULL,result_model=?,updated_at=CURRENT_TIMESTAMP "
+                                 "pr=?,error=NULL,reason_code=NULL,result_model=?,updated_at=CURRENT_TIMESTAMP "
                                  "WHERE issue=?",
                                  (proof["head"], proof["base"], proof["pr"],
                                   proof["model"], row["issue"]))
@@ -1222,7 +1246,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
         except (WorkflowError, ValueError, TypeError, KeyError,
                 json.JSONDecodeError, OSError):
             pass
-        conn.execute("UPDATE jobs SET status='blocked',error='Interrupted run requires inspection',"
+        conn.execute("UPDATE jobs SET status='blocked',error='Interrupted run requires inspection',reason_code=NULL,"
                      "updated_at=CURRENT_TIMESTAMP WHERE issue=?", (row["issue"],))
         state.event(conn, row["issue"], "blocked")
         try:
@@ -1308,7 +1332,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                     with state.connect(cfg.state_dir) as conn:
                         candidate = claim_model(conn, claim_order, lease_id)
                     if candidate is None:
-                        raise WorkflowError("no provider capacity is available")
+                        raise ProviderCapacityUnavailable("no provider capacity is available")
                     try:
                         with state.connect(cfg.state_dir) as conn:
                             state.event(conn, issue, "model_selected", model=candidate.ref)
@@ -1343,7 +1367,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         with state.connect(cfg.state_dir) as conn:
                             release_model(conn, lease_id)
                 if used_model is None:
-                    raise WorkflowError("all configured providers reached their quota")
+                    raise ProviderQuotaExhausted("all configured providers reached their quota")
             else:
                 with state.connect(cfg.state_dir) as conn:
                     conn.execute("UPDATE jobs SET attempts_count=attempts_count+1 WHERE issue=?",
@@ -1592,7 +1616,7 @@ def run_once(cfg: Config) -> list[dict]:
                                 else result.get("model"))
                 result["model"] = result_model
                 with state.connect(cfg.state_dir) as conn:
-                    conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,error=NULL,result_model=?,"
+                    conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,error=NULL,reason_code=NULL,result_model=?,"
                                  "updated_at=CURRENT_TIMESTAMP WHERE issue=?",
                                  (result["head"], result.get("base", expected_base),
                                   result["pr"], result_model, number))
@@ -1604,16 +1628,20 @@ def run_once(cfg: Config) -> list[dict]:
             except Exception as exc:
                 with state.connect(cfg.state_dir) as conn:
                     category = ("provider" if (isinstance(exc, WorkerFailure) and exc.returncode == 75
-                                                 or str(exc).startswith(("no provider capacity", "all configured providers")))
+                                                 or isinstance(exc, (ProviderQuotaExhausted,
+                                                                     ProviderCapacityUnavailable)))
                                 else "identity" if isinstance(exc, WorkerFailure) and exc.returncode in (77, 78)
                                 else "transient" if isinstance(exc, (WorkerFailure, TransientFailure, GitHubError))
                                 else "identity")
+                    reason_code = _failure_reason(exc)
                     decision = record_failure(conn, number, category,
                                               failure_id=f"run-{uuid.uuid4().hex}",
                                               resume_status="correcting" if pr is not None else "running",
                                               lease_token=retry_claim.token if retry_claim else None)
-                    conn.execute("UPDATE jobs SET error=? WHERE issue=?",
-                                 (type(exc).__name__, number))
+                    conn.execute("UPDATE jobs SET error=?,reason_code=? WHERE issue=?",
+                                 (type(exc).__name__,
+                                  reason_code if decision.status in ("blocked", "retry_wait") else None,
+                                  number))
                     state.event(conn, number,
                                 "retry_scheduled" if decision.status == "retry_wait" else "blocked")
                 if decision.status == "blocked":
