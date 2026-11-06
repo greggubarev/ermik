@@ -10,12 +10,14 @@ import sqlite3
 import stat
 import sys
 import time
+import uuid
 
 from .config import load_config
 from .github import GitHub
 from .review import merge, request_changes, review
 from .runtime import admit, checked, main_sha, poll, run_once
-from .observability import status_snapshot
+from .observability import QUOTA_FILE, quota_status, status_snapshot
+from .quota import probe, unknown
 from .dashboard import create_server
 from .retention import cleanup as cleanup_artifacts, inventory as inventory_artifacts
 from .evidence import MAX_BYTES, dumps_manifest, loads_manifest
@@ -74,7 +76,10 @@ def doctor(cfg) -> dict:
 
 def status(cfg) -> dict:
     snapshot = status_snapshot(cfg.state_dir, max_parallel=cfg.max_parallel,
-                               ready_issues=GitHub(cfg.repo).ready_issues())
+                               ready_issues=GitHub(cfg.repo).ready_issues(),
+                               quota_providers=(model.provider_id for model in cfg.models),
+                               quota_sources={provider: source.kind for provider, source
+                                              in cfg.quota_sources.items()})
     return {"repo": cfg.repo, **snapshot}
 
 
@@ -101,11 +106,45 @@ def _write_private_output(output: Path, data: bytes) -> None:
         raise
 
 
+def refresh_quota(cfg) -> dict:
+    """Probe only configured loopback sources and store their bounded projection."""
+    if not cfg.state_dir.is_dir() or cfg.state_dir.is_symlink():
+        raise ValueError("private state directory is required for quota refresh")
+    if os.name == "posix":
+        info = cfg.state_dir.stat()
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError("quota state directory must be private")
+    rows = []
+    for provider, source in sorted(cfg.quota_sources.items()):
+        credential = os.environ.get(source.auth_env) if source.auth_env else None
+        observed = (unknown(source.kind, "unavailable")
+                    if source.auth_env and not credential else
+                    probe(source.kind, source.port, credential))
+        rows.append({"provider": provider, **observed})
+    target = cfg.state_dir / QUOTA_FILE
+    if target.is_symlink():
+        raise ValueError("quota observation file cannot be a symlink")
+    temporary = cfg.state_dir / (QUOTA_FILE + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        _write_private_output(temporary, (json.dumps(
+            {"version": 1, "providers": rows}, sort_keys=True,
+            separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8"))
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return {"repo": cfg.repo,
+            "quota_observations": quota_status(
+                cfg.state_dir, (model.provider_id for model in cfg.models),
+                sources={provider: source.kind for provider, source
+                         in cfg.quota_sources.items()})}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local issue-to-PR workflow")
     parser.add_argument("--config", type=Path, required=True)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("doctor", "status", "run-once", "poll"):
+    for name in ("doctor", "status", "run-once", "poll", "quota-refresh", "quota-status"):
         commands.add_parser(name)
     storage_parser = commands.add_parser("storage")
     storage_parser.add_argument("--cleanup", action="store_true")
@@ -151,6 +190,14 @@ def main(argv: list[str] | None = None) -> int:
             result = doctor(cfg)
         elif args.command == "status":
             result = status(cfg)
+        elif args.command == "quota-refresh":
+            result = refresh_quota(cfg)
+        elif args.command == "quota-status":
+            result = {"repo": cfg.repo,
+                      "quota_observations": quota_status(
+                          cfg.state_dir, (model.provider_id for model in cfg.models),
+                          sources={provider: source.kind for provider, source
+                                   in cfg.quota_sources.items()})}
         elif args.command == "admit":
             result = admit(cfg, args.issue)
         elif args.command == "run-once":
@@ -185,7 +232,12 @@ def main(argv: list[str] | None = None) -> int:
                 return last["issues"]
 
             server = create_server(cfg.state_dir, max_parallel=cfg.max_parallel,
-                                   port=args.port, ready_issues=ready)
+                                   port=args.port, ready_issues=ready,
+                                   quota_providers=tuple(model.provider_id
+                                                         for model in cfg.models),
+                                   quota_sources={provider: source.kind
+                                                  for provider, source in
+                                                  cfg.quota_sources.items()})
             try:
                 server.serve_forever()
             finally:

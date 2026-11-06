@@ -159,7 +159,7 @@ On the Docker host, you can test cleanup of a container left by a stopped contro
 PYTHONPATH=. python3 tests/host_container_recovery.py ermik-opencode:1.18.35
 ```
 
-The example configuration is not ready for arbitrary projects: its `checks` validates only the demo task file. Build an image with your dependencies, configure meaningful checks, and add [JUnit XML validation](local-ci.md) if needed. See [provider routing](providers.md) for models and additional compatible accounts.
+The example configuration is not ready for arbitrary projects: its `checks` validates only the demo task file. Build an image with your dependencies, configure meaningful checks, and add [JUnit XML validation](local-ci.md) if needed. See [provider routing](providers.md) for models, additional compatible accounts, and optional local quota observations. The quota source's local server credential is separate from the model key and stays in the trusted controller environment.
 
 Create a private environment file **outside the checkout** under the controller account. It needs only keys for providers enabled in `models`. Do not put values in documentation, JSON, or command-line arguments.
 

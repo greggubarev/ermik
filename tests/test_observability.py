@@ -1,12 +1,19 @@
 from datetime import datetime, timezone
 from contextlib import closing
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 
-from ermik.observability import log_window_metadata, resource_guard, status_snapshot
+from ermik.observability import (QUOTA_FILE, log_window_metadata, resource_guard,
+                                  status_snapshot)
 from ermik.state import initialize
+from ermik.__main__ import refresh_quota
+from ermik.config import QuotaSource
+from ermik.dashboard import public_snapshot
 
 
 class ObservabilityTests(unittest.TestCase):
@@ -25,6 +32,67 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(value["slots"]["available"], 2)
         self.assertIsNone(value["attempts"])
         self.assertEqual(value["events"], [])
+        self.assertEqual(value["quota_observations"], [])
+        unsupported = status_snapshot(state_dir, max_parallel=2,
+                                      quota_providers=("other-provider",))
+        self.assertEqual(unsupported["quota_observations"], [{
+            "provider": "other-provider", "source": "unavailable",
+            "observed_at": None, "status": "unknown", "unit": "percent",
+            "windows": []}])
+
+    def test_quota_observation_stale_and_malicious_fields_are_bounded(self):
+        state_dir = self.root / "quota"
+        state_dir.mkdir()
+        row = {"provider": "opencode-go", "source": "opencode-local",
+               "observed_at": "2026-11-07T10:00:00Z", "status": "ok",
+               "unit": "percent", "windows": [{"name": "weekly",
+               "used_percent": 31.0, "reset_at": "2026-11-14T10:00:00Z"}],
+               "token": "never-display"}
+        (state_dir / QUOTA_FILE).write_text(json.dumps({"version": 1,
+            "providers": [row, {**row, "provider": "secret:malicious"}]}),
+            encoding="utf-8")
+        current = status_snapshot(state_dir, max_parallel=1,
+            observed_at=datetime(2026, 11, 7, 10, 1, tzinfo=timezone.utc),
+            quota_providers=("opencode-go",))
+        self.assertEqual(len(current["quota_observations"]), 1)
+        self.assertEqual(public_snapshot(current)["quota_observations"],
+                         current["quota_observations"])
+        self.assertNotIn("never-display", str(current))
+        removed = status_snapshot(state_dir, max_parallel=1,
+            observed_at=datetime(2026, 11, 7, 10, 1, tzinfo=timezone.utc),
+            quota_providers=("opencode-go",), quota_sources={})
+        self.assertEqual(removed["quota_observations"][0]["status"], "unknown")
+        self.assertEqual(removed["quota_observations"][0]["source"], "unavailable")
+        stale = status_snapshot(state_dir, max_parallel=1,
+            observed_at=datetime(2026, 11, 7, 10, 16, tzinfo=timezone.utc),
+            quota_providers=("opencode-go",))
+        self.assertEqual(stale["quota_observations"][0]["status"], "stale")
+        self.assertEqual(stale["quota_observations"][0]["windows"], [])
+        row["windows"][0]["reset_at"] = "2026-11-07T10:02:00Z"
+        (state_dir / QUOTA_FILE).write_text(json.dumps({"version": 1,
+            "providers": [row]}), encoding="utf-8")
+        reset = status_snapshot(state_dir, max_parallel=1,
+            observed_at=datetime(2026, 11, 7, 10, 3, tzinfo=timezone.utc),
+            quota_providers=("opencode-go",))
+        self.assertEqual(reset["quota_observations"][0]["status"], "stale")
+
+    def test_quota_refresh_stores_only_probe_projection(self):
+        state_dir = self.root / "quota-refresh"
+        state_dir.mkdir()
+        cfg = SimpleNamespace(repo="owner/repo", state_dir=state_dir,
+            quota_sources={"kimi-code": QuotaSource("kimi-code", 58627, "LOCAL_TOKEN")},
+            models=(SimpleNamespace(provider_id="kimi-code"),))
+        row = {"source": "kimi-cli-local", "observed_at": "2026-11-07T10:00:00Z",
+               "status": "ok", "unit": "percent", "windows": [{
+                   "name": "limit5h", "used_percent": 25.0,
+                   "reset_at": "2026-11-07T15:00:00Z"}]}
+        with patch.dict("os.environ", {"LOCAL_TOKEN": "test-only"}):
+            with patch("ermik.__main__.probe", return_value=row) as mocked:
+                result = refresh_quota(cfg)
+        self.assertEqual(mocked.call_args.args[0:2], ("kimi-code", 58627))
+        self.assertEqual(result["repo"], "owner/repo")
+        self.assertEqual((state_dir / QUOTA_FILE).exists(), True)
+        self.assertNotIn("LOCAL_TOKEN", (state_dir / QUOTA_FILE).read_text())
 
     def test_snapshot_redacts_error_and_counts_slots(self):
         state_dir = self.root / "state"
