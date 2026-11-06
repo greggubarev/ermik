@@ -68,7 +68,7 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(packet["goal"], "Fix the parser")
         self.assertEqual(packet["acceptance"], "Checks pass")
         self.assertEqual(packet["evidence"]["observation"], "publisher_claim")
-        self.assertNotIn("provider/model", str(packet))
+        self.assertEqual(packet["evidence"]["model_ref"], "provider/model")
         self.assertNotIn("estimated_cost", str(packet))
         self.assertNotIn("log_sha256", str(packet))
         self.assertNotIn(str(self.cfg.state_dir), str(packet))

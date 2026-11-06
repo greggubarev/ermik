@@ -18,6 +18,7 @@ _UNSAFE_TEXT = re.compile(
     r"authorization|private[ _-]?key)\b|\b[A-Za-z0-9_+=.-]{32,}\b)"
 )
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_MODEL_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
 _SAFE_PROSE = re.compile(r"[A-Za-z0-9 .,;:!?()'\"-]+\Z")
 
 
@@ -174,6 +175,9 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         evidence["checks"] = [{"index": row["index"], "result": row["result"]}
                               for row in record["checks"]]
         evidence["observation"] = "publisher_claim"
+        model = record.get("model")
+        evidence["model_ref"] = (model if isinstance(model, str) and
+                                 _MODEL_REF.fullmatch(model) else None)
         # The preceding publisher record is history, never a current check claim.
         try:
             history = _published_records(cfg, GitHub(cfg.repo), pr_number)

@@ -25,6 +25,7 @@ from .evidence_export import export_manifest, verify_manifest
 from .evidence_transport import fetch_manifest, publish_manifest
 from .delivery_loop import deliver_pending
 from .review_packet import build_review_packet
+from .maintainer_view import queue_snapshot, create_server as create_maintainer_server
 from .decision_trail import read_decisions
 from .outcomes import build_outcome_report, build_quality_snapshot
 
@@ -153,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
     storage_parser.add_argument("--max-bytes", type=int, default=268435456)
     dashboard_parser = commands.add_parser("dashboard")
     dashboard_parser.add_argument("--port", type=int, default=8765)
+    commands.add_parser("maintainer-queue")
+    maintainer_view_parser = commands.add_parser("maintainer-view")
+    maintainer_view_parser.add_argument("--port", type=int, default=8766)
     admit_parser = commands.add_parser("admit")
     admit_parser.add_argument("issue", type=int)
     review_parser = commands.add_parser("review")
@@ -190,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
             result = doctor(cfg)
         elif args.command == "status":
             result = status(cfg)
+        elif args.command == "maintainer-queue":
+            result = queue_snapshot(cfg)
         elif args.command == "quota-refresh":
             result = refresh_quota(cfg)
         elif args.command == "quota-status":
@@ -238,6 +244,13 @@ def main(argv: list[str] | None = None) -> int:
                                    quota_sources={provider: source.kind
                                                   for provider, source in
                                                   cfg.quota_sources.items()})
+            try:
+                server.serve_forever()
+            finally:
+                server.server_close()
+            return 0
+        elif args.command == "maintainer-view":
+            server = create_maintainer_server(cfg, port=args.port)
             try:
                 server.serve_forever()
             finally:
