@@ -121,7 +121,11 @@ def ledger(root: Path) -> dict:
         return {name: conn.execute(
                     "SELECT " + ("issue,branch,base_sha,head_sha,pr,status,allowed_json,"
                                  "last_request,error,updated_at,last_model,result_model,"
-                                 "attempts_count,review_next_check_at" if name == "jobs" else "*")
+                                 "attempts_count,review_next_check_at" if name == "jobs" else
+                                 "attempt_id,issue,provider_id,model_id,complete,input_tokens,"
+                                 "output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,"
+                                 "total_tokens,estimated_cost,result_code,created_at"
+                                 if name == "usage_events" else "*")
                     + f" FROM {name} ORDER BY 1").fetchall()
                 for name in ("admissions", "jobs", "retry_state", "events",
                              "usage_events")}
@@ -134,6 +138,13 @@ def evidence(root: Path) -> dict:
 
 
 class StateMigrationTests(unittest.TestCase):
+    @staticmethod
+    def v3_schema() -> str:
+        return (state.SCHEMA.replace(",\n  route_key TEXT", "")
+                .replace(",\n  phase TEXT CHECK(phase IN ('initial','correction')),\n"
+                         "  finished_at TEXT,\n"
+                         "  duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0)", ""))
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -146,6 +157,57 @@ class StateMigrationTests(unittest.TestCase):
     def version(self, root=None):
         with closing(sqlite3.connect((root or self.root) / "state.sqlite3")) as conn:
             return conn.execute("PRAGMA user_version").fetchone()[0]
+
+    def test_v3_upgrade_preserves_usage_and_rejects_unexpected_columns(self):
+        root = self.base / "v3"
+        root.mkdir()
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(self.v3_schema())
+            conn.execute("PRAGMA user_version = 3")
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(7,'work-7',?,'running','[]')", ("a" * 40,))
+            conn.execute("INSERT INTO usage_events(attempt_id,issue,provider_id,model_id,"
+                         "complete,result_code,created_at) VALUES(?,?,?,?,?,?,?)",
+                         ("old-attempt", 7, "provider", "model", 0, 75,
+                          "2026-01-01 00:00:00"))
+            conn.commit()
+        state.initialize(root)
+        with state.connect(root) as conn:
+            row = conn.execute("SELECT * FROM usage_events").fetchone()
+            self.assertEqual((row["result_code"], row["finished_at"], row["phase"],
+                              row["duration_ms"]),
+                             (75, "2026-01-01 00:00:00", None, None))
+            self.assertIsNone(state.job(conn, 7)["route_key"])
+        bad = self.base / "v3-extra"
+        bad.mkdir()
+        with closing(sqlite3.connect(bad / "state.sqlite3")) as conn:
+            conn.executescript(self.v3_schema())
+            conn.execute("ALTER TABLE jobs ADD COLUMN unexpected TEXT")
+            conn.execute("PRAGMA user_version = 3")
+            conn.commit()
+        with self.assertRaisesRegex(ValueError, "schema"):
+            state.initialize(bad)
+        self.assertEqual(self.version(bad), 3)
+
+    def test_attempt_start_is_durable_and_finish_is_idempotent(self):
+        root = self.base / "attempts"
+        with state.connect(root) as conn:
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(1,'work-1',?,'running','[]')", ("a" * 40,))
+            state.begin_attempt(conn, "attempt-1", 1, "provider", "model", "initial")
+        with state.connect(root) as conn:
+            row = conn.execute("SELECT * FROM usage_events WHERE attempt_id='attempt-1'").fetchone()
+            self.assertEqual((row["result_code"], row["finished_at"],
+                              row["estimated_cost"], row["phase"]),
+                             (-2, None, None, "initial"))
+            self.assertTrue(state.finish_attempt(conn, "attempt-1", None, 75, 12))
+            self.assertFalse(state.finish_attempt(conn, "attempt-1", None, 0, 13))
+            with self.assertRaises(sqlite3.IntegrityError):
+                state.begin_attempt(conn, "attempt-1", 1, "provider", "model", "initial")
+        with state.connect(root) as conn:
+            row = conn.execute("SELECT * FROM usage_events WHERE attempt_id='attempt-1'").fetchone()
+            self.assertEqual((row["result_code"], row["duration_ms"], row["complete"]),
+                             (75, 12, 0))
 
     def test_populated_preview_upgrade_preserves_ledger_and_evidence(self):
         self.assertEqual(self.version(), 0)
@@ -214,7 +276,7 @@ class StateMigrationTests(unittest.TestCase):
         old = "'provider_auth','provider_quota','local_check_failed'"
         new = old + ",'broker_unavailable','publication_unconfirmed','publish_credential_unavailable'"
         with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
-            conn.executescript(state.SCHEMA.replace(new, old))
+            conn.executescript(self.v3_schema().replace(new, old))
             conn.execute("PRAGMA user_version = 2")
             conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,reason_code) "
                          "VALUES(7,'work-7',?,'retry_wait','[]','provider_quota')", ("a" * 40,))
@@ -238,7 +300,7 @@ class StateMigrationTests(unittest.TestCase):
         old = "'provider_auth','provider_quota','local_check_failed'"
         new = old + ",'broker_unavailable','publication_unconfirmed','publish_credential_unavailable'"
         with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
-            conn.executescript(state.SCHEMA.replace(new, old))
+            conn.executescript(self.v3_schema().replace(new, old))
             conn.execute("PRAGMA user_version = 2")
             conn.commit()
         original = state._migrate_v2
@@ -264,7 +326,7 @@ class StateMigrationTests(unittest.TestCase):
         root.mkdir()
         old = "'provider_auth','provider_quota','local_check_failed'"
         new = old + ",'broker_unavailable','publication_unconfirmed','publish_credential_unavailable'"
-        schema = state.SCHEMA.replace(new, old)
+        schema = self.v3_schema().replace(new, old)
         schema = schema.replace(f"reason_code TEXT CHECK(reason_code IN ({old}))",
                                 "reason_code TEXT")
         with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
