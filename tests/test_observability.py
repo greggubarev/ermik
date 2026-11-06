@@ -42,15 +42,17 @@ class ObservabilityTests(unittest.TestCase):
 
     def test_quota_observation_stale_and_malicious_fields_are_bounded(self):
         state_dir = self.root / "quota"
-        state_dir.mkdir()
+        state_dir.mkdir(mode=0o700)
         row = {"provider": "opencode-go", "source": "opencode-local",
                "observed_at": "2026-11-07T10:00:00Z", "status": "ok",
                "unit": "percent", "windows": [{"name": "weekly",
                "used_percent": 31.0, "reset_at": "2026-11-14T10:00:00Z"}],
                "token": "never-display"}
-        (state_dir / QUOTA_FILE).write_text(json.dumps({"version": 1,
+        quota_file = state_dir / QUOTA_FILE
+        quota_file.write_text(json.dumps({"version": 1,
             "providers": [row, {**row, "provider": "secret:malicious"}]}),
             encoding="utf-8")
+        quota_file.chmod(0o600)
         current = status_snapshot(state_dir, max_parallel=1,
             observed_at=datetime(2026, 11, 7, 10, 1, tzinfo=timezone.utc),
             quota_providers=("opencode-go",))
@@ -78,7 +80,7 @@ class ObservabilityTests(unittest.TestCase):
 
     def test_quota_refresh_stores_only_probe_projection(self):
         state_dir = self.root / "quota-refresh"
-        state_dir.mkdir()
+        state_dir.mkdir(mode=0o700)
         cfg = SimpleNamespace(repo="owner/repo", state_dir=state_dir,
             quota_sources={"kimi-code": QuotaSource("kimi-code", 58627, "LOCAL_TOKEN")},
             models=(SimpleNamespace(provider_id="kimi-code"),))
