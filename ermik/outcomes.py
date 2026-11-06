@@ -14,6 +14,8 @@ from .decision_trail import read_decisions
 MAX_JOBS = 10000
 MAX_ATTEMPTS = 100000
 MAX_EVENTS = 100000
+USAGE_COLUMNS = ("input_tokens", "output_tokens", "reasoning_tokens",
+                 "cache_read_tokens", "cache_write_tokens", "total_tokens")
 
 
 def _utc(value: str) -> datetime:
@@ -26,6 +28,31 @@ def _utc(value: str) -> datetime:
 def _db_time(value: str) -> datetime:
     # SQLite CURRENT_TIMESTAMP is UTC but has no suffix.
     return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+
+
+def _usage_summary(rows: list[sqlite3.Row], missing_rows: int) -> dict:
+    """Sum complete attempts; shares require every attempt and a nonzero denominator.
+
+    Cache-read share divides cache reads by input plus cache reads (prompt
+    tokens). Output share divides output by reported total tokens. The latter
+    already includes every token category, so categories are never added to it.
+    """
+    known = [row for row in rows if row["complete"] == 1
+             and all(row[column] is not None for column in USAGE_COLUMNS)]
+    unknown = missing_rows + len(rows) - len(known)
+    totals = {column: sum(row[column] for row in known) for column in USAGE_COLUMNS}
+    prompt = totals["input_tokens"] + totals["cache_read_tokens"]
+    total = totals["total_tokens"]
+    return {
+        **{f"observed_{column}": value for column, value in totals.items()},
+        "unknown_token_attempts": unknown,
+        "cache_read_share_denominator_tokens": prompt,
+        "cache_read_share": totals["cache_read_tokens"] / prompt
+        if not unknown and prompt else None,
+        "output_share_denominator_tokens": total,
+        "output_share": totals["output_tokens"] / total
+        if not unknown and total else None,
+    }
 
 
 def _read_controller(cfg: Config) -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict[int, str], list[sqlite3.Row]]:
@@ -70,7 +97,9 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
     jobs in that cohort, including failed jobs and retries. The first-review
     rate divides accepted-on-first-review PRs by PRs with a recorded review.
     Elapsed mean covers accepted PRs with a known admission and merge time;
-    missing elapsed values are counted separately.
+    missing elapsed values are counted separately. Observed token categories
+    are summed over complete attempts only. Shares are unavailable if any
+    attempt has missing usage or if their documented denominator is zero.
     """
     if period is not None:
         try:
@@ -129,12 +158,7 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
         attempt_history_complete = recorded_attempts == len(rows) and bool(rows)
         missing_attempt_rows = max(0, recorded_attempts - len(rows))
         event_counts = events_by_issue.get(issue, {})
-        complete_rows = [row for row in rows if row["complete"] == 1]
-        unknown_usage = len(rows) - len(complete_rows)
-        observed_tokens = sum(row["total_tokens"] for row in complete_rows
-                              if row["total_tokens"] is not None)
-        unknown_tokens = missing_attempt_rows + unknown_usage + sum(
-            row["total_tokens"] is None for row in complete_rows)
+        usage = _usage_summary(rows, missing_attempt_rows)
         observed_cost = sum(row["estimated_cost"] for row in rows
                             if row["estimated_cost"] is not None)
         unknown_cost = missing_attempt_rows + sum(
@@ -169,8 +193,8 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
             "retry_started_events": event_counts.get("retry_started", 0),
             "quota_paused_events": event_counts.get("quota_paused", 0),
             "rate_limit_attempts": sum(row["result_code"] == 75 for row in rows),
-            "observed_tokens": observed_tokens,
-            "unknown_token_attempts": unknown_tokens,
+            "observed_tokens": usage["observed_total_tokens"],
+            **usage,
             "observed_attempt_duration_ms": sum(row["duration_ms"] for row in rows
                                                 if row["duration_ms"] is not None),
             "unknown_duration_attempts": missing_attempt_rows + sum(
@@ -187,6 +211,12 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
         accepted = sum(row["accepted"] for row in rows)
         cost = sum(row["observed_estimated_cost"] for row in rows)
         missing = sum(row["unknown_cost_attempts"] for row in rows)
+        usage_totals = {f"observed_{column}": sum(row[f"observed_{column}"]
+                         for row in rows) for column in USAGE_COLUMNS}
+        unknown_usage = sum(row["unknown_token_attempts"] for row in rows)
+        prompt = (usage_totals["observed_input_tokens"]
+                  + usage_totals["observed_cache_read_tokens"])
+        total = usage_totals["observed_total_tokens"]
         cohorts.append({
             "period": month, "route": route, "jobs": len(rows),
             "accepted_prs": accepted,
@@ -221,8 +251,15 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
             "retry_started_events": sum(row["retry_started_events"] for row in rows),
             "quota_paused_events": sum(row["quota_paused_events"] for row in rows),
             "rate_limit_attempts": sum(row["rate_limit_attempts"] for row in rows),
-            "observed_tokens": sum(row["observed_tokens"] for row in rows),
-            "unknown_token_attempts": sum(row["unknown_token_attempts"] for row in rows),
+            "observed_tokens": total,
+            **usage_totals,
+            "unknown_token_attempts": unknown_usage,
+            "cache_read_share_denominator_tokens": prompt,
+            "cache_read_share": usage_totals["observed_cache_read_tokens"] / prompt
+            if not unknown_usage and prompt else None,
+            "output_share_denominator_tokens": total,
+            "output_share": usage_totals["observed_output_tokens"] / total
+            if not unknown_usage and total else None,
             "observed_attempt_duration_ms": sum(row["observed_attempt_duration_ms"]
                                                 for row in rows),
             "unknown_duration_attempts": sum(row["unknown_duration_attempts"]

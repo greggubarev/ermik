@@ -32,17 +32,84 @@ class OutcomeTests(unittest.TestCase):
                          (issue, f"work/{issue}", "a" * 40, head, pr, "merged",
                           '["src"]', route))
 
-    def attempt(self, issue, name, code, *, cost=None, tokens=None, phase="initial",
-                pending=False, provider="provider"):
+    def attempt(self, issue, name, code, *, cost=None, tokens=None, usage=None,
+                phase="initial", pending=False, provider="provider"):
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("UPDATE jobs SET attempts_count=attempts_count+1 WHERE issue=?",
                          (issue,))
             state.begin_attempt(conn, name, issue, provider, "model", phase)
             if not pending:
-                metric = ({"complete": True, "input": tokens, "output": 0,
+                metric = (usage if usage is not None else
+                          {"complete": True, "input": tokens, "output": 0,
+                           "reasoning": 0, "cache_read": 0, "cache_write": 0,
                            "total": tokens, "estimated_cost": cost}
                           if tokens is not None else None)
                 state.finish_attempt(conn, name, metric, code, 10)
+
+    def test_usage_shares_include_failed_retry_and_correction_attempts(self):
+        head = "b" * 40
+        self.add_job(1, 11, "route:fast", head)
+        self.add_job(2, 12, "route:steady", head)
+        self.attempt(1, "failed", 75, cost=0.1, usage={
+            "complete": True, "input": 10, "output": 2, "reasoning": 1,
+            "cache_read": 8, "cache_write": 1, "total": 22,
+            "estimated_cost": 0.1})
+        self.attempt(1, "retry", 0, cost=0.2, phase="initial", usage={
+            "complete": True, "input": 20, "output": 4, "reasoning": 2,
+            "cache_read": 12, "cache_write": 2, "total": 40,
+            "estimated_cost": 0.2})
+        self.attempt(1, "correction", 0, cost=0.3, phase="correction", usage={
+            "complete": True, "input": 30, "output": 6, "reasoning": 3,
+            "cache_read": 20, "cache_write": 3, "total": 62,
+            "estimated_cost": 0.3})
+        self.attempt(2, "steady", 0, cost=0.4, usage={
+            "complete": True, "input": 5, "output": 5, "reasoning": 0,
+            "cache_read": 0, "cache_write": 0, "total": 10,
+            "estimated_cost": 0.4})
+        with state.connect(self.cfg.state_dir) as conn:
+            state.event(conn, 1, "retry_started")
+        self.journal(1, 11, head, [(head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        self.journal(2, 12, head, [(head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        report = build_outcome_report(self.cfg, self.maintainer)
+        job, fast = report["jobs"][0], report["cohorts"][0]
+        for row in (job, fast):
+            self.assertEqual(tuple(row[f"observed_{name}_tokens"] for name in
+                                   ("input", "output", "reasoning", "cache_read",
+                                    "cache_write", "total")),
+                             (60, 12, 6, 40, 6, 124))
+            self.assertEqual((row["cache_read_share_denominator_tokens"],
+                              row["cache_read_share"],
+                              row["output_share_denominator_tokens"],
+                              row["output_share"], row["unknown_token_attempts"]),
+                             (100, 0.4, 124, 12 / 124, 0))
+        self.assertEqual((fast["retry_started_events"], fast["correction_attempts"],
+                          fast["estimated_cost_per_accepted_pr"]), (1, 1, 0.6))
+        self.assertEqual((report["cohorts"][1]["route"],
+                          report["cohorts"][1]["cache_read_share"]),
+                         ("route:steady", 0.0))
+
+    def test_partial_usage_makes_shares_unknown_but_preserves_observed_counts(self):
+        head = "b" * 40
+        self.add_job(1, 11, "route:fast", head)
+        self.attempt(1, "known", 0, cost=0.1, usage={
+            "complete": True, "input": 10, "output": 2, "reasoning": 0,
+            "cache_read": 5, "cache_write": 0, "total": 17,
+            "estimated_cost": 0.1})
+        self.attempt(1, "partial", 1, cost=0.2, usage={
+            "complete": True, "input": 10, "output": 2, "reasoning": 0,
+            "cache_write": 0, "total": 12, "estimated_cost": 0.2})
+        self.journal(1, 11, head, [(head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        report = build_outcome_report(self.cfg, self.maintainer)
+        for row in (report["jobs"][0], report["cohorts"][0]):
+            self.assertEqual((row["observed_input_tokens"],
+                              row["observed_cache_read_tokens"],
+                              row["unknown_token_attempts"]), (10, 5, 1))
+            self.assertIsNone(row["cache_read_share"])
+            self.assertIsNone(row["output_share"])
+        self.assertEqual(report["cohorts"][0]["estimated_cost_per_accepted_pr"], 0.3)
 
     def journal(self, issue, pr, head, decisions):
         path = self.maintainer / "decision-trail" / f"pr-{pr}.json"
@@ -118,6 +185,8 @@ class OutcomeTests(unittest.TestCase):
         self.assertFalse(row["accepted"])
         self.assertEqual((row["pending_attempts"], row["unknown_token_attempts"],
                           row["unknown_cost_attempts"]), (1, 1, 1))
+        self.assertIsNone(row["cache_read_share"])
+        self.assertIsNone(group["output_share"])
         self.assertIsNone(group["estimated_cost_per_accepted_pr"])
         self.assertIsNone(group["billed_cost"])
         self.assertEqual(group["first_review_rate_denominator"], 0)
@@ -168,6 +237,22 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(group["missing_attempt_rows"], 2)
         self.assertEqual(group["observed_estimated_cost"], 0.3)
         self.assertIsNone(group["estimated_cost_per_accepted_pr"])
+        self.assertIsNone(group["cache_read_share"])
+        self.assertIsNone(group["output_share"])
+
+    def test_zero_token_denominators_have_unknown_shares(self):
+        head = "b" * 40
+        self.add_job(1, 11, "route:fast", head)
+        self.attempt(1, "empty", 0, cost=0, tokens=0)
+        self.journal(1, 11, head, [(head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        report = build_outcome_report(self.cfg, self.maintainer)
+        for row in (report["jobs"][0], report["cohorts"][0]):
+            self.assertEqual((row["unknown_token_attempts"],
+                              row["cache_read_share_denominator_tokens"],
+                              row["output_share_denominator_tokens"]), (0, 0, 0))
+            self.assertIsNone(row["cache_read_share"])
+            self.assertIsNone(row["output_share"])
 
     def test_re_reviewed_head_is_not_first_review_acceptance(self):
         old, new = "b" * 40, "c" * 40

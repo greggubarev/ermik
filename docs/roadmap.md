@@ -52,7 +52,7 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 **Goal:** Compare configured routes using observed outcomes and resource use over complete PR cycles.
 
-The [outcome ledger](https://github.com/greggubarev/ermik/issues/16) must precede any [measured routing policy](https://github.com/greggubarev/ermik/issues/17). [Quota observations](https://github.com/greggubarev/ermik/issues/35) and [context-efficiency measures](https://github.com/greggubarev/ermik/issues/36) must distinguish verified counters from estimates and missing data.
+The [outcome ledger](https://github.com/greggubarev/ermik/issues/16) now links two live provider routes through draft PRs, separate review, explicit merge, and a bounded report. [Context-efficiency measures](https://github.com/greggubarev/ermik/issues/36) add aggregate cache and output shares without exposing session content. A [measured routing policy](https://github.com/greggubarev/ermik/issues/17) and [quota observations](https://github.com/greggubarev/ermik/issues/35) still need their own gates; the small two-route trial does not set a routing default.
 
 The [live provider failure matrix](https://github.com/greggubarev/ermik/issues/6) remains open for each advertised route: bounded authentication, quota, timeout, and malformed-response observations, including cooldown, slot release, retry behavior, and redaction. Successful file tasks alone do not complete this matrix; route failure handling remains experimental until it passes.
 
@@ -68,4 +68,4 @@ The [optional maintainer view](https://github.com/greggubarev/ermik/issues/18) d
 
 ## Outside the current claim
 
-Multiple controller hosts sharing one queue or state database are unsupported. Project correctness beyond configured checks and maintainer review is unverified. Provider authentication, quota, and timeout behavior has not been exercised for every compatible endpoint. Comparative cost reporting and the optional maintainer view remain open work. The cross-store image trial covers the tested Docker versions and image, not every image format. These are explicit limits of the preview, not implied promises in the phases above.
+Multiple controller hosts sharing one queue or state database are unsupported. Project correctness beyond configured checks and maintainer review is unverified. Provider authentication, quota, and timeout behavior has not been exercised for every compatible endpoint. Automated policy choices, official quota observations, and the optional maintainer view remain open work. The cross-store image trial covers the tested Docker versions and image, not every image format. These are explicit limits of the preview, not implied promises in the phases above.
