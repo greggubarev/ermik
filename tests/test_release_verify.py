@@ -54,9 +54,10 @@ class ReleaseVerifyTests(unittest.TestCase):
             item = tarfile.TarInfo(stem + "/README.md")
             item.size = len(payload)
             archive.addfile(item, io.BytesIO(payload))
+        self.raw_tar = raw.getvalue()
         with self.archive.open("wb") as target:
-            with gzip.GzipFile(fileobj=target, mode="wb", mtime=0) as writer:
-                writer.write(raw.getvalue())
+            with gzip.GzipFile(fileobj=target, mode="wb", filename="", mtime=0) as writer:
+                writer.write(self.raw_tar)
         digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         self.checksum = self.root / (stem + ".sha256")
         self.checksum.write_text(f"{digest}  {self.archive.name}\n", encoding="ascii")
@@ -67,9 +68,10 @@ class ReleaseVerifyTests(unittest.TestCase):
 
     def _verify(self):
         with patch.object(release_verify, "_release"), \
-             patch.object(release_verify.release_gate, "_tree",
-                          return_value=[("README.md", "100644", "blob-id")]), \
-             patch.object(release_verify.release_gate, "_git", return_value=b"release source"):
+             patch.object(release_verify.release_gate, "_scan",
+                          return_value={"README.md": b"release source"}), \
+             patch.object(release_verify.release_gate, "_git", return_value=self.raw_tar), \
+             patch.object(release_verify.release_gate, "_inventory", return_value={}):
             release_verify.verify(COMMIT, "v0.3.0", self.windows, self.linux,
                                   self.docker, self.manifest, self.archive, self.checksum)
 
@@ -81,7 +83,7 @@ class ReleaseVerifyTests(unittest.TestCase):
             item.size = len(payload)
             archive.addfile(item, io.BytesIO(payload))
         with self.archive.open("wb") as target:
-            with gzip.GzipFile(fileobj=target, mode="wb", mtime=0) as writer:
+            with gzip.GzipFile(fileobj=target, mode="wb", filename="", mtime=0) as writer:
                 writer.write(raw.getvalue())
         digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
@@ -142,6 +144,27 @@ class ReleaseVerifyTests(unittest.TestCase):
         self._replace_archive(b"altered source")
         with self.assertRaisesRegex(release_verify.BundleError, "archive_tree_mismatch"):
             self._verify()
+
+    def test_rejects_hidden_payload_after_tar_end(self):
+        stream = io.BytesIO()
+        with gzip.GzipFile(fileobj=stream, mode="wb", mtime=0) as writer:
+            writer.write(self.raw_tar + b"hidden payload")
+        self.archive.write_bytes(stream.getvalue())
+        digest = hashlib.sha256(stream.getvalue()).hexdigest()
+        manifest = json.loads(self.manifest.read_text(encoding="utf-8"))
+        manifest["archive_sha256"] = digest
+        self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        self.checksum.write_text(f"{digest}  {self.archive.name}\n", encoding="ascii")
+        with self.assertRaisesRegex(release_verify.BundleError, "archive_tree_mismatch"):
+            self._verify()
+
+    def test_rejects_failed_history_scan_without_exposing_detail(self):
+        with patch.object(release_verify, "_release"), \
+             patch.object(release_verify.release_gate, "_scan",
+                          side_effect=release_verify.release_gate.ReleaseError("private value")):
+            with self.assertRaisesRegex(release_verify.BundleError, "source_scan_failed"):
+                release_verify.verify(COMMIT, "v0.3.0", self.windows, self.linux,
+                                      self.docker, self.manifest, self.archive, self.checksum)
 
     def test_rejects_excess_unpacked_archive_size(self):
         with patch.object(release_verify, "_MAX_UNPACKED", 10):

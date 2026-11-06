@@ -39,7 +39,7 @@ The output files are `ermik-source-<sha12>.tar.gz`, `ermik-source-<sha12>.sha256
 
 ## Verify one complete bundle
 
-Copy the Windows, Linux, and Docker JSON reports to the release host. From a clean checkout at the candidate commit, run the local bundle verifier before creating a tag. Replace the example paths and tag with the actual files and previous published tag:
+Copy the Windows, Linux, and Docker JSON reports to the release host. Generate the source archive and run the bundle verifier on that same release host and toolchain: it compares the archive with canonical bytes regenerated there. From a clean checkout at the candidate commit, run the verifier before creating a tag. Replace the example paths and tag with the actual files and previous published tag:
 
 ```sh
 python3 -m ermik.release_verify \

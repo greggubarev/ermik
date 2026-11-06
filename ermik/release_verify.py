@@ -8,10 +8,9 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import subprocess
-import tarfile
 
 from . import release_gate
 
@@ -161,58 +160,29 @@ def _artifacts(commit: str, manifest_path: Path, archive_path: Path,
     if _read(checksum_path, 256, "checksum_invalid") not in (expected, expected[:-1] + b"\r\n"):
         raise BundleError("checksum_invalid")
     try:
-        tree = {name: (mode, blob) for name, mode, blob in release_gate._tree(commit, Path.cwd())}
-    except (release_gate.ReleaseError, OSError, ValueError):
-        raise BundleError("git_check_failed") from None
-    if not tree or len(tree) > _MAX_FILES:
-        raise BundleError("archive_tree_mismatch")
-    try:
-        if not archive_path.is_file() or archive_path.stat().st_size > _MAX_ARCHIVE:
-            raise BundleError("archive_invalid")
-        digest = hashlib.sha256()
-        with archive_path.open("rb") as source:
-            while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
-        if digest.hexdigest() != manifest["archive_sha256"]:
-            raise BundleError("archive_hash_mismatch")
-        with gzip.open(archive_path, "rb") as source:
-            raw_tar = source.read(_MAX_TAR_BYTES + 1)
+        files = release_gate._scan(commit, Path.cwd())
+        if (not files or len(files) > _MAX_FILES
+                or sum(map(len, files.values())) > _MAX_UNPACKED):
+            raise BundleError("archive_size_limit")
+        raw_tar = release_gate._git(
+            "-c", "core.autocrlf=false", "archive", "--format=tar",
+            f"--prefix={stem}/", commit, cwd=Path.cwd())
         if len(raw_tar) > _MAX_TAR_BYTES:
             raise BundleError("archive_size_limit")
-        names: set[str] = set()
-        unpacked = 0
-        with tarfile.open(fileobj=io.BytesIO(raw_tar), mode="r:") as archive:
-            for member in archive:
-                if member.isdir():
-                    continue
-                prefix = stem + "/"
-                if not member.isfile() or not member.name.startswith(prefix):
-                    raise BundleError("archive_invalid")
-                name = member.name[len(prefix):]
-                parts = PurePosixPath(name).parts
-                if (not name or name in names or len(names) >= _MAX_FILES
-                        or member.size > 2_000_000
-                        or any(part in {".", "..", ""} for part in parts)):
-                    raise BundleError("archive_invalid")
-                unpacked += member.size
-                if unpacked > _MAX_UNPACKED:
-                    raise BundleError("archive_size_limit")
-                if name not in tree or member.mode & 0o777 != int(tree[name][0], 8) & 0o777:
-                    raise BundleError("archive_tree_mismatch")
-                try:
-                    original = release_gate._git("cat-file", "blob", tree[name][1], cwd=Path.cwd())
-                except release_gate.ReleaseError:
-                    raise BundleError("git_check_failed") from None
-                source = archive.extractfile(member)
-                if source is None or source.read(member.size + 1) != original:
-                    raise BundleError("archive_tree_mismatch")
-                names.add(name)
-        if len(names) != manifest["file_count"]:
-            raise BundleError("manifest_count_mismatch")
-        if names != tree.keys():
-            raise BundleError("archive_tree_mismatch")
-    except (OSError, tarfile.TarError, EOFError):
-        raise BundleError("archive_invalid") from None
+        release_gate._verify_archive(raw_tar, f"{stem}/", files)
+    except (release_gate.ReleaseError, OSError, ValueError):
+        raise BundleError("source_scan_failed") from None
+    if manifest["file_count"] != len(files) or manifest["inventory"] != release_gate._inventory(files):
+        raise BundleError("manifest_count_mismatch")
+    stream = io.BytesIO()
+    with gzip.GzipFile(fileobj=stream, mode="wb", filename="", mtime=0,
+                       compresslevel=9) as writer:
+        writer.write(raw_tar)
+    actual = _read(archive_path, _MAX_ARCHIVE, "archive_invalid")
+    if hashlib.sha256(actual).hexdigest() != manifest["archive_sha256"]:
+        raise BundleError("archive_hash_mismatch")
+    if actual != stream.getvalue():
+        raise BundleError("archive_tree_mismatch")
 
 
 def verify(commit: str, previous_tag: str, windows: Path, linux: Path,
