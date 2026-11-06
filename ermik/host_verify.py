@@ -172,6 +172,7 @@ def verify(*, docker: bool = False, image: str | None = None) -> dict:
                 if image else None)
     report = {
         "commit": commit,
+        "platform": "windows" if os.name == "nt" else "linux" if sys.platform.startswith("linux") else "other",
         "dirty": dirty_before,
         "python": sys.version.split()[0],
         "docker": {"server_version": docker_version, "image": image,

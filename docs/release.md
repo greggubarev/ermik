@@ -15,7 +15,7 @@ docker build -f examples/Dockerfile.demo -t ermik-demo:verification .
 python3 -m ermik.host_verify --docker --image ermik-demo:verification > "$HOME/ermik-verification/docker-linux.json"
 ```
 
-On Windows, use `py -3 -m ermik.host_verify` from the same commit and save its JSON outside the checkout. Run the Docker command there only if the Docker daemon is available. The gate permits only documented platform skips; it does not silently treat missing Git or Docker as a passing check. The `--docker` option is required to make Docker smoke part of the result. Review the recorded failure and skip counts before publishing.
+On Windows, use `py -3 -m ermik.host_verify` from the same commit and save its JSON outside the checkout. Run the Docker command there only if the Docker daemon is available. The gate permits only documented platform skips; it does not silently treat missing Git or Docker as a passing check. The `--docker` option is required to make Docker smoke part of the result. Pass the reports to the bundle verifier below; a missing or failed report blocks publication.
 
 For a project check that produces JUnit XML, require a minimum number of **executed** cases. Skipped cases do not count toward that minimum:
 
@@ -36,6 +36,23 @@ python3 -m ermik.release_gate --commit "$(git rev-parse HEAD)" --output /private
 ```
 
 The output files are `ermik-source-<sha12>.tar.gz`, `ermik-source-<sha12>.sha256`, and `ermik-source-<sha12>.manifest.json`, where `<sha12>` is the first 12 characters of the commit ID. The manifest records the full commit, archive digest, file count, and an inventory of bundled and referenced components. Verify the checksum and inspect the manifest and archive file list before publication. Review the tree and reachable Git history for credentials, local paths, and unrelated project references; findings identify locations without printing matching values. Confirm the archive contains only the intended tracked source, documentation, examples, license, and notices. Do not add a local config, provider credential, token, state database, log, worktree, checkout, backup, or another project's files. Preserve the manifest and checksum with the release record. Re-run the gate for every changed commit; do not reuse an earlier result.
+
+## Verify one complete bundle
+
+Copy the Windows, Linux, and Docker JSON reports to the release host. Generate the source archive and run the bundle verifier on that same release host and toolchain: it compares the archive with canonical bytes regenerated there. From a clean checkout at the candidate commit, run the verifier before creating a tag. Replace the example paths and tag with the actual files and previous published tag:
+
+```sh
+python3 -m ermik.release_verify \
+  --commit FULL_CANDIDATE_SHA --previous-tag PREVIOUS_PUBLISHED_TAG \
+  --windows /private/release/unit-windows.json \
+  --linux /private/release/unit-linux.json \
+  --docker /private/release/docker-linux.json \
+  --manifest /private/release/ermik-source-SHA12.manifest.json \
+  --archive /private/release/ermik-source-SHA12.tar.gz \
+  --checksum /private/release/ermik-source-SHA12.sha256
+```
+
+The command fails for a missing report, mixed commit, dirty checkout, failed or empty test run, unexpected skip, missing container smoke or recovery, or inconsistent archive and checksum. It checks report contents, not the physical identity of the machines that produced them; keep the original reports and host records. Review the accepted Issue/PR and actual behavior introduced after the previous tag separately. Run a disposable Issue-to-PR correction cycle for changes that cross publication or review boundaries, and an isolated backup/upgrade/rollback trial when state migration changes. A green bundle alone does not establish application correctness.
 
 ```sh
 cd /private/ermik-release
