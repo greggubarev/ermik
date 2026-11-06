@@ -18,11 +18,17 @@ class MaintainerViewTests(unittest.TestCase):
                           (("check",),), 1, 60, (), "main")
         self.pulls = [{"number": 12, "head": {"ref": "work/issue-7-fix"}}]
 
-    def snapshot(self, packet, *, ready=(), labels=("state:in-progress", "route:local")):
+    def snapshot(self, packet, *, ready=(), blocked=(),
+                 labels=("queue:worker", "state:in-progress", "route:local")):
         with (patch("ermik.maintainer_view.GitHub") as gh,
               patch("ermik.maintainer_view.build_review_packet", return_value=packet)):
-            gh.return_value.ready_issues.return_value = list(ready)
-            gh.return_value._pages.return_value = self.pulls
+            def listing(endpoint):
+                if "state%3Aready" in endpoint:
+                    return [{"number": issue} for issue in ready]
+                if "state%3Ablocked" in endpoint:
+                    return [{"number": issue} for issue in blocked]
+                return self.pulls
+            gh.return_value.api.side_effect = listing
             gh.return_value.issue.return_value = {
                 "labels": [{"name": label} for label in labels]}
             return queue_snapshot(self.cfg), gh.return_value.issue.call_count
@@ -49,7 +55,7 @@ class MaintainerViewTests(unittest.TestCase):
         for status in ("missing", "stale", "incomplete"):
             with self.subTest(status=status):
                 row = self.snapshot(self.packet(status, "stale", status),
-                                    labels=("state:blocked",))[0]["items"][0]
+                                    labels=("queue:worker", "state:blocked"))[0]["items"][0]
                 self.assertEqual(row["remote_label_state"], "blocked")
                 self.assertEqual(row["checks"], "unverified")
                 self.assertEqual(row["next_action"], "reconcile_evidence_then_review")
@@ -70,10 +76,37 @@ class MaintainerViewTests(unittest.TestCase):
 
     def test_admitted_waiting_has_no_claimed_runtime(self):
         self.pulls = []
-        row = self.snapshot({}, ready=(7,))[0]["items"][0]
+        row = self.snapshot({}, ready=(7,), labels=(
+            "queue:worker", "state:ready"))[0]["items"][0]
         self.assertEqual(row["remote_label_state"], "ready")
         self.assertEqual(row["evidence"], "missing")
         self.assertEqual(row["controller_runtime"], "unverified")
+
+    def test_ready_and_blocked_without_pr_show_verified_route(self):
+        self.pulls = []
+        ready = self.snapshot({}, ready=(7,), labels=(
+            "queue:worker", "state:ready", "route:local"))[0]["items"][0]
+        self.assertEqual(ready["remote_label_state"], "ready")
+        self.assertEqual(ready["model_route_label"], "route:local")
+        blocked = self.snapshot({}, blocked=(8,), labels=(
+            "queue:worker", "state:blocked", "route:local"))[0]["items"][0]
+        self.assertEqual(blocked["issue"], 8)
+        self.assertEqual(blocked["remote_label_state"], "blocked")
+        self.assertEqual(blocked["model_route_label"], "route:local")
+        self.assertEqual(blocked["next_action"],
+                         "reconcile_issue_branch_and_pr_manually")
+        self.assertEqual(blocked["checks"], "unverified")
+
+    def test_listing_overflow_probes_only_one_extra_item(self):
+        with patch("ermik.maintainer_view.GitHub") as gh:
+            gh.return_value.api.side_effect = lambda endpoint: (
+                [{"number": n} for n in range(1, 101)]
+                if "per_page=100&page=1" in endpoint else [{"number": 101}])
+            with self.assertRaisesRegex(ValueError, "display limit"):
+                queue_snapshot(self.cfg)
+            calls = [call.args[0] for call in gh.return_value.api.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn("per_page=1&page=101", calls[1])
 
     def test_html_escapes_and_http_rejects_writes_and_external_host(self):
         html = render_html({"items": [{key: "<script>" for key in (

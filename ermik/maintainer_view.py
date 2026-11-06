@@ -30,13 +30,45 @@ def _action(packet: dict) -> str:
     return "decide_on_reviewed_head_manually"
 
 
+def _issue_labels(gh: GitHub, issue: int) -> set[str]:
+    record = gh.issue(issue)
+    return {row["name"] for row in record.get("labels", [])
+            if isinstance(row, dict) and isinstance(row.get("name"), str)}
+
+
+def _route(labels: set[str]) -> str:
+    routes = {label for label in labels if _ROUTE.fullmatch(label)}
+    return next(iter(routes)) if len(routes) == 1 else "unknown"
+
+
+def _bounded_rows(gh: GitHub, endpoint: str, remaining: int) -> list[dict]:
+    """Read at most one item beyond the remaining display budget."""
+    if remaining < 0:
+        raise ValueError("maintainer queue exceeds display limit")
+    size = min(100, remaining + 1)
+    first = gh.api(f"{endpoint}&per_page={size}&page=1")
+    if not isinstance(first, list) or any(not isinstance(row, dict) for row in first):
+        raise ValueError("invalid GitHub listing")
+    if len(first) > remaining:
+        raise ValueError("maintainer queue exceeds display limit")
+    if len(first) == size:
+        # Only possible with a full 100-row page. Probe the 101st row using
+        # one-item pagination; do not fetch another 100 rows.
+        extra = gh.api(f"{endpoint}&per_page=1&page=101")
+        if not isinstance(extra, list) or extra:
+            raise ValueError("maintainer queue exceeds display limit")
+    return first
+
+
 def queue_snapshot(cfg) -> dict:
     """Read live GitHub state; no controller runtime or remote check is inferred."""
     gh = GitHub(cfg.repo)
-    ready = gh.ready_issues()
-    pulls = gh._pages("pulls?state=open")
-    if len(ready) + len(pulls) > MAX_ITEMS:
-        raise ValueError("maintainer queue exceeds display limit")
+    ready_rows = _bounded_rows(gh, "issues?state=open&labels=queue%3Aworker%2Cstate%3Aready",
+                               MAX_ITEMS)
+    ready = [row.get("number") for row in ready_rows if "pull_request" not in row]
+    blocked = _bounded_rows(gh, "issues?state=open&labels=queue%3Aworker%2Cstate%3Ablocked",
+                            MAX_ITEMS - len(ready_rows))
+    pulls = _bounded_rows(gh, "pulls?state=open", MAX_ITEMS - len(ready_rows) - len(blocked))
     rows = []
     represented = set()
     for pr in pulls:
@@ -55,17 +87,12 @@ def queue_snapshot(cfg) -> dict:
         remote_state = "unknown"
         route = "unknown"
         if verified:
-            issue_record = gh.issue(issue)
-            labels = {row.get("name") for row in issue_record.get("labels", [])
-                      if isinstance(row, dict)}
+            labels = _issue_labels(gh, issue)
             if "state:in-progress" in labels:
                 remote_state = "in_progress"
             elif "state:blocked" in labels:
                 remote_state = "blocked"
-            routes = {label for label in labels if isinstance(label, str)
-                      and _ROUTE.fullmatch(label)}
-            if len(routes) == 1:
-                route = next(iter(routes))
+            route = _route(labels)
         evidence = packet.get("evidence") or {}
         review = packet.get("review") or {}
         rows.append({"issue": issue if verified else None, "pr": number,
@@ -92,14 +119,26 @@ def queue_snapshot(cfg) -> dict:
                      else "unknown",
                      "next_action": _action(packet) if verified else
                      "reconcile_remote_identity_manually"})
-    for issue in ready:
+    queued = [(issue, "ready") for issue in ready]
+    queued.extend((row.get("number"), "blocked") for row in blocked
+                  if isinstance(row, dict) and "pull_request" not in row)
+    for issue, state in queued:
+        if type(issue) is not int or issue <= 0:
+            raise ValueError("invalid queued Issue number")
         if issue not in represented:
+            labels = _issue_labels(gh, issue)
+            expected = "state:ready" if state == "ready" else "state:blocked"
+            verified_state = state if {"queue:worker", expected}.issubset(labels) else "unknown"
             rows.append({"issue": issue, "pr": None, "head": None,
-                         "remote_label_state": "ready", "controller_runtime": "unverified",
-                         "model_route_label": "unknown", "evidence": "missing",
+                         "remote_label_state": verified_state,
+                         "controller_runtime": "unverified",
+                         "model_route_label": _route(labels) if verified_state != "unknown"
+                         else "unknown", "evidence": "missing",
                          "publisher_model_claim": None,
                          "checks": "unverified", "review": "missing",
-                         "next_action": "wait_for_controller_or_reconcile_manually"})
+                         "next_action": "wait_for_controller_or_reconcile_manually"
+                         if verified_state == "ready" else
+                         "reconcile_issue_branch_and_pr_manually"})
     return {"repo": cfg.repo, "items": sorted(rows, key=lambda row:
             (row["issue"] or 0, row["pr"] or 0))}
 
