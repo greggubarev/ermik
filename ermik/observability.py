@@ -15,6 +15,26 @@ KNOWN_STATUSES = frozenset({"running", "correcting", "retry_wait", "awaiting_rev
 MAX_READY = 1000
 MAX_JOBS = 1000
 MAX_LOG_WINDOW = 64 * 1024
+_RECORDED_ACTIONS = frozenset({"admitted", "claimed", "model_selected", "quota_paused",
+                               "checks_passed", "pr_published", "correction_started",
+                               "evidence_delivered"})
+
+
+def _job_guidance(status: str, category: str | None, pr: int | None) -> tuple[str | None, str | None]:
+    """Offer only read-only or manual actions from durable, bounded state."""
+    if status == "blocked":
+        return "requires_inspection", "reconcile_issue_branch_and_pr_manually"
+    if status == "retry_wait":
+        if category == "provider":
+            return "provider_capacity_wait", "wait_for_controller_reconciliation"
+        if category == "interrupted":
+            return "interrupted_retry_wait", "wait_for_controller_reconciliation"
+        return "scheduled_retry_wait", "wait_for_controller_reconciliation"
+    if status == "awaiting_review":
+        if type(pr) is int and pr > 0:
+            return "review_pending", "verify_current_pr_head_then_review"
+        return "pr_identity_unverified", "reconcile_issue_branch_and_pr_manually"
+    return None, None
 
 
 def _read_jobs(db: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row]]:
@@ -32,6 +52,10 @@ def _read_jobs(db: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sql
                          "review_next_check_at"))
         rows = conn.execute(
             "SELECT issue, pr, status, updated_at, error IS NOT NULL AS has_error, "
+            "(SELECT kind FROM events WHERE events.issue=jobs.issue AND kind IN "
+            "('admitted','claimed','model_selected','quota_paused','checks_passed',"
+            "'pr_published','correction_started','evidence_delivered') "
+            "ORDER BY id DESC LIMIT 1) AS last_recorded_action, "
             + model_columns + " FROM jobs ORDER BY issue LIMIT ?", (MAX_JOBS + 1,)
         ).fetchall()
         totals = conn.execute(
@@ -105,11 +129,18 @@ def status_snapshot(state_dir: Path, *, max_parallel: int,
                 raise ValueError("ready_issues exceeds display limit")
         ready = sorted(unique)
     retry_by_issue = {row["issue"]: row for row in retries}
-    for job in jobs:
+    for row, job in zip(rows, jobs):
         retry = retry_by_issue.get(job["issue"])
         if job["attempts"] is None:
             job["attempts"] = retry["attempts"] if retry else None
         job["next_retry_at"] = retry["next_retry_at"] if retry else None
+        reason, next_action = _job_guidance(job["status"],
+                                            retry["category"] if retry else None,
+                                            job["pr"])
+        job["reason_code"] = reason
+        job["next_action"] = next_action
+        recorded = row["last_recorded_action"]
+        job["last_recorded_action"] = recorded if recorded in _RECORDED_ACTIONS else None
     return {
         "observed_at": now.astimezone(timezone.utc).isoformat(),
         "queue": {"ready_issues": ready, "count": len(ready) if ready is not None else None},

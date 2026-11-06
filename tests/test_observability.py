@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -53,6 +54,39 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("secret", str(value))
         self.assertNotIn("private", str(value))
         self.assertNotIn("token xyz", str(value))
+
+    def test_waiting_and_blocked_guidance_never_recommends_an_unverified_retry(self):
+        state_dir = self.root / "guidance"
+        db = initialize(state_dir)
+        with closing(sqlite3.connect(db)) as conn:
+            for issue, status, pr, error in (
+                    (1, "blocked", None, "secret token and unknown remote write"),
+                    (2, "retry_wait", None, "provider response body"),
+                    (3, "awaiting_review", 19, None),
+                    (4, "awaiting_review", None, None),
+                    (5, "retry_wait", None, "arbitrary failure")):
+                conn.execute("INSERT INTO jobs(issue,branch,base_sha,pr,status,allowed_json,error) "
+                             "VALUES(?,?,?,?,?,?,?)",
+                             (issue, f"private-{issue}", "a" * 40, pr, status, "[]", error))
+            conn.execute("INSERT INTO events(issue,kind) VALUES(1,'pr_published')")
+            conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
+                         "next_retry_at,failure_id) VALUES(2,1,'provider','running',90,'f2')")
+            conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
+                         "next_retry_at,failure_id) VALUES(5,1,'untrusted text','running',90,'f5')")
+            conn.commit()
+        jobs = {job["issue"]: job for job in status_snapshot(state_dir, max_parallel=2)["jobs"]}
+        self.assertEqual((jobs[1]["reason_code"], jobs[1]["last_recorded_action"],
+                          jobs[1]["next_action"]),
+                         ("requires_inspection", "pr_published",
+                          "reconcile_issue_branch_and_pr_manually"))
+        self.assertEqual(jobs[2]["reason_code"], "provider_capacity_wait")
+        self.assertEqual(jobs[3]["next_action"], "verify_current_pr_head_then_review")
+        self.assertEqual(jobs[4]["reason_code"], "pr_identity_unverified")
+        self.assertEqual(jobs[5]["reason_code"], "scheduled_retry_wait")
+        self.assertNotIn("secret", str(jobs))
+        self.assertNotIn("provider response", str(jobs))
+        self.assertNotIn("untrusted text", str(jobs))
+        self.assertNotIn("retry_now", str(jobs))
 
     def test_resource_guard_is_non_destructive(self):
         workspace = self.root / "work"
