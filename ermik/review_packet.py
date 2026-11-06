@@ -71,7 +71,9 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         if not (_SHA.fullmatch(pr["baseRefOid"])
                 and _SHA.fullmatch(pr["headRefOid"])):
             raise WorkflowError("invalid commit identity")
-    except (WorkflowError, GitHubError, ValueError, KeyError, TypeError):
+    except GitHubError:
+        return {"status": "incomplete", "reason": "remote_unavailable"}
+    except (WorkflowError, ValueError, KeyError, TypeError):
         return {"status": "stale", "reason": "remote_identity"}
     packet = {
         "status": "incomplete", "repo": cfg.repo, "issue": issue, "pr": pr_number,
@@ -96,19 +98,58 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     old_head = packet["review"].get("head")
     if old_head and old_head != packet["head"]:
         packet["previous_head"] = old_head
+
+    def finish() -> dict:
+        """Confirm the PR identity again before presenting its HEAD as verified."""
+        try:
+            final_pr, final_issue, final_spec, final_paths = _live(
+                cfg, _github(cfg), pr_number)
+            final_image = published_image_id(final_pr.get("body") or "")
+            final_config = published_image_config_digest(final_pr.get("body") or "")
+            unchanged = (
+                final_issue == issue
+                and final_spec.body_sha256 == spec.body_sha256
+                and final_pr["headRefName"] == pr["headRefName"]
+                and final_pr["baseRefOid"] == pr["baseRefOid"]
+                and final_pr["headRefOid"] == pr["headRefOid"]
+                and final_paths == paths and final_image == image
+                and final_config == image_config_digest
+            )
+        except GitHubError:
+            packet.update(status="incomplete", reason="remote_unavailable",
+                          head=None, diff_url=None, head_verified=False,
+                          evidence={"status": "unavailable"})
+            return packet
+        except (WorkflowError, ValueError, KeyError, TypeError):
+            packet.update(status="stale", reason="remote_identity",
+                          head=None, diff_url=None, head_verified=False,
+                          evidence={"status": "stale", "reason": "identity_changed"})
+            return packet
+        if not unchanged:
+            packet.update(status="stale", reason="identity_changed",
+                          head=None, diff_url=None, head_verified=False,
+                          evidence={"status": "stale", "reason": "identity_changed"})
+            return packet
+        packet["head_verified"] = True
+        if (packet["status"] == "current"
+                and packet["review"]["status"] == "stale"):
+            packet["review"]["reason_code"] = "stale_local_review"
+            packet["review"]["next_action"] = "review_current_head"
+        return packet
+
     try:
         fetched, record = fetch_manifest(cfg, pr_number)
     except (OSError, ValueError, WorkflowError, GitHubError):
         packet.update(status="incomplete", evidence={"status": "unavailable"})
-        return packet
+        return finish()
     status = fetched.get("status")
     if status not in {"current", "missing", "duplicate", "stale",
                       "unsupported_version"}:
         packet.update(status="incomplete", evidence={"status": "unavailable"})
-        return packet
+        return finish()
     if status == "current" and not isinstance(record, dict):
         packet.update(status="incomplete", evidence={"status": "unavailable"})
-        return packet
+        return finish()
     evidence = {"status": status}
     if status == "current" and record is not None:
         manifest_identity = {
@@ -124,7 +165,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         if any(record.get(key) != value for key, value in manifest_identity.items()):
             packet.update(status="stale", evidence={"status": "stale",
                                                     "reason": "identity_changed"})
-            return packet
+            return finish()
         evidence["head"] = record["head"]
         evidence["sha256"] = record["sha256"]
         evidence["checks"] = [{"index": row["index"], "result": row["result"]}
@@ -135,7 +176,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
             history = _published_records(cfg, GitHub(cfg.repo), pr_number)
         except (GitHubError, ValueError):
             packet.update(status="incomplete", evidence={"status": "unavailable"})
-            return packet
+            return finish()
         prior_heads = [saved["head"] for _, saved in history
                        if saved["head"] != packet["head"]]
         if prior_heads:
@@ -152,25 +193,4 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
             packet["previous_head"] = prior
     packet["evidence"] = evidence
     packet["status"] = status
-    if status == "current":
-        try:
-            final_pr, final_issue, final_spec, final_paths = _live(
-                cfg, _github(cfg), pr_number)
-            final_image = published_image_id(final_pr.get("body") or "")
-            final_image_config_digest = published_image_config_digest(
-                final_pr.get("body") or "")
-            unchanged = (
-                final_issue == issue
-                and final_spec.body_sha256 == spec.body_sha256
-                and final_pr["headRefName"] == pr["headRefName"]
-                and final_pr["baseRefOid"] == pr["baseRefOid"]
-                and final_pr["headRefOid"] == pr["headRefOid"]
-                and final_paths == paths and final_image == image
-                and final_image_config_digest == image_config_digest
-            )
-        except (WorkflowError, GitHubError, ValueError, KeyError, TypeError):
-            unchanged = False
-        if not unchanged:
-            packet["status"] = "stale"
-            packet["evidence"] = {"status": "stale", "reason": "identity_changed"}
-    return packet
+    return finish()

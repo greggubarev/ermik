@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
+from ermik.github import GitHubError
 from ermik.policy import parse_issue
 from ermik.review import _checks_sha256
 from ermik.review_packet import build_review_packet
@@ -123,7 +124,11 @@ class ReviewPacketTests(unittest.TestCase):
               patch("ermik.review_packet._published_records", return_value=[])):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
-        self.assertEqual(packet["review"], {"status": "stale", "head": HEAD})
+        self.assertEqual(packet["review"], {
+            "status": "stale", "head": HEAD,
+            "reason_code": "stale_local_review",
+            "next_action": "review_current_head"})
+        self.assertTrue(packet["head_verified"])
 
     def test_manifest_without_config_digest_is_stale(self):
         legacy = self.record()
@@ -172,6 +177,8 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(packet["evidence"], {"status": "stale",
                                               "reason": "identity_changed"})
         self.assertNotIn("checks", packet["evidence"])
+        self.assertIsNone(packet["head"])
+        self.assertFalse(packet["head_verified"])
 
     def test_correction_marks_old_review_stale_and_shows_both_heads(self):
         (self.cfg.state_dir / "reviews").mkdir(parents=True)
@@ -192,6 +199,39 @@ class ReviewPacketTests(unittest.TestCase):
                    side_effect=ValueError("unsafe path: '/private/password'")):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet, {"status": "stale", "reason": "remote_identity"})
+
+    def test_remote_read_failure_is_unavailable_not_stale(self):
+        with patch("ermik.review_packet._live",
+                   side_effect=GitHubError("private transport details")):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet, {"status": "incomplete", "reason": "remote_unavailable"})
+        self.assertNotIn("private transport details", str(packet))
+
+    def test_missing_evidence_cannot_bypass_final_head_check(self):
+        moved = {**self.pr, "headRefOid": "e" * 40}
+        with (patch("ermik.review_packet._live", side_effect=[
+                  (self.pr, 7, self.spec, ["src/one.py"]),
+                  (moved, 7, self.spec, ["src/one.py"])]),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "missing"}, None))):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "stale")
+        self.assertIsNone(packet["head"])
+        self.assertIsNone(packet["diff_url"])
+        self.assertFalse(packet["head_verified"])
+
+    def test_final_read_failure_cannot_present_head_as_verified(self):
+        with (patch("ermik.review_packet._live", side_effect=[
+                  (self.pr, 7, self.spec, ["src/one.py"]),
+                  GitHubError("private transport details")]),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "missing"}, None))):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "incomplete")
+        self.assertEqual(packet["reason"], "remote_unavailable")
+        self.assertIsNone(packet["head"])
+        self.assertFalse(packet["head_verified"])
+        self.assertNotIn("private transport details", str(packet))
 
     def test_suspicious_issue_text_falls_back_to_issue_reference(self):
         spec = parse_issue(BODY.replace("Fix the parser", "token=ghp_private_value"))
