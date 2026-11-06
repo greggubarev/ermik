@@ -212,6 +212,7 @@ class RouteLabelTests(unittest.TestCase):
                               "quality_score": 0.5},
                 "opencode-go": {"samples": 2, "first_review_acceptances": 2,
                                 "quality_score": 1.0}}}), encoding="utf-8")
+        path.chmod(0o600)
         self.cfg = replace(self.cfg, quality_metrics_file=path,
                            quality_min_samples=2)
         selected, error, _ = self.perform(["route:auto"])
