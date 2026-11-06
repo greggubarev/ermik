@@ -48,6 +48,37 @@ class RouteConfigTests(unittest.TestCase):
             with self.subTest(routes=routes), self.assertRaises(ValueError):
                 self.load(routes)
 
+    def test_bounded_provider_policy_and_quality_source(self):
+        self.raw["provider_policies"] = {"kimi-code": {
+            "estimated_budget_ceiling": 5.0,
+            "attempt_reservation": 0.25,
+            "cooldown_seconds": 120}}
+        self.raw["quality_metrics_file"] = str(self.path.parent / "quality.json")
+        self.raw["quality_min_samples"] = 20
+        self.raw["quality_max_age_seconds"] = 3600
+        cfg = self.load()
+        self.assertEqual(cfg.provider_policies["kimi-code"].attempt_reservation, 0.25)
+        self.assertEqual(cfg.provider_policies["kimi-code"].cooldown_seconds, 120)
+        self.assertEqual(cfg.quality_min_samples, 20)
+
+    def test_unbounded_policy_and_unknown_provider_rejected(self):
+        for policy in ({"missing": {"estimated_budget_ceiling": 1,
+                                     "attempt_reservation": 0.1}},
+                       {"kimi-code": {"estimated_budget_ceiling": 1,
+                                      "attempt_reservation": 2}},
+                       {"kimi-code": {"estimated_budget_ceiling": float("nan"),
+                                      "attempt_reservation": 0.1}},
+                       {"kimi-code": {"estimated_budget_ceiling": 1,
+                                      "attempt_reservation": 0.1,
+                                      "cooldown_seconds": 1}}):
+            with self.subTest(policy=policy), self.assertRaises(ValueError):
+                self.raw["provider_policies"] = policy
+                self.load()
+        self.raw.pop("provider_policies")
+        self.raw["quality_min_samples"] = 2
+        with self.assertRaisesRegex(ValueError, "require quality_metrics_file"):
+            self.load()
+
 
 if __name__ == "__main__":
     unittest.main()

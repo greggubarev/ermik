@@ -9,6 +9,7 @@ import sqlite3
 
 from .config import Config
 from .decision_trail import read_decisions
+from .state import SCHEMA_VERSION
 
 
 MAX_JOBS = 10000
@@ -63,8 +64,8 @@ def _read_controller(cfg: Config) -> tuple[list[sqlite3.Row], list[sqlite3.Row],
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN")
-        if conn.execute("PRAGMA user_version").fetchone()[0] != 4:
-            raise ValueError("outcome export requires controller state schema v4")
+        if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+            raise ValueError(f"outcome export requires controller state schema v{SCHEMA_VERSION}")
         jobs = conn.execute(
             "SELECT issue,pr,head_sha,status,route_key,attempts_count "
             "FROM jobs ORDER BY issue LIMIT ?",
@@ -185,6 +186,8 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
             "correction_attempts": sum(row["phase"] == "correction" for row in rows),
             "legacy_phase_attempts": sum(row["phase"] is None for row in rows),
             "observed_providers": sorted(set(providers)),
+            "provider_attribution_complete": all(bool(row["provider_id"])
+                                                  for row in rows),
             "provider_switches": sum(left != right for left, right
                                      in zip(providers, providers[1:])),
             "failed_attempts": sum(row["result_code"] not in (0, -2) for row in rows),
@@ -273,3 +276,40 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
         })
     return {"version": 1, "repo": cfg.repo, "period_basis": "admission_month_utc",
             "period_filter": period, "jobs": results, "cohorts": cohorts}
+
+
+def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
+                           *, observed_at: datetime | None = None) -> dict:
+    """Measure first-review acceptance among confirmed, single-provider merges.
+
+    Each eligible merged PR contributes one sample. Incomplete or ambiguous
+    attempt histories cannot establish provider attribution and are excluded.
+    """
+    instant = datetime.now(timezone.utc) if observed_at is None else observed_at
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("observed_at must have a timezone")
+    report = build_outcome_report(cfg, maintainer_state_dir)
+    providers: dict[str, dict] = {
+        provider_id: {"samples": 0, "first_review_acceptances": 0,
+                      "quality_score": None}
+        for provider_id in sorted({model.provider_id for model in cfg.models})
+    }
+    for job in report["jobs"]:
+        observed = job["observed_providers"]
+        if (job["decision_state"] != "confirmed_merged"
+                or not job["attempt_history_complete"]
+                or job["pending_attempts"]
+                or not job["provider_attribution_complete"]
+                or len(observed) != 1):
+            continue
+        counts = providers.setdefault(observed[0], {
+            "samples": 0, "first_review_acceptances": 0, "quality_score": None,
+        })
+        counts["samples"] += 1
+        counts["first_review_acceptances"] += int(job["first_review_accepted"])
+    for counts in providers.values():
+        counts["quality_score"] = (counts["first_review_acceptances"]
+                                   / counts["samples"] if counts["samples"] else None)
+    return {"version": 1, "repo": cfg.repo,
+            "observed_at": instant.astimezone(timezone.utc).isoformat(),
+            "providers": providers}

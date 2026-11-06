@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 import runpy
 import json
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ermik.providers import (ModelCandidate, candidate_from_dict, choose_model,
-                                claim_model, classify_failure, opencode_command,
+                                claim_model, claim_model_decision, available_capacity,
+                                classify_failure, opencode_command,
                                 record_exhaustion, release_model, model_spec)
+from ermik import state
 
 
 KIMI = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY")
@@ -100,6 +104,99 @@ class ProviderTests(unittest.TestCase):
                                max_parallel=2)
         with self.assertRaises(ValueError):
             claim_model(self.conn, [KIMI, other], "issue-1", 1000)
+
+    def test_budget_ceiling_reserves_cost_and_reports_fallback(self):
+        now = int(datetime(2026, 11, 7, tzinfo=timezone.utc).timestamp())
+        policies = {KIMI.provider_id: SimpleNamespace(estimated_budget_ceiling=2.0,
+                                                     attempt_reservation=1.25)}
+        first = claim_model_decision(self.conn, [KIMI, GO], "lease-1",
+                                     policies=policies, route_key="r", now=now)
+        self.assertEqual((first["chosen"], first["reason"]), (KIMI, "priority"))
+        self.assertEqual(first["eligible"], (KIMI.ref, GO.ref))
+        self.assertEqual(self.conn.execute("SELECT route_key,reserved_cost FROM "
+                                           "provider_leases").fetchone(), ("r", 1.25))
+        second = claim_model_decision(self.conn, [KIMI, GO], "lease-2",
+                                      policies=policies, now=now)
+        self.assertEqual((second["chosen"], second["reason"], second["eligible"]),
+                         (GO, "budget", (GO.ref,)))
+        self.assertEqual(available_capacity(self.conn, [KIMI, GO], now, policies), 0)
+        release_model(self.conn, "lease-1")
+        self.assertEqual(choose_model(self.conn, [KIMI, GO], now, policies), KIMI)
+
+    def test_unknown_monthly_usage_fails_closed(self):
+        now = int(datetime(2026, 11, 7, tzinfo=timezone.utc).timestamp())
+        policies = {KIMI.provider_id: SimpleNamespace(estimated_budget_ceiling=2.0,
+                                                     attempt_reservation=1.0)}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with state.connect(root) as conn:
+                conn.execute("INSERT INTO usage_events(attempt_id,issue,provider_id,"
+                             "model_id,complete,result_code,created_at) "
+                             "VALUES('a',1,?, 'm',0,75,'2026-11-02 00:00:00')",
+                             (KIMI.provider_id,))
+            with state.connect(root) as conn:
+                decision = claim_model_decision(conn, [KIMI, GO], "lease-1",
+                                                policies=policies, now=now)
+                self.assertEqual((decision["chosen"], decision["reason"]),
+                                 (GO, "budget"))
+                self.assertEqual(available_capacity(conn, [KIMI], now, policies), 0)
+                conn.execute("UPDATE usage_events SET estimated_cost=0.8 "
+                             "WHERE attempt_id='a'")
+                self.assertEqual(available_capacity(conn, [KIMI], now, policies), 1)
+                conn.execute("UPDATE usage_events SET estimated_cost=1.2 "
+                             "WHERE attempt_id='a'")
+                self.assertEqual(available_capacity(conn, [KIMI], now, policies), 0)
+
+    def test_concurrent_budget_reservations_cannot_exceed_ceiling(self):
+        now = int(datetime(2026, 11, 7, tzinfo=timezone.utc).timestamp())
+        policies = {KIMI.provider_id: SimpleNamespace(estimated_budget_ceiling=1.0,
+                                                     attempt_reservation=1.0)}
+        with tempfile.TemporaryDirectory() as directory:
+            db = state.initialize(Path(directory))
+            first = sqlite3.connect(db)
+            second = sqlite3.connect(db)
+            try:
+                decision = claim_model_decision(first, [KIMI], "lease-1",
+                                                policies=policies, now=now)
+                self.assertEqual(decision["chosen"], KIMI)
+                decision = claim_model_decision(second, [KIMI], "lease-2",
+                                                policies=policies, now=now)
+                self.assertEqual((decision["chosen"], decision["reason"]),
+                                 (None, "budget"))
+                self.assertEqual(first.execute("SELECT sum(reserved_cost) FROM "
+                                               "provider_leases").fetchone()[0], 1.0)
+            finally:
+                first.close()
+                second.close()
+
+    def test_active_pending_attempt_uses_lease_reservation(self):
+        now = int(datetime(2026, 11, 7, tzinfo=timezone.utc).timestamp())
+        parallel = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY",
+                                  max_parallel=2)
+        policies = {parallel.provider_id: SimpleNamespace(
+            estimated_budget_ceiling=2.0, attempt_reservation=1.0)}
+        with tempfile.TemporaryDirectory() as directory:
+            with state.connect(Path(directory)) as conn:
+                first = claim_model_decision(conn, [parallel], "lease-1",
+                                             policies=policies, now=now)
+                self.assertEqual(first["chosen"], parallel)
+                conn.execute("INSERT INTO usage_events(attempt_id,issue,provider_id,"
+                             "model_id,complete,result_code,created_at) "
+                             "VALUES('lease-1',1,?, 'k3-256k',0,-2,"
+                             "'2026-11-07 00:00:00')", (parallel.provider_id,))
+                second = claim_model_decision(conn, [parallel], "lease-2",
+                                              policies=policies, now=now)
+                self.assertEqual(second["chosen"], parallel)
+                self.assertEqual(available_capacity(conn, [parallel], now, policies), 0)
+                conn.execute("UPDATE usage_events SET result_code=0,"
+                             "finished_at='2026-11-07 00:01:00' WHERE attempt_id='lease-1'")
+                release_model(conn, "lease-1")
+                self.assertEqual(available_capacity(conn, [parallel], now, policies), 0)
+
+    def test_no_eligible_candidates_decision(self):
+        decision = claim_model_decision(self.conn, [], "lease-1", now=1000)
+        self.assertEqual(decision, {"chosen": None, "eligible": (),
+                                    "reason": "no_eligible"})
 
     def test_only_provider_status_triggers_fallback(self):
         self.assertEqual(classify_failure('{"type":"text","text":"HTTP 429"}', "", 1), "other")

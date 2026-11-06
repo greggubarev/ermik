@@ -24,7 +24,7 @@ from .evidence_transport import fetch_manifest, publish_manifest
 from .delivery_loop import deliver_pending
 from .review_packet import build_review_packet
 from .decision_trail import read_decisions
-from .outcomes import build_outcome_report
+from .outcomes import build_outcome_report, build_quality_snapshot
 
 
 def doctor(cfg) -> dict:
@@ -125,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
     outcomes_parser = commands.add_parser("outcomes")
     outcomes_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     outcomes_parser.add_argument("--period", help="UTC admission month, YYYY-MM")
+    metrics_parser = commands.add_parser("route-metrics")
+    metrics_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
+    metrics_parser.add_argument("--output", type=Path, required=True)
     correction_parser = commands.add_parser("request-changes")
     correction_parser.add_argument("pr", type=int)
     correction_parser.add_argument("--note-file", type=Path, required=True)
@@ -199,6 +202,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "outcomes":
             result = build_outcome_report(cfg, args.maintainer_state_dir,
                                           period=args.period)
+        elif args.command == "route-metrics":
+            snapshot = build_quality_snapshot(cfg, args.maintainer_state_dir)
+            _write_private_output(args.output, (json.dumps(snapshot, sort_keys=True,
+                separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8"))
+            result = {"repo": cfg.repo, "output": str(args.output),
+                      "providers": len(snapshot["providers"]), "result": "written"}
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "merge":

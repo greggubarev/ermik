@@ -26,8 +26,9 @@ from .observability import resource_guard
 from .resources import recover_stale_worktrees
 from .evidence_store import (MAX_BROKER_EVIDENCE_BYTES, read_evidence,
                              validate_evidence_size, write_evidence)
-from .providers import (available_capacity, claim_model, choose_model, model_spec,
+from .providers import (available_capacity, claim_model_decision, choose_model, model_spec,
                         record_exhaustion, release_model)
+from .routing_policy import order_candidates
 from .recovery import (RecoveryClaim, activate_claim, claim_due, complete_claim,
                        record_failure)
 from .usage import parse_worker_usage
@@ -390,7 +391,7 @@ def _route_provider(conn: sqlite3.Connection, cfg: Config, issue: dict,
                     reserved: dict[str, int]) -> str | None:
     """Find a free provider slot for scheduling this issue in this cycle."""
     try:
-        candidates = _routed_models(cfg, issue)
+        candidates, _ = order_candidates(cfg, _routed_models(cfg, issue))
     except WorkflowError:
         # Admit the invalid route so the execution path records a blocked job.
         return "__invalid_route__"
@@ -402,9 +403,20 @@ def _route_provider(conn: sqlite3.Connection, cfg: Config, issue: dict,
         if provider_id in seen:
             continue
         seen.add(provider_id)
-        if available_capacity(conn, (candidate,)) > reserved.get(provider_id, 0):
+        if available_capacity(conn, (candidate,), policies=cfg.provider_policies) > reserved.get(provider_id, 0):
             return provider_id
     return None
+
+
+def _record_no_eligible(conn: sqlite3.Connection, issue: int) -> None:
+    """Record a bounded decision for an unclaimed issue without poll-log spam."""
+    recent = conn.execute(
+        "SELECT 1 FROM events WHERE issue=? AND kind='route_decision' "
+        "AND model IS NULL AND created_at>=datetime('now','-1 hour') LIMIT 1",
+        (issue,)).fetchone()
+    if recent is None:
+        state.event(conn, issue, "route_decision", model=None,
+                    policy_version=1, eligible=(), decision_reason="no_eligible")
 
 
 def _github(cfg: Config) -> GitHub:
@@ -840,6 +852,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
             rebase_only = bool(REBASE_ONLY.search(comment.get("body") or ""))
             provider = None if rebase_only else _route_provider(conn, cfg, issue, reserved or {})
             if provider is None and not rebase_only:
+                _record_no_eligible(conn, row["issue"])
                 conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                              (now + 60, row["issue"]))
                 break
@@ -885,8 +898,6 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
         if not {"queue:worker", "state:ready"}.issubset(labels(issue)):
             continue
         provider = _route_provider(conn, cfg, issue, reserved or {})
-        if provider is None:
-            continue
         try:
             spec = parse_issue(issue.get("body") or "")
         except (ValueError, TypeError):
@@ -896,6 +907,9 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
         except GitHubError:
             continue
         if not approved:
+            continue
+        if provider is None:
+            _record_no_eligible(conn, number)
             continue
         if state.conflicting(conn, spec.allowed_paths):
             continue
@@ -1309,13 +1323,14 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
     if cohort is not None and _route_key(current) != cohort:
         raise WorkflowError("provider route changed after claim")
     routed_models = _routed_models(cfg, current)
-    claim_order = routed_models
+    ordered_models, selection_reason = order_candidates(cfg, routed_models)
+    claim_order = ordered_models
     if preferred_provider:
         if not any(model.provider_id == preferred_provider for model in routed_models):
             raise WorkflowError("provider route changed after scheduling")
-        claim_order = tuple(model for model in routed_models
+        claim_order = tuple(model for model in ordered_models
                             if model.provider_id == preferred_provider) + tuple(
-                                model for model in routed_models
+                                model for model in ordered_models
                                 if model.provider_id != preferred_provider)
     claim_order = tuple(model for model in claim_order
                         if model.provider_id == preferred_provider
@@ -1369,10 +1384,23 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         if not rebase_only:
             task = _task_file(cfg, issue, current["body"], correction_note)
             if claim_order:
+                quota_fallback = False
                 for _ in range(len(claim_order)):
                     lease_id = f"issue-{issue}-{uuid.uuid4().hex}"
                     with state.connect(cfg.state_dir) as conn:
-                        candidate = claim_model(conn, claim_order, lease_id)
+                        conn.execute("BEGIN IMMEDIATE")
+                        decision = claim_model_decision(
+                            conn, claim_order, lease_id,
+                            policies=cfg.provider_policies, route_key=cohort)
+                        candidate = decision["chosen"]
+                        reason = ("quota_fallback" if quota_fallback and candidate
+                                  else decision["reason"] if decision["reason"] != "priority"
+                                  else selection_reason if candidate
+                                  else "no_eligible")
+                        state.event(conn, issue, "route_decision",
+                                    model=candidate.ref if candidate else None,
+                                    policy_version=1, eligible=decision["eligible"],
+                                    decision_reason=reason)
                     if candidate is None:
                         raise ProviderCapacityUnavailable("no provider capacity is available")
                     started = time.monotonic_ns()
@@ -1402,8 +1430,11 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         if exc.returncode != 75:
                             raise
                         with state.connect(cfg.state_dir) as conn:
-                            record_exhaustion(conn, candidate, int(time.time()) + 900)
+                            policy = cfg.provider_policies.get(candidate.provider_id)
+                            record_exhaustion(conn, candidate, int(time.time()) + (
+                                policy.cooldown_seconds if policy else 900))
                             state.event(conn, issue, "quota_paused", model=candidate.ref)
+                        quota_fallback = True
                         baseline = git(checkout, "rev-parse", "HEAD")
                         git(checkout, "reset", "--hard", baseline)
                         git(checkout, "clean", "-fdx")
@@ -1574,10 +1605,12 @@ def run_once(cfg: Config) -> list[dict]:
             recovered = recover_stale_worktrees(cfg.workspace, conn)
             # Reconcile merged PRs before reserving new paths.
             # An explicit rebase-only request needs no provider slot.
-            cycle_capacity = (min(cfg.max_parallel, max(1, available_capacity(conn, cfg.models)))
+            cycle_capacity = (min(cfg.max_parallel, max(1, available_capacity(
+                conn, cfg.models, policies=cfg.provider_policies)))
                               if cfg.models else cfg.max_parallel)
             while len(work) < cycle_capacity:
-                if not cfg.models or choose_model(conn, cfg.models) is not None:
+                if not cfg.models or choose_model(
+                        conn, cfg.models, policies=cfg.provider_policies) is not None:
                     due = claim_due(conn, limit=1)
                     if due:
                         claim = due[0]

@@ -46,7 +46,10 @@ CREATE TABLE IF NOT EXISTS events (
   kind TEXT NOT NULL,
   model TEXT,
   head_sha TEXT,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  policy_version INTEGER,
+  eligible_json TEXT,
+  decision_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS events_issue_id ON events(issue,id);
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -71,7 +74,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _TABLE_COLUMNS = {
     "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
@@ -81,7 +84,8 @@ _TABLE_COLUMNS = {
              "reason_code", "route_key"},
     "retry_state": {"issue", "attempts", "category", "resume_status",
                     "next_retry_at", "lease_token", "lease_expires_at", "failure_id"},
-    "events": {"id", "issue", "kind", "model", "head_sha", "created_at"},
+    "events": {"id", "issue", "kind", "model", "head_sha", "created_at",
+               "policy_version", "eligible_json", "decision_reason"},
     "usage_events": {"attempt_id", "issue", "provider_id", "model_id", "complete",
                      "input_tokens", "output_tokens", "reasoning_tokens",
                      "cache_read_tokens", "cache_write_tokens", "total_tokens",
@@ -90,7 +94,8 @@ _TABLE_COLUMNS = {
 }
 _PROVIDER_COLUMNS = {
     "provider_cooldowns": {"provider_id", "retry_at", "reason"},
-    "provider_leases": {"lease_id", "provider_id", "model_id", "expires_at"},
+    "provider_leases": {"lease_id", "provider_id", "model_id", "expires_at",
+                        "route_key", "reserved_cost"},
 }
 _INDEXES = {"events_issue_id", "usage_events_issue"}
 
@@ -109,7 +114,7 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
 
 def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
                      v1: bool = False, v2: bool = False,
-                     v3: bool = False) -> None:
+                     v3: bool = False, v4: bool = False) -> None:
     tables, indexes = _schema_objects(conn)
     if (not set(_TABLE_COLUMNS).issubset(tables)
             or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
@@ -129,6 +134,18 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
                     expected = expected[:-1]
             elif table == "usage_events" and (preview or v1 or v2 or v3):
                 expected = expected[:-3]
+            elif table == "events" and (preview or v1 or v2 or v3 or v4):
+                expected = expected[:-3]
+            if actual != expected:
+                raise ValueError("unknown or incomplete SQLite state schema")
+        elif table == "provider_leases":
+            expected = [(0, "lease_id", "TEXT", 0, None, 1),
+                        (1, "provider_id", "TEXT", 1, None, 0),
+                        (2, "model_id", "TEXT", 1, None, 0),
+                        (3, "expires_at", "INTEGER", 1, None, 0)]
+            if not (preview or v1 or v2 or v3 or v4):
+                expected += [(4, "route_key", "TEXT", 0, None, 0),
+                             (5, "reserved_cost", "REAL", 1, "0", 0)]
             if actual != expected:
                 raise ValueError("unknown or incomplete SQLite state schema")
         elif {row[1] for row in actual} != _PROVIDER_COLUMNS[table]:
@@ -237,6 +254,17 @@ def _migrate_v3(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE usage_events SET finished_at=created_at")
 
 
+def _migrate_v4(conn: sqlite3.Connection) -> None:
+    for statement in (
+            "ALTER TABLE events ADD COLUMN policy_version INTEGER",
+            "ALTER TABLE events ADD COLUMN eligible_json TEXT",
+            "ALTER TABLE events ADD COLUMN decision_reason TEXT"):
+        conn.execute(statement)
+    if "provider_leases" in _schema_objects(conn)[0]:
+        conn.execute("ALTER TABLE provider_leases ADD COLUMN route_key TEXT")
+        conn.execute("ALTER TABLE provider_leases ADD COLUMN reserved_cost REAL NOT NULL DEFAULT 0")
+
+
 def initialize(root: Path) -> Path:
     if root.is_symlink():
         raise ValueError("state_dir cannot be a symlink")
@@ -263,7 +291,7 @@ def initialize(root: Path) -> Path:
         elif version == 1:
             _validate_schema(conn, v1=True)
             _migrate_v1(conn)
-        elif version in (2, 3):
+        elif version in (2, 3, 4):
             pass
         elif version != SCHEMA_VERSION:
             raise ValueError(f"unsupported SQLite state schema version: {version}")
@@ -273,6 +301,9 @@ def initialize(root: Path) -> Path:
         if version in (0, 1, 2, 3) and not fresh:
             _validate_schema(conn, v3=True)
             _migrate_v3(conn)
+        if version in (0, 1, 2, 3, 4) and not fresh:
+            _validate_schema(conn, v4=True)
+            _migrate_v4(conn)
         _validate_schema(conn)
         if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -355,14 +386,36 @@ def jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def event(conn: sqlite3.Connection, issue: int, kind: str, *,
-          model: str | None = None, head_sha: str | None = None) -> None:
+          model: str | None = None, head_sha: str | None = None,
+          policy_version: int | None = None,
+          eligible: tuple[str, ...] | list[str] | None = None,
+          decision_reason: str | None = None) -> None:
     if type(issue) is not int or issue <= 0 or kind not in {
             "admitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
             "quota_paused", "checks_passed", "pr_published", "awaiting_review", "blocked",
-            "correction_started", "merged", "evidence_delivered"}:
+            "correction_started", "merged", "evidence_delivered",
+            "route_decision"}:
         raise ValueError("invalid event")
-    conn.execute("INSERT INTO events(issue,kind,model,head_sha) VALUES(?,?,?,?)",
-                 (issue, kind, model, head_sha))
+    if kind == "route_decision":
+        model_ref = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}/[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+        if (type(policy_version) is not int or policy_version < 1
+                or type(decision_reason) is not str or decision_reason not in {
+                    "priority", "quality", "quota_fallback", "no_eligible",
+                    "budget", "cooldown", "capacity"}
+                or type(eligible) not in (list, tuple) or len(eligible) > 32
+                or any(type(ref) is not str or model_ref.fullmatch(ref) is None
+                       for ref in eligible)
+                or (model is not None and (type(model) is not str
+                                           or model_ref.fullmatch(model) is None))
+                or head_sha is not None):
+            raise ValueError("invalid route decision")
+    elif any(value is not None for value in (policy_version, eligible, decision_reason)):
+        raise ValueError("route metadata requires route_decision")
+    conn.execute("INSERT INTO events(issue,kind,model,head_sha,policy_version,"
+                 "eligible_json,decision_reason) VALUES(?,?,?,?,?,?,?)",
+                 (issue, kind, model, head_sha, policy_version,
+                  json.dumps(eligible, separators=(",", ":")) if eligible is not None else None,
+                  decision_reason))
 
 
 def record_usage(conn: sqlite3.Connection, attempt_id: str, issue: int,
