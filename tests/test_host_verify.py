@@ -75,6 +75,7 @@ class HostVerifyTests(unittest.TestCase):
             result = host_verify.verify()
         self.assertEqual(result["result"], "passed")
         self.assertEqual(result["host"], {"result": "not_requested"})
+        self.assertEqual(result["platform"], "windows" if host_verify.os.name == "nt" else "linux")
 
     def test_dirty_checkout_fails_even_when_tests_pass(self):
         with patch.object(host_verify, "_probe", side_effect=[str(host_verify._ROOT),
