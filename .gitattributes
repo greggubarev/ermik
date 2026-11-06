@@ -1,1 +1,3 @@
 tests/fixtures/evidence/*.json text eol=lf
+examples/*.sh text eol=lf
+scripts/*.sh text eol=lf
