@@ -1,5 +1,9 @@
 # Source release gate
 
+## Version delta
+
+Before running the release gates, record the previous published tag and the candidate full commit. Compare them with `git merge-base --is-ancestor PREVIOUS_TAG CANDIDATE_SHA`, `git log --oneline PREVIOUS_TAG..CANDIDATE_SHA`, and `git diff --name-status PREVIOUS_TAG..CANDIDATE_SHA`. Identify an accepted Issue/PR whose behavior or concrete security/compatibility fix first appears after the previous tag and fits this version's stated goal. Link its acceptance evidence in the release notes. A closed milestone, a version rename, a documentation-only summary, or a repeat of the same tests is not a new version outcome. Defer the tag if there is no qualifying delta; put unrelated changes in their own milestone. Run the gates below only after the release scope and final commit are fixed.
+
 ## Local verification on each supported host
 
 Use a clean checkout at the same commit on Windows and Linux. Python 3.11 or newer and Git are required. Run the unit gate on both hosts; run the Docker gate on a host with a working Docker daemon. Preserve each JSON report with the release record and compare its `commit` with the commit selected for the source archive. `unit.skipped` and `unit.unexpected_skips` are reported separately; an unexpected skip or failed test makes the command exit nonzero. The Docker gate runs both host smoke scripts and records the Docker server version and exact image ID.
