@@ -24,6 +24,7 @@ from .evidence_transport import fetch_manifest, publish_manifest
 from .delivery_loop import deliver_pending
 from .review_packet import build_review_packet
 from .decision_trail import read_decisions
+from .outcomes import build_outcome_report
 
 
 def doctor(cfg) -> dict:
@@ -121,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
     packet_parser.add_argument("pr", type=int)
     history_parser = commands.add_parser("decision-history")
     history_parser.add_argument("pr", type=int)
+    outcomes_parser = commands.add_parser("outcomes")
+    outcomes_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
+    outcomes_parser.add_argument("--period", help="UTC admission month, YYYY-MM")
     correction_parser = commands.add_parser("request-changes")
     correction_parser.add_argument("pr", type=int)
     correction_parser.add_argument("--note-file", type=Path, required=True)
@@ -192,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
             history = read_decisions(cfg, args.pr)
             result = {"status": "historical_only", "approval": "none",
                       **history}
+        elif args.command == "outcomes":
+            result = build_outcome_report(cfg, args.maintainer_state_dir,
+                                          period=args.period)
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "merge":

@@ -123,6 +123,17 @@ class RuntimeRecoveryTests(unittest.TestCase):
             with patch.object(runtime, "_perform", side_effect=perform):
                 return runtime.run_once(self.cfg)
 
+    def test_claim_freezes_route_and_changed_label_blocks_execution(self):
+        Hub.issues[1]["names"].add("route:primary")
+        self._first_failure()
+        with state.connect(self.cfg.state_dir) as conn:
+            self.assertEqual(state.job(conn, 1)["route_key"], "route:primary")
+        Hub.issues[1]["names"].remove("route:primary")
+        with self.assertRaisesRegex(runtime.WorkflowError, "route changed after claim"):
+            runtime._perform(self.cfg, 1, "work/issue-1-delivery",
+                             runtime.parse_issue(BODY), correction_note=None,
+                             pr_number=None, expected_base=BASE, expected_head=None)
+
     def test_worker_failure_retries_same_issue_and_branch_without_duplicate_pr(self):
         due = self._first_failure()
         calls = []

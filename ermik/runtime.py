@@ -363,6 +363,11 @@ def labels(issue: dict) -> set[str]:
     return {row["name"] for row in issue.get("labels", [])}
 
 
+def _route_key(issue: dict) -> str | None:
+    routes = {name for name in labels(issue) if name.startswith("route:")}
+    return next(iter(routes), "route:auto") if len(routes) <= 1 else None
+
+
 def _routed_models(cfg: Config, issue: dict):
     """Apply the issue's routing hint to trusted configured candidates."""
     routes = {name for name in labels(issue) if name.startswith("route:")}
@@ -902,8 +907,10 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                      (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
         base = main_sha(gh, cfg)
         branch = f"work/issue-{number}-delivery"
-        conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) VALUES(?,?,?,?,?)",
-                     (number, branch, base, "running", json.dumps(spec.allowed_paths)))
+        conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,route_key) "
+                     "VALUES(?,?,?,?,?,?)",
+                     (number, branch, base, "running", json.dumps(spec.allowed_paths),
+                      _route_key(issue)))
         state.event(conn, number, "claimed")
         conn.commit()  # The local intent must exist before the external label write.
         gh.label(number, add="state:in-progress", remove="state:ready")
@@ -1297,6 +1304,10 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
     current = gh.issue(issue)
     if spec.body_sha256 != parse_issue(current.get("body") or "").body_sha256:
         raise WorkflowError("issue changed after admission")
+    with state.connect(cfg.state_dir) as conn:
+        cohort = state.job(conn, issue)["route_key"]
+    if cohort is not None and _route_key(current) != cohort:
+        raise WorkflowError("provider route changed after claim")
     routed_models = _routed_models(cfg, current)
     claim_order = routed_models
     if preferred_provider:
@@ -1364,23 +1375,30 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         candidate = claim_model(conn, claim_order, lease_id)
                     if candidate is None:
                         raise ProviderCapacityUnavailable("no provider capacity is available")
+                    started = time.monotonic_ns()
+                    begun = False
                     try:
                         with state.connect(cfg.state_dir) as conn:
                             state.event(conn, issue, "model_selected", model=candidate.ref)
                             conn.execute("UPDATE jobs SET last_model=?,attempts_count=attempts_count+1 "
                                          "WHERE issue=?", (candidate.ref, issue))
+                            state.begin_attempt(conn, lease_id, issue,
+                                                candidate.provider_id, candidate.model_id,
+                                                "correction" if pr_number is not None else "initial")
+                        begun = True
                         usage = _docker(cfg, checkout, cfg.worker_command, issue_file=task,
                                         network=True, timeout=3600, selected_model=candidate,
                                         image_id=image_id)
                         with state.connect(cfg.state_dir) as conn:
-                            state.record_usage(conn, lease_id, issue, candidate.provider_id,
-                                               candidate.model_id, usage, 0)
+                            state.finish_attempt(conn, lease_id, usage, 0,
+                                                 (time.monotonic_ns() - started) // 1_000_000)
                         used_model = candidate
                         break
                     except WorkerFailure as exc:
-                        with state.connect(cfg.state_dir) as conn:
-                            state.record_usage(conn, lease_id, issue, candidate.provider_id,
-                                               candidate.model_id, exc.usage, exc.returncode)
+                        if begun:
+                            with state.connect(cfg.state_dir) as conn:
+                                state.finish_attempt(conn, lease_id, exc.usage, exc.returncode,
+                                                     (time.monotonic_ns() - started) // 1_000_000)
                         if exc.returncode != 75:
                             raise
                         with state.connect(cfg.state_dir) as conn:
@@ -1390,9 +1408,10 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         git(checkout, "reset", "--hard", baseline)
                         git(checkout, "clean", "-fdx")
                     except Exception:
-                        with state.connect(cfg.state_dir) as conn:
-                            state.record_usage(conn, lease_id, issue, candidate.provider_id,
-                                               candidate.model_id, None, -1)
+                        if begun:
+                            with state.connect(cfg.state_dir) as conn:
+                                state.finish_attempt(conn, lease_id, None, -1,
+                                                     (time.monotonic_ns() - started) // 1_000_000)
                         raise
                     finally:
                         with state.connect(cfg.state_dir) as conn:
@@ -1400,11 +1419,29 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                 if used_model is None:
                     raise ProviderQuotaExhausted("all configured providers reached their quota")
             else:
+                attempt_id = f"issue-{issue}-{uuid.uuid4().hex}"
                 with state.connect(cfg.state_dir) as conn:
                     conn.execute("UPDATE jobs SET attempts_count=attempts_count+1 WHERE issue=?",
                                  (issue,))
-                _docker(cfg, checkout, cfg.worker_command, issue_file=task,
-                        network=True, timeout=3600, image_id=image_id)
+                    state.begin_attempt(conn, attempt_id, issue, "", "",
+                                        "correction" if pr_number is not None else "initial")
+                started = time.monotonic_ns()
+                try:
+                    usage = _docker(cfg, checkout, cfg.worker_command, issue_file=task,
+                                    network=True, timeout=3600, image_id=image_id)
+                except WorkerFailure as exc:
+                    with state.connect(cfg.state_dir) as conn:
+                        state.finish_attempt(conn, attempt_id, exc.usage, exc.returncode,
+                                             (time.monotonic_ns() - started) // 1_000_000)
+                    raise
+                except Exception:
+                    with state.connect(cfg.state_dir) as conn:
+                        state.finish_attempt(conn, attempt_id, None, -1,
+                                             (time.monotonic_ns() - started) // 1_000_000)
+                    raise
+                with state.connect(cfg.state_dir) as conn:
+                    state.finish_attempt(conn, attempt_id, usage, 0,
+                                         (time.monotonic_ns() - started) // 1_000_000)
         if pr_number is None:
             base = git(checkout, "merge-base", "HEAD", f"origin/{cfg.base_branch}")
         if rebase_only and _changed(checkout):
@@ -1437,7 +1474,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         if (parse_issue(latest.get("body") or "").body_sha256 != spec.body_sha256
                 or not {"queue:worker", "state:in-progress"}.issubset(labels(latest))
                 or not _approved_on_github(gh, cfg, issue, spec)
-                or _routed_models(cfg, latest) != routed_models):
+                or _routed_models(cfg, latest) != routed_models
+                or (cohort is not None and _route_key(latest) != cohort)):
             raise WorkflowError("issue approval or provider route changed during execution")
         if main_sha(gh, cfg) != base:
             raise TransientFailure("base branch moved during execution")

@@ -230,6 +230,10 @@ class RoutingTests(unittest.TestCase):
         def fake_docker(cfg, path, command, *, selected_model, **kwargs):
             selected.append(selected_model.ref)
             image_ids.append(kwargs["image_id"])
+            with state.connect(cfg.state_dir) as conn:
+                pending = conn.execute("SELECT result_code,finished_at FROM usage_events "
+                                       "WHERE issue=1 ORDER BY rowid DESC LIMIT 1").fetchone()
+                self.assertEqual(tuple(pending), (-2, None))
             if len(selected) == 1:
                 (path / "file.txt").write_text("partial\n", encoding="utf-8")
                 (path / "extra.txt").write_text("untracked\n", encoding="utf-8")
@@ -250,6 +254,32 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(choose_model(conn, (KIMI, GO)), GO)
             count = conn.execute("SELECT count(*) FROM provider_leases").fetchone()[0]
             self.assertEqual(count, 0)
+            attempts = conn.execute("SELECT provider_id,model_id,phase,result_code,"
+                                    "finished_at,duration_ms FROM usage_events "
+                                    "WHERE issue=1 ORDER BY created_at,rowid").fetchall()
+            self.assertEqual([(row[0], row[1], row[2], row[3]) for row in attempts],
+                             [(KIMI.provider_id, KIMI.model_id, "initial", 75),
+                              (GO.provider_id, GO.model_id, "initial", -1)])
+            self.assertTrue(all(row[4] is not None and row[5] is not None
+                                for row in attempts))
+
+    def test_unconfigured_model_still_records_worker_attempt(self):
+        cfg = replace(self.cfg, models=())
+        checkout = cfg.workspace / "no-model"
+        checkout.mkdir(parents=True)
+        with patch.object(runtime, "GitHub", Hub), patch.object(
+                runtime, "_checkout", return_value=checkout), patch.object(
+                runtime, "_docker", side_effect=runtime.WorkerFailure(1)) as worker:
+            with self.assertRaises(runtime.WorkerFailure):
+                runtime._perform(cfg, 1, "work/issue-1", self.spec,
+                                 correction_note=None, pr_number=None,
+                                 expected_base=BASE, expected_head=None)
+        self.assertEqual(worker.call_count, 1)
+        with state.connect(cfg.state_dir) as conn:
+            row = conn.execute("SELECT * FROM usage_events WHERE issue=1").fetchone()
+            self.assertEqual((row["provider_id"], row["model_id"], row["phase"],
+                              row["result_code"]), ("", "", "initial", 1))
+            self.assertIsNotNone(row["finished_at"])
 
     def test_auth_failure_does_not_fall_back_or_pause_account(self):
         checkout = self.cfg.workspace / "checkout"

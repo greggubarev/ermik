@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_model TEXT, result_model TEXT, attempts_count INTEGER NOT NULL DEFAULT 0,
   review_next_check_at INTEGER NOT NULL DEFAULT 0,
   image_id TEXT,
-  reason_code TEXT CHECK(reason_code IN ('provider_auth','provider_quota','local_check_failed','broker_unavailable','publication_unconfirmed','publish_credential_unavailable'))
+  reason_code TEXT CHECK(reason_code IN ('provider_auth','provider_quota','local_check_failed','broker_unavailable','publication_unconfirmed','publish_credential_unavailable')),
+  route_key TEXT
 );
 CREATE TABLE IF NOT EXISTS retry_state (
   issue INTEGER PRIMARY KEY REFERENCES jobs(issue),
@@ -62,26 +63,30 @@ CREATE TABLE IF NOT EXISTS usage_events (
   total_tokens INTEGER,
   estimated_cost REAL,
   result_code INTEGER NOT NULL,
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  phase TEXT CHECK(phase IN ('initial','correction')),
+  finished_at TEXT,
+  duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0)
 );
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _TABLE_COLUMNS = {
     "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
     "jobs": {"issue", "branch", "base_sha", "head_sha", "pr", "status",
              "allowed_json", "last_request", "error", "updated_at", "last_model",
              "result_model", "attempts_count", "review_next_check_at", "image_id",
-             "reason_code"},
+             "reason_code", "route_key"},
     "retry_state": {"issue", "attempts", "category", "resume_status",
                     "next_retry_at", "lease_token", "lease_expires_at", "failure_id"},
     "events": {"id", "issue", "kind", "model", "head_sha", "created_at"},
     "usage_events": {"attempt_id", "issue", "provider_id", "model_id", "complete",
                      "input_tokens", "output_tokens", "reasoning_tokens",
                      "cache_read_tokens", "cache_write_tokens", "total_tokens",
-                     "estimated_cost", "result_code", "created_at"},
+                     "estimated_cost", "result_code", "created_at", "phase",
+                     "finished_at", "duration_ms"},
 }
 _PROVIDER_COLUMNS = {
     "provider_cooldowns": {"provider_id", "retry_at", "reason"},
@@ -103,7 +108,8 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
 
 
 def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
-                     v1: bool = False, v2: bool = False) -> None:
+                     v1: bool = False, v2: bool = False,
+                     v3: bool = False) -> None:
     tables, indexes = _schema_objects(conn)
     if (not set(_TABLE_COLUMNS).issubset(tables)
             or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
@@ -115,10 +121,14 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
         if table in reference:
             expected = reference[table]
             if table == "jobs":
-                if preview and len(actual) in (len(expected) - 2, len(expected) - 1):
+                if preview and len(actual) in (len(expected) - 3, len(expected) - 2):
                     expected = expected[:len(actual)]
-                elif v1 and len(actual) == len(expected) - 1:
+                elif v1:
+                    expected = expected[:-2]
+                elif v2 or v3:
                     expected = expected[:-1]
+            elif table == "usage_events" and (preview or v1 or v2 or v3):
+                expected = expected[:-3]
             if actual != expected:
                 raise ValueError("unknown or incomplete SQLite state schema")
         elif {row[1] for row in actual} != _PROVIDER_COLUMNS[table]:
@@ -146,7 +156,11 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
         "retry_state": ("CHECK(attempts>=1)",
                         "CHECK(resume_statusIN('running','correcting'))",
                         "CHECK((lease_tokenISNULL)=(lease_expires_atISNULL))"),
-        "usage_events": ("CHECK(completeIN(0,1))",),
+        "usage_events": (("CHECK(completeIN(0,1))",) if
+                         (preview or v1 or v2 or v3) else
+                         ("CHECK(completeIN(0,1))",
+                          "CHECK(phaseIN('initial','correction'))",
+                          "CHECK(duration_msISNULLORduration_ms>=0)")),
     }
     if "reason_code" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
         reason_check = ("CHECK(reason_codeIN('provider_auth','provider_quota',"
@@ -201,6 +215,7 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     columns = [row[1] for row in conn.execute("PRAGMA table_info(jobs)")]
     jobs_ddl = next(statement.strip() for statement in SCHEMA.split(";")
                     if statement.lstrip().startswith("CREATE TABLE IF NOT EXISTS jobs ("))
+    jobs_ddl = jobs_ddl.replace(",\n  route_key TEXT", "")
     conn.execute(jobs_ddl.replace("CREATE TABLE IF NOT EXISTS jobs (",
                                   "CREATE TABLE jobs_v3 (", 1))
     names = ",".join(columns)
@@ -209,6 +224,17 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE jobs_v3 RENAME TO jobs")
     if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise ValueError("SQLite state foreign key check failed")
+
+
+def _migrate_v3(conn: sqlite3.Connection) -> None:
+    if "route_key" not in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
+        conn.execute("ALTER TABLE jobs ADD COLUMN route_key TEXT")
+    for statement in (
+            "ALTER TABLE usage_events ADD COLUMN phase TEXT CHECK(phase IN ('initial','correction'))",
+            "ALTER TABLE usage_events ADD COLUMN finished_at TEXT",
+            "ALTER TABLE usage_events ADD COLUMN duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0)"):
+        conn.execute(statement)
+    conn.execute("UPDATE usage_events SET finished_at=created_at")
 
 
 def initialize(root: Path) -> Path:
@@ -237,13 +263,16 @@ def initialize(root: Path) -> Path:
         elif version == 1:
             _validate_schema(conn, v1=True)
             _migrate_v1(conn)
-        elif version == 2:
+        elif version in (2, 3):
             pass
         elif version != SCHEMA_VERSION:
             raise ValueError(f"unsupported SQLite state schema version: {version}")
         if version in (0, 1, 2) and not fresh:
             _validate_schema(conn, v2=True)
             _migrate_v2(conn)
+        if version in (0, 1, 2, 3) and not fresh:
+            _validate_schema(conn, v3=True)
+            _migrate_v3(conn)
         _validate_schema(conn)
         if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -339,17 +368,51 @@ def event(conn: sqlite3.Connection, issue: int, kind: str, *,
 def record_usage(conn: sqlite3.Connection, attempt_id: str, issue: int,
                  provider_id: str, model_id: str, usage: dict | None,
                  result_code: int) -> None:
-    """Persist aggregate usage only; never store a provider transcript."""
-    complete = bool(usage and usage.get("complete"))
+    """Compatibility helper for already-finished aggregate observations."""
+    if conn.execute("SELECT 1 FROM usage_events WHERE attempt_id=?",
+                    (attempt_id,)).fetchone() is not None:
+        return
+    begin_attempt(conn, attempt_id, issue, provider_id, model_id, "initial")
+    finish_attempt(conn, attempt_id, usage, result_code, None)
+
+
+def begin_attempt(conn: sqlite3.Connection, attempt_id: str, issue: int,
+                  provider_id: str, model_id: str, phase: str) -> None:
+    """Commit this row before invoking a worker; pending result_code is -2."""
+    if (not attempt_id or type(issue) is not int or issue <= 0
+            or type(provider_id) is not str or type(model_id) is not str
+            or phase not in ("initial", "correction")):
+        raise ValueError("invalid attempt identity")
+    conn.execute("INSERT INTO usage_events(attempt_id,issue,provider_id,model_id,"
+                 "complete,result_code,phase) VALUES(?,?,?,?,0,-2,?)",
+                 (attempt_id, issue, provider_id, model_id, phase))
+
+
+def finish_attempt(conn: sqlite3.Connection, attempt_id: str,
+                   usage: dict | None, result_code: int,
+                   duration_ms: int | None) -> bool:
+    """Finish once with aggregate counters; keep missing counters as NULL."""
+    if (type(result_code) is not int or result_code == -2
+            or (duration_ms is not None and
+                (type(duration_ms) is not int or duration_ms < 0))):
+        raise ValueError("invalid attempt result")
+    complete = type(usage) is dict and usage.get("complete") is True
     value = usage if complete else {}
-    conn.execute("INSERT OR IGNORE INTO usage_events("
-                 "attempt_id,issue,provider_id,model_id,complete,input_tokens,"
-                 "output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,"
-                 "total_tokens,estimated_cost,result_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                 (attempt_id, issue, provider_id, model_id, int(complete),
-                  value.get("input"), value.get("output"), value.get("reasoning"),
-                  value.get("cache_read"), value.get("cache_write"), value.get("total"),
-                  value.get("estimated_cost"), result_code))
+    changed = conn.execute(
+        "UPDATE usage_events SET complete=?,input_tokens=?,output_tokens=?,"
+        "reasoning_tokens=?,cache_read_tokens=?,cache_write_tokens=?,total_tokens=?,"
+        "estimated_cost=?,result_code=?,finished_at=CURRENT_TIMESTAMP,duration_ms=? "
+        "WHERE attempt_id=? AND finished_at IS NULL",
+        (int(complete), value.get("input"), value.get("output"),
+         value.get("reasoning"), value.get("cache_read"),
+         value.get("cache_write"), value.get("total"),
+         value.get("estimated_cost"), result_code, duration_ms, attempt_id))
+    if changed.rowcount:
+        return True
+    if conn.execute("SELECT 1 FROM usage_events WHERE attempt_id=?",
+                    (attempt_id,)).fetchone() is None:
+        raise ValueError("attempt does not exist")
+    return False
 
 
 def scopes_overlap(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
