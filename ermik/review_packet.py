@@ -118,16 +118,19 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         except GitHubError:
             packet.update(status="incomplete", reason="remote_unavailable",
                           head=None, diff_url=None, head_verified=False,
+                          review={"status": "unavailable"},
                           evidence={"status": "unavailable"})
             return packet
         except (WorkflowError, ValueError, KeyError, TypeError):
             packet.update(status="stale", reason="remote_identity",
                           head=None, diff_url=None, head_verified=False,
+                          review={"status": "stale"},
                           evidence={"status": "stale", "reason": "identity_changed"})
             return packet
         if not unchanged:
             packet.update(status="stale", reason="identity_changed",
                           head=None, diff_url=None, head_verified=False,
+                          review={"status": "stale"},
                           evidence={"status": "stale", "reason": "identity_changed"})
             return packet
         packet["head_verified"] = True

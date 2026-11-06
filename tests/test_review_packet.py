@@ -169,6 +169,8 @@ class ReviewPacketTests(unittest.TestCase):
         with (patch("ermik.review_packet._live", side_effect=[
                   (self.pr, 7, self.spec, ["src/one.py"]),
                   (moved, 7, self.spec, ["src/one.py"])]),
+              patch("ermik.review_packet._review_summary",
+                    return_value={"status": "current", "head": HEAD}),
               patch("ermik.review_packet.fetch_manifest",
                     return_value=({"status": "current"}, self.record())),
               patch("ermik.review_packet._published_records", return_value=[])):
@@ -179,6 +181,7 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertNotIn("checks", packet["evidence"])
         self.assertIsNone(packet["head"])
         self.assertFalse(packet["head_verified"])
+        self.assertEqual(packet["review"], {"status": "stale"})
 
     def test_correction_marks_old_review_stale_and_shows_both_heads(self):
         (self.cfg.state_dir / "reviews").mkdir(parents=True)
@@ -224,6 +227,8 @@ class ReviewPacketTests(unittest.TestCase):
         with (patch("ermik.review_packet._live", side_effect=[
                   (self.pr, 7, self.spec, ["src/one.py"]),
                   GitHubError("private transport details")]),
+              patch("ermik.review_packet._review_summary",
+                    return_value={"status": "current", "head": HEAD}),
               patch("ermik.review_packet.fetch_manifest",
                     return_value=({"status": "missing"}, None))):
             packet = build_review_packet(self.cfg, 12)
@@ -231,6 +236,7 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(packet["reason"], "remote_unavailable")
         self.assertIsNone(packet["head"])
         self.assertFalse(packet["head_verified"])
+        self.assertEqual(packet["review"], {"status": "unavailable"})
         self.assertNotIn("private transport details", str(packet))
 
     def test_suspicious_issue_text_falls_back_to_issue_reference(self):
