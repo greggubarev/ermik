@@ -17,8 +17,15 @@ class DashboardTests(unittest.TestCase):
             "slots": {"capacity": 2, "active": 1, "available": 1},
             "jobs": [{"issue": 7, "pr": 8, "status": "running", "attempts": 2,
                       "next_retry_at": 1792930000, "next_review_at": 1792930001,
+                      "reason_code": "requires_inspection",
+                      "next_action": "reconcile_issue_branch_and_pr_manually",
+                      "last_recorded_action": "<script>",
                       "error": "secret-token",
-                      "branch": "private-branch"}],
+                      "branch": "private-branch"},
+                     {"issue": 9, "pr": None, "status": "blocked",
+                      "reason_code": "requires_inspection",
+                      "next_action": "reconcile_issue_branch_and_pr_manually",
+                      "last_recorded_action": "pr_published"}],
             "events": [{"issue": 7, "kind": "model_selected", "model": "provider/model",
                         "created_at": "2026-10-25 12:00:00", "head_sha": "private-sha"},
                        {"issue": 7, "kind": "<script>", "model": "evil"}],
@@ -26,6 +33,10 @@ class DashboardTests(unittest.TestCase):
         }
         projected = public_snapshot(source)
         self.assertEqual(projected["jobs"][0]["model"], "provider/model")
+        self.assertIsNone(projected["jobs"][0]["reason_code"])
+        self.assertIsNone(projected["jobs"][0]["last_recorded_action"])
+        self.assertEqual(projected["jobs"][1]["reason_code"], "requires_inspection")
+        self.assertEqual(projected["jobs"][1]["last_recorded_action"], "pr_published")
         payload = json.dumps(projected)
         self.assertNotIn("secret-token", payload)
         self.assertNotIn("private-branch", payload)
@@ -33,6 +44,7 @@ class DashboardTests(unittest.TestCase):
         self.assertNotIn("<script>", payload)
         html = render_html(projected).decode("utf-8")
         self.assertIn("provider/model", html)
+        self.assertIn("reconcile_issue_branch_and_pr_manually", html)
         self.assertIsNotNone(projected["jobs"][0]["next_review_at"])
         self.assertNotIn("secret-token", html)
 
@@ -45,6 +57,26 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(result["jobs"]), 200)
         self.assertEqual(len(result["events"]), 40)
         self.assertTrue(result["jobs_truncated"])
+
+    def test_guidance_projection_rejects_unknown_or_mismatched_values(self):
+        source = {"jobs": [
+            {"issue": 1, "status": "retry_wait", "reason_code": "provider_capacity_wait",
+             "next_action": "wait_for_controller_reconciliation",
+             "last_recorded_action": "quota_paused"},
+            {"issue": 2, "status": "blocked", "reason_code": "provider_capacity_wait",
+             "next_action": "wait_for_controller_reconciliation",
+             "last_recorded_action": ["private log"]},
+            {"issue": 3, "status": "blocked", "reason_code": "<script>",
+             "next_action": "secret", "last_recorded_action": "private"}]}
+        rows = public_snapshot(source)["jobs"]
+        self.assertEqual(rows[0]["reason_code"], "provider_capacity_wait")
+        self.assertEqual(rows[0]["last_recorded_action"], "quota_paused")
+        for row in rows[1:]:
+            self.assertIsNone(row["reason_code"])
+            self.assertIsNone(row["next_action"])
+            self.assertIsNone(row["last_recorded_action"])
+        self.assertNotIn("private log", json.dumps(rows))
+        self.assertNotIn("secret", json.dumps(rows))
 
     def test_server_loopback_only_and_read_only_routes(self):
         with tempfile.TemporaryDirectory() as tmp:

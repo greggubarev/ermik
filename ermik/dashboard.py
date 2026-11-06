@@ -24,6 +24,17 @@ _STATUSES = {"running", "correcting", "retry_wait", "awaiting_review", "blocked"
 _EVENTS = {"admitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
            "quota_paused", "checks_passed", "pr_published", "awaiting_review",
            "blocked", "correction_started", "merged"}
+_RECORDED_ACTIONS = {"admitted", "claimed", "model_selected", "quota_paused",
+                     "checks_passed", "pr_published", "correction_started",
+                     "evidence_delivered"}
+_GUIDANCE = {
+    "requires_inspection": ("blocked", "reconcile_issue_branch_and_pr_manually"),
+    "provider_capacity_wait": ("retry_wait", "wait_for_controller_reconciliation"),
+    "interrupted_retry_wait": ("retry_wait", "wait_for_controller_reconciliation"),
+    "scheduled_retry_wait": ("retry_wait", "wait_for_controller_reconciliation"),
+    "review_pending": ("awaiting_review", "verify_current_pr_head_then_review"),
+    "pr_identity_unverified": ("awaiting_review", "reconcile_issue_branch_and_pr_manually"),
+}
 
 
 def _positive_int(value: object) -> int | None:
@@ -67,16 +78,27 @@ def public_snapshot(source: dict) -> dict:
         if issue is None:
             continue
         status = row.get("status")
+        status = status if isinstance(status, str) and status in _STATUSES else "unknown"
         last_model = _safe_id(row.get("last_model")) or model_by_issue.get(issue)
         result_model = _safe_id(row.get("result_model"))
+        reason = row.get("reason_code")
+        action = row.get("next_action")
+        if (not isinstance(reason, str) or not isinstance(action, str)
+                or _GUIDANCE.get(reason) != (status, action)):
+            reason, action = None, None
+        recorded = row.get("last_recorded_action")
         jobs.append({"issue": issue,
                      "pr": _positive_int(row.get("pr")),
-                     "status": status if isinstance(status, str) and status in _STATUSES else "unknown",
+                     "status": status,
                      "model": last_model,
                      "result_model": result_model,
                      "attempts": _positive_int(row.get("attempts")),
                      "next_retry_at": _safe_time(row.get("next_retry_at")),
-                     "next_review_at": _safe_time(row.get("next_review_at"))})
+                     "next_review_at": _safe_time(row.get("next_review_at")),
+                     "reason_code": reason,
+                     "last_recorded_action": recorded if isinstance(recorded, str)
+                     and recorded in _RECORDED_ACTIONS else None,
+                     "next_action": action})
     cooldowns = []
     for row in (source.get("provider_cooldown") or [])[:32]:
         if isinstance(row, dict):
@@ -129,7 +151,8 @@ def render_html(snapshot: dict) -> bytes:
         f"<tr><td>#{e(row['issue'])}</td><td>{e(row['status'])}</td>"
         f"<td>{e(row['model'])}</td><td>{e(row['result_model'])}</td><td>{e(row['attempts'])}</td>"
         f"<td>{e(row['next_retry_at'])}</td><td>{e(row['next_review_at'])}</td>"
-        f"<td>{e(row['pr'])}</td></tr>"
+        f"<td>{e(row['pr'])}</td><td>{e(row['reason_code'])}</td>"
+        f"<td>{e(row['last_recorded_action'])}</td><td>{e(row['next_action'])}</td></tr>"
         for row in snapshot["jobs"])
     event_rows = "".join(
         f"<tr><td>{e(row['at'])}</td><td>#{e(row['issue'])}</td>"
@@ -154,7 +177,7 @@ small{{color:#526374}}.scroll{{overflow:auto}}
 </style></head><body><h1>Task status</h1><small>Updated: {e(snapshot['observed_at'])}</small>
 <section><h2>Queue and slots</h2><p>Ready: {e(queue['count'])} · Active: {e(slots['active'])} / {e(slots['capacity'])} · Available: {e(slots['available'])}</p>
 <p>Queued issues: {e(', '.join('#' + str(n) for n in (queue['ready_issues'] or [])) if queue['ready_issues'] is not None else None)}{' …' if queue['truncated'] else ''}</p></section>
-<section><h2>Jobs</h2><div class="scroll"><table><thead><tr><th>Issue</th><th>Status</th><th>Last model</th><th>PR model</th><th>Attempts</th><th>Next retry</th><th>Next PR check</th><th>PR</th></tr></thead><tbody>{job_rows}</tbody></table></div>{'<small>List truncated.</small>' if snapshot['jobs_truncated'] else ''}</section>
+<section><h2>Jobs</h2><div class="scroll"><table><thead><tr><th>Issue</th><th>Status</th><th>Last model</th><th>PR model</th><th>Attempts</th><th>Next retry</th><th>Next PR check</th><th>PR</th><th>Reason</th><th>Last recorded action</th><th>Next action</th></tr></thead><tbody>{job_rows}</tbody></table></div>{'<small>List truncated.</small>' if snapshot['jobs_truncated'] else ''}</section>
 <section><h2>Provider cooldowns</h2><ul>{cooldown_rows or '<li>None</li>'}</ul></section>
 <section><h2>Usage by model</h2><p><small>Cost is an estimate, not a subscription balance. Attempts without usage data are counted separately.</small></p><div class="scroll"><table><thead><tr><th>Provider/model</th><th>Attempts</th><th>Measured</th><th>Unknown</th><th>Input</th><th>Output</th><th>Cache read</th><th>Total</th><th>Est. $</th></tr></thead><tbody>{usage_rows}</tbody></table></div></section>
 <section><h2>Recent events</h2><div class="scroll"><table><thead><tr><th>Time</th><th>Issue</th><th>Event</th><th>Model</th></tr></thead><tbody>{event_rows}</tbody></table></div></section>
