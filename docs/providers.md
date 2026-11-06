@@ -47,6 +47,12 @@ OpenCode Go access depends on the subscription and permitted models; verify mode
 
 Optional `provider_policies` can set `estimated_budget_ceiling`, `attempt_reservation`, and `cooldown_seconds` for a configured provider. The first two values use the same estimated cost units emitted by the worker. A claim atomically reserves one attempt against current UTC-month observed estimates and active reservations. Missing estimates fail closed. This is a local scheduling guard, not a subscription balance or a hard billing cap: the actual attempt can cost more than its reservation, and a provider can bill differently. `max_parallel` on each model is the per-provider concurrency limit; all models sharing a provider must use the same value.
 
+```json
+"provider_policies": {
+  "opencode-go": {"estimated_budget_ceiling": 10.0, "attempt_reservation": 0.5, "cooldown_seconds": 900}
+}
+```
+
 To enable outcome-based ordering, make a consistent copy of the controller state and transfer the matching maintainer decision trail to the same trusted analysis host as described in [maintainer reporting](maintainer.md). Point the analysis config at the copied controller state, then run `python3 -m ermik --config config.json route-metrics --maintainer-state-dir /private/maintainer-state --output /private/quality.json`. Transfer only the resulting snapshot to the controller through a trusted channel. Set `quality_metrics_file` to its absolute path, `quality_min_samples` (default 20), and `quality_max_age_seconds` (default 86400). The file must be owned by the controller and mode `0600` on Linux. Refresh it by writing to a new private path and atomically renaming it over the configured path. Each provider needs at least the minimum number of confirmed, single-provider merged PRs with complete attempt histories. A missing, stale, malformed, or incomplete snapshot retains configured priority order. This metric measures first-review acceptance among accepted PRs; it does not prove one model is better on every task. A route-decision event records the policy version, eligible model references, selected reference, and bounded reason, without issue text or credentials.
 
 Exit code 75 means confirmed quota exhaustion. Code 77 is authentication failure, 1 is another execution failure, and 78 is configuration failure. Only code 75 permits failover to another key; other outcomes stop the task for investigation. Commit, CI, scope validation, and publication remain controller responsibilities.
