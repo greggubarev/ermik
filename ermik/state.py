@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   error TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
   last_model TEXT, result_model TEXT, attempts_count INTEGER NOT NULL DEFAULT 0,
   review_next_check_at INTEGER NOT NULL DEFAULT 0,
-  image_id TEXT
+  image_id TEXT,
+  reason_code TEXT CHECK(reason_code IN ('provider_auth','provider_quota','local_check_failed'))
 );
 CREATE TABLE IF NOT EXISTS retry_state (
   issue INTEGER PRIMARY KEY REFERENCES jobs(issue),
@@ -66,13 +67,14 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _TABLE_COLUMNS = {
     "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
     "jobs": {"issue", "branch", "base_sha", "head_sha", "pr", "status",
              "allowed_json", "last_request", "error", "updated_at", "last_model",
-             "result_model", "attempts_count", "review_next_check_at", "image_id"},
+             "result_model", "attempts_count", "review_next_check_at", "image_id",
+             "reason_code"},
     "retry_state": {"issue", "attempts", "category", "resume_status",
                     "next_retry_at", "lease_token", "lease_expires_at", "failure_id"},
     "events": {"id", "issue", "kind", "model", "head_sha", "created_at"},
@@ -100,7 +102,8 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
     return tables, indexes
 
 
-def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False) -> None:
+def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
+                     v1: bool = False) -> None:
     tables, indexes = _schema_objects(conn)
     if (not set(_TABLE_COLUMNS).issubset(tables)
             or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
@@ -111,8 +114,11 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False) -> None
         actual = [tuple(row) for row in conn.execute(f"PRAGMA table_info({table})")]
         if table in reference:
             expected = reference[table]
-            if preview and table == "jobs" and len(actual) == len(expected) - 1:
-                expected = expected[:-1]
+            if table == "jobs":
+                if preview and len(actual) in (len(expected) - 2, len(expected) - 1):
+                    expected = expected[:len(actual)]
+                elif v1 and len(actual) == len(expected) - 1:
+                    expected = expected[:-1]
             if actual != expected:
                 raise ValueError("unknown or incomplete SQLite state schema")
         elif {row[1] for row in actual} != _PROVIDER_COLUMNS[table]:
@@ -142,6 +148,9 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False) -> None
                         "CHECK((lease_tokenISNULL)=(lease_expires_atISNULL))"),
         "usage_events": ("CHECK(completeIN(0,1))",),
     }
+    if "reason_code" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
+        checks["jobs"] = ("CHECK(reason_codeIN('provider_auth','provider_quota',"
+                          "'local_check_failed'))",)
     if "provider_cooldowns" in tables:
         checks["provider_cooldowns"] = ("CHECK(reasonIN('quota'))",)
     for table, required in checks.items():
@@ -178,6 +187,11 @@ def _migrate_preview(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE jobs ADD COLUMN image_id TEXT")
 
 
+def _migrate_v1(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE jobs ADD COLUMN reason_code TEXT CHECK(reason_code IN "
+                 "('provider_auth','provider_quota','local_check_failed'))")
+
+
 def initialize(root: Path) -> Path:
     if root.is_symlink():
         raise ValueError("state_dir cannot be a symlink")
@@ -200,10 +214,14 @@ def initialize(root: Path) -> Path:
         elif version == 0:
             _validate_schema(conn, preview=True)
             _migrate_preview(conn)
+            _migrate_v1(conn)
+        elif version == 1:
+            _validate_schema(conn, v1=True)
+            _migrate_v1(conn)
         elif version != SCHEMA_VERSION:
             raise ValueError(f"unsupported SQLite state schema version: {version}")
         _validate_schema(conn)
-        if version == 0:
+        if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         conn.commit()
     except BaseException:

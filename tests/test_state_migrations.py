@@ -169,6 +169,45 @@ class StateMigrationTests(unittest.TestCase):
         with state.connect(root) as conn:
             self.assertEqual(state.job(conn, 7)["image_id"], image_id)
 
+    def test_v1_upgrade_adds_bounded_reason_without_changing_job(self):
+        root = self.base / "v1-reason"
+        create_preview(root, with_image=True)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
+        before = ledger(root)
+        state.initialize(root)
+        self.assertEqual(self.version(root), state.SCHEMA_VERSION)
+        self.assertEqual(ledger(root), before)
+        with state.connect(root) as conn:
+            self.assertIsNone(state.job(conn, 7)["reason_code"])
+            conn.execute("UPDATE jobs SET reason_code='provider_auth' WHERE issue=7")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("UPDATE jobs SET reason_code='private error text' WHERE issue=7")
+
+    def test_interrupted_v1_upgrade_rolls_back_new_column(self):
+        root = self.base / "v1-interrupted"
+        create_preview(root, with_image=True)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.execute("PRAGMA user_version = 1")
+            conn.commit()
+        before = ledger(root)
+        original = state._migrate_v1
+
+        def interrupted(conn):
+            original(conn)
+            raise OSError("interrupted reason migration")
+
+        with patch.object(state, "_migrate_v1", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "interrupted reason migration"):
+                state.initialize(root)
+        self.assertEqual(self.version(root), 1)
+        self.assertEqual(ledger(root), before)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            self.assertNotIn("reason_code", {row[1] for row in conn.execute("PRAGMA table_info(jobs)")})
+        state.initialize(root)
+        self.assertEqual(self.version(root), state.SCHEMA_VERSION)
+
     def test_v1_manifest_fails_closed_and_survives_populated_upgrade(self):
         root = self.base / "manifest-preview"
         create_preview(root, with_image=True)

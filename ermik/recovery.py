@@ -135,7 +135,7 @@ def record_failure(conn: sqlite3.Connection, issue: int, category: str, *,
                  "next_retry_at=excluded.next_retry_at,lease_token=NULL,"
                  "lease_expires_at=NULL,failure_id=excluded.failure_id",
                  (issue, attempts, category, resume_status, due, failure_id))
-    conn.execute("UPDATE jobs SET status=?,updated_at=CURRENT_TIMESTAMP WHERE issue=?",
+    conn.execute("UPDATE jobs SET status=?,reason_code=NULL,updated_at=CURRENT_TIMESTAMP WHERE issue=?",
                  (status, issue))
     return RecoveryDecision(issue, status, attempts, due)
 
@@ -169,7 +169,7 @@ def claim_due(conn: sqlite3.Connection, *, now: datetime | int | float | None = 
             conn.execute("UPDATE retry_state SET category='interrupted',"
                          "next_retry_at=?,lease_token=NULL,lease_expires_at=NULL "
                          "WHERE issue=?", (due, row[0]))
-            conn.execute("UPDATE jobs SET status=?,updated_at=CURRENT_TIMESTAMP "
+            conn.execute("UPDATE jobs SET status=?,reason_code=NULL,updated_at=CURRENT_TIMESTAMP "
                          "WHERE issue=? AND status NOT IN ('awaiting_review','merged')",
                          ("retry_wait" if retry else "blocked", row[0]))
         rows = conn.execute("SELECT r.issue,r.attempts,r.resume_status FROM retry_state r "
@@ -199,7 +199,7 @@ def activate_claim(conn: sqlite3.Connection, claim: RecoveryClaim,
                    *, now: datetime | int | float | None = None) -> bool:
     """Move a verified, live claim into execution; stale claims cannot activate."""
     instant = _epoch(now)
-    changed = conn.execute("UPDATE jobs SET status=?,updated_at=CURRENT_TIMESTAMP "
+    changed = conn.execute("UPDATE jobs SET status=?,reason_code=NULL,updated_at=CURRENT_TIMESTAMP "
                            "WHERE issue=? AND status='retry_wait' AND EXISTS "
                            "(SELECT 1 FROM retry_state WHERE issue=? AND lease_token=? "
                            "AND lease_expires_at>?)",
