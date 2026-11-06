@@ -1,6 +1,8 @@
 """The draft PR boundary rejects stale identities and reconciles POST loss."""
 
 import hashlib
+from contextlib import redirect_stdout
+import io
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,9 @@ import unittest
 from unittest.mock import patch
 
 from ermik.evidence_store import MAX_BROKER_EVIDENCE_BYTES
+from ermik.app_token_rotation import TokenPair, TokenStore
 from ermik.policy import parse_issue
+from ermik import pr_broker
 from ermik.pr_broker import Broker, BrokerError, handle_connection
 
 
@@ -278,6 +282,77 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(json.loads(right.recv(1024)),
                          {"ok": True, "pr": 19, "created": False})
         self.assertEqual(sum(method == "POST" for method, _, _ in self.api.calls), 1)
+
+
+class CredentialStatusTests(unittest.TestCase):
+    def test_static_file_reports_only_bounded_status(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "private-token"
+            self.assertEqual(pr_broker.credential_status(token_file=path)["status"],
+                             "credential_missing")
+            path.write_text("private-token-sentinel", encoding="ascii")
+            path.chmod(0o600)
+            self.assertEqual(pr_broker.credential_status(token_file=path),
+                             {"status": "present_unverified",
+                              "next_action": "verify_repository_access"})
+            output = io.StringIO()
+            with patch.object(pr_broker.sys, "argv", ["pr_broker", "credential-status",
+                                                      "--token-file", str(path)]), \
+                 redirect_stdout(output), self.assertRaises(SystemExit) as exited:
+                pr_broker.main()
+            self.assertEqual(exited.exception.code, 0)
+            self.assertEqual(json.loads(output.getvalue())["status"],
+                             "present_unverified")
+            self.assertNotIn("private-token-sentinel", output.getvalue())
+            self.assertNotIn(str(path), output.getvalue())
+            path.write_text("\n", encoding="ascii")
+            self.assertEqual(pr_broker.credential_status(token_file=path)["status"],
+                             "credential_missing")
+            path.write_bytes(b"\xff")
+            self.assertEqual(pr_broker.credential_status(token_file=path)["status"],
+                             "credential_invalid")
+            output = io.StringIO()
+            with patch.object(pr_broker.sys, "argv", ["pr_broker", "credential-status",
+                                                      "--token-file", str(path)]), \
+                 redirect_stdout(output), self.assertRaises(SystemExit) as exited:
+                pr_broker.main()
+            self.assertEqual(exited.exception.code, 2)
+            self.assertEqual(json.loads(output.getvalue())["status"],
+                             "credential_invalid")
+
+    def test_app_store_inspection_is_read_only_and_distinguishes_expiry(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = TokenStore(Path(root) / "app-tokens.json")
+            self.assertEqual(pr_broker.credential_status(app_token_store=store.path,
+                                                          now=1000)["status"],
+                             "credential_missing")
+            pair = TokenPair("private-access-sentinel", "private-refresh-sentinel",
+                             5000, 10000)
+            store.initialize(pair)
+            before = store.path.read_bytes()
+            self.assertEqual(pr_broker.credential_status(app_token_store=store.path,
+                                                          now=1000)["status"],
+                             "present_unverified")
+            self.assertEqual(pr_broker.credential_status(app_token_store=store.path,
+                                                          now=1500)["status"],
+                             "refresh_due")
+            self.assertEqual(pr_broker.credential_status(app_token_store=store.path,
+                                                          now=5000)["status"],
+                             "access_expired")
+            self.assertEqual(pr_broker.credential_status(app_token_store=store.path,
+                                                          now=10000)["status"],
+                             "refresh_expired")
+            store.pending.write_text("private-pending-sentinel", encoding="ascii")
+            self.assertEqual(pr_broker.credential_status(app_token_store=store.path,
+                                                          now=1000)["status"],
+                             "rotation_unresolved")
+            self.assertEqual(store.path.read_bytes(), before)
+            self.assertEqual(store.pending.read_text(encoding="ascii"),
+                             "private-pending-sentinel")
+            for value in ("private-access-sentinel", "private-refresh-sentinel",
+                          "private-pending-sentinel", str(store.path)):
+                self.assertNotIn(value, str(pr_broker.credential_status(
+                    app_token_store=store.path, now=1000)))
 
 
 if __name__ == "__main__":

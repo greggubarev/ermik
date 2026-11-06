@@ -27,6 +27,12 @@ def _job_guidance(status: str, category: str | None, pr: int | None,
         return "provider_auth", "verify_provider_credential_manually"
     if status == "blocked" and typed_reason == "local_check_failed":
         return "local_check_failed", "inspect_local_check_results"
+    if status in ("blocked", "retry_wait") and typed_reason == "broker_unavailable":
+        return "broker_unavailable", "inspect_broker_manually"
+    if status in ("blocked", "retry_wait") and typed_reason == "publication_unconfirmed":
+        return "publication_unconfirmed", "reconcile_publication_remotely"
+    if status in ("blocked", "retry_wait") and typed_reason == "publish_credential_unavailable":
+        return "publish_credential_unavailable", "verify_fork_credential_manually"
     if status == "retry_wait" and typed_reason == "provider_quota":
         return "provider_quota", "wait_for_controller_reconciliation"
     if status == "blocked":

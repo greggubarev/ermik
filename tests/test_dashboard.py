@@ -73,7 +73,15 @@ class DashboardTests(unittest.TestCase):
             {"issue": 5, "status": "blocked", "reason_code": "local_check_failed",
              "next_action": "inspect_local_check_results"},
             {"issue": 6, "status": "retry_wait", "reason_code": "provider_quota",
-             "next_action": "wait_for_controller_reconciliation"}]}
+             "next_action": "wait_for_controller_reconciliation"},
+            {"issue": 7, "status": "retry_wait", "reason_code": "publication_unconfirmed",
+             "next_action": "reconcile_publication_remotely"},
+            {"issue": 8, "status": "blocked", "reason_code": "broker_unavailable",
+             "next_action": "inspect_broker_manually"},
+            {"issue": 9, "status": "blocked", "reason_code": "publish_credential_unavailable",
+             "next_action": "verify_fork_credential_manually"},
+            {"issue": 10, "status": "blocked", "reason_code": "publication_unconfirmed",
+             "next_action": "retry_now"}]}
         rows = public_snapshot(source)["jobs"]
         self.assertEqual(rows[0]["reason_code"], "provider_capacity_wait")
         self.assertEqual(rows[0]["last_recorded_action"], "quota_paused")
@@ -81,8 +89,11 @@ class DashboardTests(unittest.TestCase):
             self.assertIsNone(row["reason_code"])
             self.assertIsNone(row["next_action"])
             self.assertIsNone(row["last_recorded_action"])
-        self.assertEqual([row["reason_code"] for row in rows[3:]],
-                         ["provider_auth", "local_check_failed", "provider_quota"])
+        self.assertEqual([row["reason_code"] for row in rows[3:9]],
+                         ["provider_auth", "local_check_failed", "provider_quota",
+                          "publication_unconfirmed", "broker_unavailable",
+                          "publish_credential_unavailable"])
+        self.assertIsNone(rows[9]["reason_code"])
         self.assertNotIn("private log", json.dumps(rows))
         self.assertNotIn("secret", json.dumps(rows))
 
