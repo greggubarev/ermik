@@ -128,6 +128,67 @@ class WorkerUsageTests(unittest.TestCase):
             self.assertEqual(len(output.getvalue().splitlines()), 2)
             self.assertNotIn("secret", output.getvalue())
 
+    def test_provider_failures_have_bounded_codes_and_no_raw_output(self):
+        secret = "provider-secret-value"
+        cases = (
+            ("401 event", subprocess.CompletedProcess([], 1,
+             '{"type":"error","error":{"status":401,"message":"provider-secret-value"}}',
+             ""), 77, "WORKER_AUTH_FAILURE"),
+            ("403 stderr", subprocess.CompletedProcess([], 1, "",
+             "HTTP 403 provider-secret-value"), 77, "WORKER_AUTH_FAILURE"),
+            ("429 nested event", subprocess.CompletedProcess([], 1,
+             '{"type":"step_error","properties":{"error":{"data":'
+             '{"statusCode":"429","message":"provider-secret-value"}}}}', ""),
+             75, "WORKER_QUOTA_EXHAUSTED"),
+            ("malformed event", subprocess.CompletedProcess([], 1,
+             '{"type":"error","error":{"status":429',
+             "provider-secret-value malformed response"),
+             1, "WORKER_EXECUTION_ERROR"),
+            ("assistant text", subprocess.CompletedProcess([], 1,
+             '{"type":"text","text":"HTTP 429 provider-secret-value"}', ""),
+             1, "WORKER_EXECUTION_ERROR"),
+            ("timeout", subprocess.TimeoutExpired(["opencode"], 3300,
+             output=secret, stderr="HTTP 429 provider-secret-value"),
+             1, "WORKER_EXECUTION_ERROR"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            task = Path(directory) / "issue.md"
+            task.write_text("Do the task", encoding="utf-8")
+            globals_ = WORKER["main"].__globals__
+            with patch.dict(globals_, {"TASK": task, "WORK": Path(directory),
+                                       "_session_usage": lambda _: WORKER["_unavailable_usage"]()}):
+                for ref, selected_key, other_key in (
+                    ("kimi-code/k3-256k", "KIMI_CODE_API_KEY", "OPENCODE_GO_API_KEY"),
+                    ("opencode-go/kimi-k3", "OPENCODE_GO_API_KEY", "KIMI_CODE_API_KEY"),
+                ):
+                    with patch.dict("os.environ", {"ERMIK_MODEL_REF": ref,
+                                                 selected_key: secret,
+                                                 other_key: "other-secret"}):
+                        for label, result, expected_code, expected_marker in cases:
+                            with self.subTest(ref=ref, label=label):
+                                output = StringIO()
+                                with patch.object(WORKER["subprocess"], "run",
+                                                  side_effect=result if isinstance(
+                                                      result, subprocess.TimeoutExpired) else None,
+                                                  return_value=None if isinstance(
+                                                      result, subprocess.TimeoutExpired) else result) as run, \
+                                        redirect_stdout(output):
+                                    self.assertEqual(WORKER["main"](), expected_code)
+                                self.assertEqual(run.call_count, 1)
+                                self.assertEqual(run.call_args.args[0][3], ref)
+                                self.assertEqual(run.call_args.kwargs["timeout"], 3300)
+                                environment = run.call_args.kwargs["env"]
+                                self.assertEqual(environment[selected_key], secret)
+                                self.assertNotIn(other_key, environment)
+                                lines = output.getvalue().splitlines()
+                                self.assertEqual(len(lines), 2)
+                                self.assertEqual(lines[1], expected_marker)
+                                usage = json.loads(lines[0].removeprefix("WORKER_USAGE "))
+                                self.assertEqual(lines[0].split(" ", 1)[0], "WORKER_USAGE")
+                                self.assertFalse(usage["complete"])
+                                self.assertNotIn(secret, output.getvalue())
+                                self.assertNotIn("other-secret", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
