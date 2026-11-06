@@ -57,7 +57,7 @@ The maintainer admits an issue; the server's `run-once` or `poll` takes only adm
 | [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **0 / 5** | Live provider failure matrix [#6](https://github.com/greggubarev/ermik/issues/6), route outcomes, and cost per accepted PR. |
 | [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Operator view and adoption | **0 / 4** | Maintainer queue view, diagnostics, and non-demo project trials. |
 
-Counts reflect moving open Issue #6 to v0.4 and closing Issue #7; they do not indicate production readiness or a schedule. Provider failure handling remains experimental. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
+The six v0.3 capabilities were already present in the v0.2 preview source tag. v0.3 records their separate portable-review acceptance; its milestone count is not a claim of six new changes after v0.2. Counts do not indicate production readiness or a schedule. Provider failure handling remains experimental. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
 
 ## Guides
 
