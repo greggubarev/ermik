@@ -17,6 +17,16 @@ python3 -m ermik.pr_broker serve \
 
 `--token-env NAME` replaces `--token-file` for local use. The token file must be regular, owned by root or the broker user, and not group- or world-writable. The token must see both private repositories; read issues, comments, refs, comparisons, Git trees, and PRs; and create upstream PRs. The broker validates both full repository names and numeric IDs, plus the fork's exact parent. Obtain numeric IDs from GitHub during setup and keep them out of issue text.
 
+### Check the credential without starting the broker
+
+Run the local diagnostic as the broker account from its source checkout. It reads the credential under that account, makes no network request, and prints only a fixed status and next action:
+
+```sh
+sudo -u ACCOUNT -H sh -c 'cd /home/ACCOUNT/ermik && python3 -m ermik.pr_broker credential-status --token-file /var/lib/ermik-pr-broker/private/github.token'
+```
+
+For an App token store, replace `--token-file PATH` with `--app-token-store PATH`. `--token-env NAME` is available for a broker configured with an environment variable. Exit status is zero for a locally present token or a token due for refresh and 2 for missing, invalid, expired, or unresolved local state. `present_unverified` says only that the local credential can be read; it does not establish access to either repository. A static token has no locally verifiable expiry. The App store reports access and refresh expiry from its stored timestamps without refreshing either token; pending rotation files produce `rotation_unresolved` and remain untouched. Check repository permissions separately before enabling publication. An absent broker socket alone cannot establish that a credential is missing.
+
 ### Start at host boot
 
 The [system service template](../examples/systemd/ermik-pr-broker@.service) runs the broker under a dedicated Linux account and recreates its private socket directory under `/run` at boot. Use a broker account with a matching primary group and a separate checkout at `/home/ACCOUNT/ermik`, pinned to the same reviewed source commit as the controller. If either path differs, edit the unit copy before installing it. Add only the controller account to the broker group so it can traverse the runtime directory and connect to the socket. The broker still checks the controller's exact UID with `SO_PEERCRED`.

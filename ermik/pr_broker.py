@@ -12,6 +12,7 @@ import signal
 import socket
 import stat
 import struct
+import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -325,7 +326,75 @@ def handle_connection(connection: socket.socket, broker: Broker) -> None:
         pass
 
 
+def credential_status(*, token_file: Path | None = None,
+                      token_env: str | None = None,
+                      app_token_store: Path | None = None,
+                      now: int | None = None) -> dict[str, str]:
+    """Inspect local broker credentials without a remote call or token output."""
+    if sum(value is not None for value in
+           (token_file, token_env, app_token_store)) != 1:
+        raise ValueError("select exactly one credential source")
+
+    def result(status: str, action: str) -> dict[str, str]:
+        return {"status": status, "next_action": action}
+
+    if app_token_store is not None:
+        store = TokenStore(app_token_store)
+        try:
+            store._check_location()
+            if any(os.path.lexists(path) for path in
+                   (store.pending, store.temporary, store.reauthorization_marker)):
+                return result("rotation_unresolved", "inspect_broker_token_rotation")
+            if not os.path.lexists(store.path):
+                return result("credential_missing", "authorize_broker_credential")
+            pair = store._read_pair(store.path)
+            if any(os.path.lexists(path) for path in
+                   (store.pending, store.temporary, store.reauthorization_marker)):
+                return result("rotation_unresolved", "inspect_broker_token_rotation")
+        except (OSError, ValueError, TokenRotationError):
+            return result("credential_invalid", "repair_broker_credential")
+        instant = int(time.time()) if now is None else now
+        if pair.refresh_token_expires_at <= instant:
+            return result("refresh_expired", "reauthorize_broker_credential")
+        if pair.expires_at <= instant:
+            return result("access_expired", "restart_broker_for_refresh")
+        if pair.due(instant):
+            return result("refresh_due", "check_broker_refresh")
+        return result("present_unverified", "verify_repository_access")
+
+    try:
+        owners = {0, os.geteuid()} if hasattr(os, "geteuid") else {0}
+        secret = (_private_file(token_file, owners).decode().strip()
+                  if token_file is not None else os.environ.get(token_env, ""))
+    except FileNotFoundError:
+        return result("credential_missing", "install_broker_credential")
+    except (OSError, ValueError, BrokerError, UnicodeError):
+        return result("credential_invalid", "repair_broker_credential")
+    if not secret:
+        return result("credential_missing", "install_broker_credential")
+    if "\n" in secret or "\r" in secret:
+        return result("credential_invalid", "repair_broker_credential")
+    return result("present_unverified", "verify_repository_access")
+
+
+def _credential_status_main(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(description="Inspect local broker credential status")
+    token = parser.add_mutually_exclusive_group(required=True)
+    token.add_argument("--token-file", type=Path)
+    token.add_argument("--token-env")
+    token.add_argument("--app-token-store", type=Path)
+    args = parser.parse_args(argv)
+    observation = credential_status(token_file=args.token_file, token_env=args.token_env,
+                                    app_token_store=args.app_token_store)
+    print(json.dumps(observation, separators=(",", ":"), sort_keys=True))
+    raise SystemExit(0 if observation["status"] in
+                     {"present_unverified", "refresh_due"} else 2)
+
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "credential-status":
+        _credential_status_main(sys.argv[2:])
+        return
     parser = argparse.ArgumentParser(description="Serve one draft PR operation")
     parser.add_argument("serve", choices=["serve"])
     parser.add_argument("--socket", type=Path, required=True)
