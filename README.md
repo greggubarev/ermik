@@ -53,11 +53,11 @@ The maintainer admits an issue; the server's `run-once` or `poll` takes only adm
 | Milestone | Focus | Closed issues | What remains |
 | --- | --- | ---: | --- |
 | [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Reliable preview operation | **20 / 20** | No open milestone issues; the [reboot trial](https://github.com/greggubarev/ermik/issues/7#issuecomment-6643766138) ended in a specific blocked state. |
-| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable handoff and actionable recovery | **6 / 7** | Complete [#37](https://github.com/greggubarev/ermik/issues/37) before release; earlier portable-evidence work is already in v0.2 preview. |
+| [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable handoff and actionable recovery | **7 / 7** | [#37](https://github.com/greggubarev/ermik/issues/37) adds distinct failure guidance after v0.2; release host gates remain. |
 | [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **0 / 5** | Live provider failure matrix [#6](https://github.com/greggubarev/ermik/issues/6), route outcomes, and cost per accepted PR. |
 | [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Operator view and adoption | **0 / 3** | Optional maintainer queue view, event digests, and non-demo project trials. |
 
-The six closed v0.3 evidence tasks were already present in the v0.2 preview source tag. Actionable recovery in #37 is the new v0.3 release outcome; the version stays open until it passes. Counts do not indicate production readiness or a schedule. Provider failure handling remains experimental. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
+The six earlier v0.3 evidence tasks were already present in the v0.2 preview source tag. Actionable recovery in #37 is the new v0.3 release outcome. Counts do not indicate production readiness or a schedule. Provider failure handling remains experimental. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).
 
 ## Guides
 
