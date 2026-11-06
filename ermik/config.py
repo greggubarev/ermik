@@ -17,7 +17,8 @@ _OPTIONAL = {"worker_env", "base_branch", "models", "min_free_gb",
              "publish_repo", "publish_token_env", "routes", "draft_pr_socket",
              "draft_pr_evidence_dir", "retention_days", "artifact_warn_mb",
              "evidence_publisher", "evidence_publisher_id", "provider_policies",
-             "quality_metrics_file", "quality_min_samples", "quality_max_age_seconds"}
+             "quality_metrics_file", "quality_min_samples", "quality_max_age_seconds",
+             "quota_sources"}
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ROUTE = re.compile(r"^route:[a-z][a-z0-9_-]{0,39}$")
 
@@ -27,6 +28,13 @@ class ProviderPolicy:
     estimated_budget_ceiling: float
     attempt_reservation: float
     cooldown_seconds: int = 900
+
+
+@dataclass(frozen=True)
+class QuotaSource:
+    kind: str
+    port: int
+    auth_env: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +65,7 @@ class Config:
     quality_metrics_file: Path | None = None
     quality_min_samples: int = 20
     quality_max_age_seconds: int = 86400
+    quota_sources: dict[str, QuotaSource] = field(default_factory=dict)
 
 
 def _command(value: object, name: str) -> tuple[str, ...]:
@@ -150,6 +159,29 @@ def load_config(path: Path) -> Config:
         raise ValueError("models on one provider must share max_parallel")
     if models and max_parallel > sum(capacities.values()):
         raise ValueError("max_parallel exceeds configured model capacity")
+    quota_rows = raw.get("quota_sources", {})
+    if (not isinstance(quota_rows, dict) or len(quota_rows) > 32
+            or any(provider not in capacities for provider in quota_rows)):
+        raise ValueError("quota_sources must name configured providers")
+    quota_sources = {}
+    for provider, item in quota_rows.items():
+        if (not isinstance(item, dict) or set(item) - {"kind", "port", "auth_env"}
+                or not {"kind", "port"}.issubset(item)):
+            raise ValueError("invalid quota source")
+        kind, port, auth_env = item["kind"], item["port"], item.get("auth_env")
+        if (kind not in ("kimi-code", "opencode-go")
+                or type(port) is not int or not 1 <= port <= 65535
+                or (auth_env is not None and (type(auth_env) is not str
+                                              or not _ENV.fullmatch(auth_env)
+                                              or any(part in auth_env.upper() for part in
+                                                     ("GITHUB", "GH_", "GIT_", "SSH_"))
+                                              or auth_env in worker_env
+                                              or auth_env == publish_token_env
+                                              or auth_env in {model.credential_env
+                                                              for model in models}))
+                or (kind == "kimi-code" and auth_env is None)):
+            raise ValueError("invalid quota source")
+        quota_sources[provider] = QuotaSource(kind, port, auth_env)
     routes = raw.get("routes", {})
     if (not isinstance(routes, dict) or len(routes) > 32
             or any(not isinstance(label, str) or not _ROUTE.fullmatch(label)
@@ -226,4 +258,4 @@ def load_config(path: Path) -> Config:
                   publish_repo, publish_token_env, dict(routes), draft_pr_socket,
                   draft_pr_evidence_dir, retention_days, artifact_warn_mb,
                   evidence_publisher, evidence_publisher_id, provider_policies,
-                  quality_file, min_samples, max_age)
+                  quality_file, min_samples, max_age, quota_sources)

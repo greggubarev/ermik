@@ -55,6 +55,17 @@ Optional `provider_policies` can set `estimated_budget_ceiling`, `attempt_reserv
 
 To enable outcome-based ordering, make a consistent copy of the controller state and transfer the matching maintainer decision trail to the same trusted analysis host as described in [maintainer reporting](maintainer.md). Point the analysis config at the copied controller state, then run `python3 -m ermik --config config.json route-metrics --maintainer-state-dir /private/maintainer-state --output /private/quality.json`. Transfer only the resulting snapshot to the controller through a trusted channel. Set `quality_metrics_file` to its absolute path, `quality_min_samples` (default 20), and `quality_max_age_seconds` (default 86400). The file must be owned by the controller and mode `0600` on Linux. Refresh it by writing to a new private path and atomically renaming it over the configured path. Each provider needs at least the minimum number of confirmed, single-provider merged PRs with complete attempt histories. A missing, stale, malformed, or incomplete snapshot retains configured priority order. This metric measures first-review acceptance among accepted PRs; it does not prove one model is better on every task. A route-decision event records the policy version, eligible model references, selected reference, and bounded reason, without issue text or credentials.
 
+Quota observations are separate from routing. To read a running local Kimi Code or OpenCode server, set optional loopback-only sources in the controller config:
+
+```json
+"quota_sources": {
+  "kimi-code": {"kind": "kimi-code", "port": 58627, "auth_env": "KIMI_LOCAL_SERVER_TOKEN"},
+  "opencode-go": {"kind": "opencode-go", "port": 4096, "auth_env": "OPENCODE_SERVER_PASSWORD"}
+}
+```
+
+The named variables belong only in the trusted controller environment, never `worker_env`. The ports must match your local CLI instances; they are not discovered automatically. `quota-refresh` performs fixed GET requests to `127.0.0.1`, writes only selected percentages and UTC reset times to a private snapshot, and never changes route eligibility. `quota-status` and the local dashboard read that file; providers without a configured source report unknown. The local REST APIs are experimental, so a missing or changed response reports unknown. Current verification uses a local HTTP fixture, not live signed-in CLI instances. See the [Kimi Code server API](https://moonshotai.github.io/kimi-code/en/reference/server-api.html) and [OpenCode usage API](https://opencode.ai/docs/api#usage).
+
 Exit code 75 means confirmed quota exhaustion. Code 77 is authentication failure, 1 is another execution failure, and 78 is configuration failure. Only code 75 permits failover to another key; other outcomes stop the task for investigation. Commit, CI, scope validation, and publication remain controller responsibilities.
 
 ## Route verification status

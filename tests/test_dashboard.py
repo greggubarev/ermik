@@ -58,6 +58,54 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(result["events"]), 40)
         self.assertTrue(result["jobs_truncated"])
 
+    def test_quota_projection_rejects_private_and_malformed_values(self):
+        source = {"quota_observations": [
+            {"provider": "kimi", "source": "kimi-cli-local",
+             "observed_at": "2026-11-07T10:00:00Z", "status": "ok", "unit": "percent",
+             "endpoint": "https://secret.example/api?token=credential",
+             "windows": [
+                 {"name": "limit5h", "used_percent": 47.5,
+                  "reset_at": "2026-11-07T15:00:00Z", "raw": "credential"},
+                 {"name": "limit7d", "used_percent": float("nan"),
+                  "reset_at": "<script>alert(1)</script>"},
+                 {"name": "monthTotal", "used_percent": 101, "reset_at": None},
+                 {"name": "<script>", "used_percent": 20},
+                 {"name": "monthCode", "used_percent": 30}]},
+            {"provider": "<img src=x>", "source": "opencode-local", "windows": []},
+            {"provider": "opencode", "source": "https://secret.example", "status": "<script>",
+             "unit": "credential", "observed_at": "2026-99-99T10:00:00Z",
+             "windows": [{"name": "weekly", "used_percent": 20}]},
+        ]}
+        result = public_snapshot(source)["quota_observations"]
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["windows"][0],
+                         {"name": "limit5h", "used_percent": 47.5,
+                          "reset_at": "2026-11-07T15:00:00Z"})
+        self.assertEqual(len(result[0]["windows"]), 3)
+        self.assertIsNone(result[0]["windows"][1]["used_percent"])
+        self.assertIsNone(result[0]["windows"][1]["reset_at"])
+        self.assertIsNone(result[1]["source"])
+        self.assertEqual(result[1]["status"], "unknown")
+        self.assertEqual(result[1]["windows"], [])
+        payload = json.dumps(result)
+        html = render_html(public_snapshot(source)).decode("utf-8")
+        for secret in ("credential", "secret.example", "<script>", "<img"):
+            self.assertNotIn(secret, payload)
+            self.assertNotIn(secret, html)
+        self.assertIn("47.5", html)
+        self.assertIn("2026-11-07T15:00:00Z", html)
+
+    def test_quota_collections_are_bounded_and_html_escapes_text(self):
+        source = {"quota_observations": [
+            {"provider": f"provider{n}", "source": "kimi-cli-local", "unit": "percent",
+             "windows": [{"name": "limit5h", "used_percent": 1}] * 6}
+            for n in range(40)]}
+        projected = public_snapshot(source)
+        self.assertEqual(len(projected["quota_observations"]), 32)
+        self.assertEqual(len(projected["quota_observations"][0]["windows"]), 4)
+        projected["quota_observations"][0]["provider"] = "<unsafe&>"
+        self.assertIn("&lt;unsafe&amp;&gt;", render_html(projected).decode("utf-8"))
+
     def test_guidance_projection_rejects_unknown_or_mismatched_values(self):
         source = {"jobs": [
             {"issue": 1, "status": "retry_wait", "reason_code": "provider_capacity_wait",
@@ -101,7 +149,13 @@ class DashboardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             source = {"queue": {"count": None, "ready_issues": None},
                       "slots": {"capacity": 2, "active": 0, "available": 2},
-                      "jobs": [], "events": [], "provider_cooldown": []}
+                      "jobs": [], "events": [], "provider_cooldown": [],
+                      "quota_observations": [{
+                          "provider": "kimi", "source": "kimi-cli-local",
+                          "observed_at": "2026-11-07T10:00:00Z", "status": "ok",
+                          "unit": "percent", "windows": [{"name": "limit5h",
+                          "used_percent": 47.5, "reset_at": "2026-11-07T15:00:00Z"}],
+                          "raw": "private-credential"}]}
             with patch("ermik.dashboard.status_snapshot", return_value=source):
                 server = create_server(Path(tmp), max_parallel=2, port=0)
                 self.assertEqual(server.server_address[0], "127.0.0.1")
@@ -113,7 +167,18 @@ class DashboardTests(unittest.TestCase):
                     response = conn.getresponse()
                     self.assertEqual(response.status, 200)
                     self.assertEqual(response.getheader("Cache-Control"), "no-store")
-                    self.assertEqual(json.loads(response.read())["slots"]["available"], 2)
+                    api = json.loads(response.read())
+                    self.assertEqual(api["slots"]["available"], 2)
+                    self.assertEqual(api["quota_observations"][0]["windows"][0]["used_percent"], 47.5)
+                    self.assertNotIn("private-credential", json.dumps(api))
+                    conn.close()
+
+                    conn = HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                    conn.request("GET", "/")
+                    html = conn.getresponse().read().decode("utf-8")
+                    self.assertIn("47.5", html)
+                    self.assertIn("kimi-cli-local", html)
+                    self.assertNotIn("private-credential", html)
                     conn.close()
 
                     conn = HTTPConnection("127.0.0.1", server.server_port, timeout=3)

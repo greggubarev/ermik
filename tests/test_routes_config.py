@@ -79,6 +79,41 @@ class RouteConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "require quality_metrics_file"):
             self.load()
 
+    def test_optional_local_quota_source(self):
+        self.raw["quota_sources"] = {"kimi-code": {
+            "kind": "kimi-code", "port": 58627,
+            "auth_env": "KIMI_LOCAL_SERVER_TOKEN"}}
+        source = self.load().quota_sources["kimi-code"]
+        self.assertEqual((source.kind, source.port, source.auth_env),
+                         ("kimi-code", 58627, "KIMI_LOCAL_SERVER_TOKEN"))
+
+    def test_invalid_quota_source_rejected(self):
+        for sources in ({"unknown": {"kind": "kimi-code", "port": 58627,
+                                      "auth_env": "LOCAL_TOKEN"}},
+                        {"kimi-code": {"kind": "kimi-code", "port": 0,
+                                       "auth_env": "LOCAL_TOKEN"}},
+                        {"kimi-code": {"kind": "kimi-code", "port": 58627}},
+                        {"kimi-code": {"kind": "opencode-go", "port": 58627,
+                                       "auth_env": "GITHUB_TOKEN"}},
+                        {"kimi-code": {"kind": "kimi-code", "port": 58627,
+                                       "auth_env": "WORKER_SECRET"}}):
+            with self.subTest(sources=sources), self.assertRaises(ValueError):
+                self.raw["quota_sources"] = sources
+                self.raw["worker_env"] = ["WORKER_SECRET"]
+                self.load()
+        self.raw["worker_env"] = []
+        self.raw["publish_repo"] = "owner/fork"
+        self.raw["publish_token_env"] = "FORK_SECRET"
+        self.raw["quota_sources"] = {"kimi-code": {"kind": "kimi-code",
+            "port": 58627, "auth_env": "FORK_SECRET"}}
+        with self.assertRaises(ValueError):
+            self.load()
+        self.raw.pop("publish_repo")
+        self.raw.pop("publish_token_env")
+        self.raw["quota_sources"]["kimi-code"]["auth_env"] = "KIMI_CODE_API_KEY"
+        with self.assertRaises(ValueError):
+            self.load()
+
 
 if __name__ == "__main__":
     unittest.main()

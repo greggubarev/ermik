@@ -54,7 +54,7 @@ The maintainer admits an issue; the server's `run-once` or `poll` takes only adm
 | --- | --- | ---: | --- |
 | [v0.2.0](https://github.com/greggubarev/ermik/milestone/1) | Reliable preview operation | **20 / 20** | No open milestone issues; the [reboot trial](https://github.com/greggubarev/ermik/issues/7#issuecomment-6643766138) ended in a specific blocked state. |
 | [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) | Portable handoff and actionable recovery | **7 / 7** | [#37](https://github.com/greggubarev/ermik/issues/37) adds distinct failure guidance after v0.2; release host gates remain. |
-| [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **2 / 5** | Live failure matrix [#6](https://github.com/greggubarev/ermik/issues/6), routing policy [#17](https://github.com/greggubarev/ermik/issues/17), and quota observations [#35](https://github.com/greggubarev/ermik/issues/35). |
+| [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) | Measured routing | **3 / 5** | Live failure matrix [#6](https://github.com/greggubarev/ermik/issues/6) and quota observations [#35](https://github.com/greggubarev/ermik/issues/35). |
 | [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) | Operator view and adoption | **0 / 3** | Optional maintainer queue view, event digests, and non-demo project trials. |
 
 The six earlier v0.3 evidence tasks were already present in the v0.2 preview source tag. Actionable recovery in #37 is the new v0.3 release outcome. Counts do not indicate production readiness or a schedule. Provider failure handling remains experimental. See [acceptance criteria](docs/roadmap.md) and [verified trials and limits](docs/readiness.md).

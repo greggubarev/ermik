@@ -9,7 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Callable
+from typing import Callable, Mapping
 
 from .observability import status_snapshot
 
@@ -17,9 +17,19 @@ from .observability import status_snapshot
 MAX_JOBS = 200
 MAX_EVENTS = 40
 MAX_QUEUE = 100
+MAX_QUOTA_OBSERVATIONS = 32
+MAX_QUOTA_WINDOWS = 4
 MAX_RESPONSE_BYTES = 128 * 1024
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
 _TIME = re.compile(r"[0-9T: .+Z-]{1,40}\Z")
+_QUOTA_PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
+_QUOTA_STATUSES = {"ok", "unknown", "stale"}
+_QUOTA_WINDOWS = {
+    "kimi-cli-local": {"limit5h", "limit7d", "monthTotal", "monthCode"},
+    "opencode-local": {"rolling", "weekly", "monthly"},
+    "unavailable": set(),
+}
+_QUOTA_TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z\Z")
 _STATUSES = {"running", "correcting", "retry_wait", "awaiting_review", "blocked", "merged", "unknown"}
 _EVENTS = {"admitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
            "quota_paused", "checks_passed", "pr_published", "awaiting_review",
@@ -55,6 +65,24 @@ def _safe_time(value: object) -> str | None:
     if type(value) is int and 0 <= value <= 4102444800:
         return datetime.fromtimestamp(value, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return value if isinstance(value, str) and _TIME.fullmatch(value) else None
+
+
+def _safe_quota_provider(value: object) -> str | None:
+    return value if isinstance(value, str) and _QUOTA_PROVIDER.fullmatch(value) else None
+
+
+def _safe_quota_time(value: object) -> str | None:
+    if not isinstance(value, str) or not _QUOTA_TIME.fullmatch(value):
+        return None
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
+def _safe_percent(value: object) -> int | float | None:
+    return value if type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 100 else None
 
 
 def public_snapshot(source: dict) -> dict:
@@ -137,6 +165,36 @@ def public_snapshot(source: dict) -> dict:
         metrics["estimated_cost"] = (round(cost, 4) if type(cost) in (int, float)
                                       and math.isfinite(cost) and cost >= 0 else None)
         usage.append({"provider": provider, "model": model, **metrics})
+    quota_observations = []
+    raw_quota = source.get("quota_observations")
+    for row in (raw_quota[:MAX_QUOTA_OBSERVATIONS] if isinstance(raw_quota, list) else []):
+        if not isinstance(row, dict):
+            continue
+        provider = _safe_quota_provider(row.get("provider"))
+        if not provider:
+            continue
+        source_name = row.get("source")
+        source_name = source_name if isinstance(source_name, str) and source_name in _QUOTA_WINDOWS else None
+        windows = []
+        raw_windows = row.get("windows")
+        if isinstance(raw_windows, list):
+            for window in raw_windows[:MAX_QUOTA_WINDOWS]:
+                if not isinstance(window, dict):
+                    continue
+                name = window.get("name")
+                if source_name is not None and isinstance(name, str) and name in _QUOTA_WINDOWS[source_name]:
+                    windows.append({"name": name,
+                                    "used_percent": _safe_percent(window.get("used_percent")),
+                                    "reset_at": _safe_quota_time(window.get("reset_at"))})
+        status = row.get("status")
+        quota_observations.append({
+            "provider": provider,
+            "source": source_name,
+            "observed_at": _safe_quota_time(row.get("observed_at")),
+            "status": status if isinstance(status, str) and status in _QUOTA_STATUSES else "unknown",
+            "unit": "percent" if row.get("unit") == "percent" else None,
+            "windows": windows,
+        })
     return {
         "observed_at": _safe_time(source.get("observed_at")),
         "queue": {"count": queue.get("count") if type(queue.get("count")) is int else None,
@@ -150,6 +208,7 @@ def public_snapshot(source: dict) -> dict:
         "jobs": jobs, "jobs_truncated": bool(source.get("jobs_truncated")) or
                 len(source.get("jobs") or []) > MAX_JOBS,
         "provider_cooldown": cooldowns, "events": events, "usage": usage,
+        "quota_observations": quota_observations,
     }
 
 
@@ -178,6 +237,13 @@ def render_html(snapshot: dict) -> bytes:
         f"<td>{e(row['input_tokens'])}</td><td>{e(row['output_tokens'])}</td>"
         f"<td>{e(row['cache_read_tokens'])}</td><td>{e(row['total_tokens'])}</td>"
         f"<td>{e(row['estimated_cost'])}</td></tr>" for row in snapshot["usage"])
+    quota_rows = "".join(
+        f"<tr><td>{e(row['provider'])}</td><td>{e(row['source'])}</td>"
+        f"<td>{e(row['observed_at'])}</td><td>{e(row['status'])}</td>"
+        f"<td>{e(row['unit'])}</td><td>{e(window['name'])}</td>"
+        f"<td>{e(window['used_percent'])}</td><td>{e(window['reset_at'])}</td></tr>"
+        for row in snapshot["quota_observations"]
+        for window in (row["windows"] or [{"name": None, "used_percent": None, "reset_at": None}]))
     html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="10"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Task status</title><style>
@@ -191,6 +257,7 @@ small{{color:#526374}}.scroll{{overflow:auto}}
 <section><h2>Jobs</h2><div class="scroll"><table><thead><tr><th>Issue</th><th>Status</th><th>Last model</th><th>PR model</th><th>Attempts</th><th>Next retry</th><th>Next PR check</th><th>PR</th><th>Reason</th><th>Last recorded action</th><th>Next action</th></tr></thead><tbody>{job_rows}</tbody></table></div>{'<small>List truncated.</small>' if snapshot['jobs_truncated'] else ''}</section>
 <section><h2>Provider cooldowns</h2><ul>{cooldown_rows or '<li>None</li>'}</ul></section>
 <section><h2>Usage by model</h2><p><small>Cost is an estimate, not a subscription balance. Attempts without usage data are counted separately.</small></p><div class="scroll"><table><thead><tr><th>Provider/model</th><th>Attempts</th><th>Measured</th><th>Unknown</th><th>Input</th><th>Output</th><th>Cache read</th><th>Total</th><th>Est. $</th></tr></thead><tbody>{usage_rows}</tbody></table></div></section>
+<section><h2>Quota observations</h2><div class="scroll"><table><thead><tr><th>Provider</th><th>Source</th><th>Observed</th><th>Status</th><th>Unit</th><th>Window</th><th>Used %</th><th>Reset</th></tr></thead><tbody>{quota_rows}</tbody></table></div></section>
 <section><h2>Recent events</h2><div class="scroll"><table><thead><tr><th>Time</th><th>Issue</th><th>Event</th><th>Model</th></tr></thead><tbody>{event_rows}</tbody></table></div></section>
 </body></html>"""
     data = html.encode("utf-8")
@@ -200,7 +267,9 @@ small{{color:#526374}}.scroll{{overflow:auto}}
 
 
 def create_server(state_dir: Path, *, max_parallel: int, port: int = 8765,
-                  ready_issues: Callable[[], list[int]] | None = None) -> HTTPServer:
+                  ready_issues: Callable[[], list[int]] | None = None,
+                  quota_providers: tuple[str, ...] = (),
+                  quota_sources: Mapping[str, str] | None = None) -> HTTPServer:
     """Build a read-only HTTP server bound strictly to IPv4 loopback."""
     if type(port) is not int or not 0 <= port <= 65535:
         raise ValueError("invalid port")
@@ -223,7 +292,9 @@ def create_server(state_dir: Path, *, max_parallel: int, port: int = 8765,
             try:
                 ready = ready_issues() if ready_issues is not None else None
                 snapshot = public_snapshot(status_snapshot(
-                    state_dir, max_parallel=max_parallel, ready_issues=ready))
+                    state_dir, max_parallel=max_parallel, ready_issues=ready,
+                    quota_providers=quota_providers,
+                    quota_sources=quota_sources))
                 if self.path == "/":
                     payload = render_html(snapshot)
                     content_type = "text/html; charset=utf-8"

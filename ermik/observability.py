@@ -4,10 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import json
+import math
+import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
-from typing import Iterable
+import stat
+from typing import Iterable, Mapping
 
 
 ACTIVE = frozenset({"running", "correcting"})
@@ -18,6 +23,116 @@ MAX_LOG_WINDOW = 64 * 1024
 _RECORDED_ACTIONS = frozenset({"admitted", "claimed", "model_selected", "quota_paused",
                                "checks_passed", "pr_published", "correction_started",
                                "evidence_delivered"})
+QUOTA_FILE = "quota-observations.json"
+
+
+def read_quota_observations(state_dir: Path, *, now: datetime | None = None) -> list[dict]:
+    """Read only the bounded local quota projection; stale observations lose values."""
+    path = state_dir / QUOTA_FILE
+    try:
+        if path.is_symlink():
+            return []
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > 32768
+                    or (os.name == "posix" and
+                        (info.st_uid != os.geteuid() or info.st_mode & 0o077))):
+                return []
+            with os.fdopen(fd, "rb") as stream:
+                fd = -1
+                payload = json.loads(stream.read(32769).decode("utf-8"))
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if (type(payload) is not dict or payload.get("version") != 1
+                or type(payload.get("providers")) is not list
+                or len(payload["providers"]) > 32):
+            return []
+        instant = now or datetime.now(timezone.utc)
+        rows = []
+        for row in payload["providers"]:
+            if type(row) is not dict or type(row.get("observed_at")) is not str:
+                continue
+            try:
+                observed = datetime.fromisoformat(row["observed_at"])
+                age = (instant - observed).total_seconds()
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if (observed.tzinfo is None or observed.utcoffset() is None
+                    or observed.utcoffset().total_seconds() != 0
+                    or len(row["observed_at"]) > 40):
+                continue
+            provider, source, status, unit = (row.get("provider"), row.get("source"),
+                                              row.get("status"), row.get("unit"))
+            if (type(provider) is not str or not re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", provider)
+                    or source not in ("kimi-cli-local", "opencode-local")
+                    or status not in ("ok", "unknown") or unit != "percent"
+                    or type(row.get("windows")) is not list
+                    or len(row["windows"]) > 4):
+                continue
+            windows = []
+            expired = False
+            for window in row["windows"]:
+                if type(window) is not dict:
+                    break
+                name, used, reset = (window.get("name"), window.get("used_percent"),
+                                     window.get("reset_at"))
+                if (name not in ("limit5h", "limit7d", "monthTotal", "monthCode",
+                                 "rolling", "weekly", "monthly")
+                        or type(used) not in (int, float) or not math.isfinite(used)
+                        or not 0 <= used <= 100
+                        or (reset is not None and (type(reset) is not str
+                                                   or len(reset) > 40))):
+                    break
+                if reset is not None:
+                    try:
+                        reset_time = datetime.fromisoformat(reset)
+                    except ValueError:
+                        break
+                    if (reset_time.tzinfo is None or reset_time.utcoffset() is None
+                            or reset_time.utcoffset().total_seconds() != 0):
+                        break
+                    if reset_time <= instant:
+                        expired = True
+                windows.append({"name": name, "used_percent": float(used),
+                                "reset_at": reset})
+            else:
+                projected = {"provider": provider, "source": source,
+                             "observed_at": row["observed_at"], "status": status,
+                             "unit": unit, "windows": windows}
+                if age < 0 or age > 900 or expired:
+                    projected["status"] = "stale"
+                    projected["windows"] = []
+                rows.append(projected)
+        return rows
+    except (OSError, ValueError, UnicodeError, TypeError):
+        return []
+
+
+def quota_status(state_dir: Path, providers: Iterable[str], *,
+                 now: datetime | None = None,
+                 sources: Mapping[str, str] | None = None) -> list[dict]:
+    """Show unsupported or unobserved providers as explicit unknowns."""
+    observed = {row["provider"]: row for row in read_quota_observations(
+        state_dir, now=now)}
+    result = []
+    for provider in sorted(set(providers)):
+        if type(provider) is not str or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", provider):
+            raise ValueError("invalid quota provider")
+        row = observed.get(provider)
+        expected_source = ({"kimi-code": "kimi-cli-local",
+                            "opencode-go": "opencode-local"}.get(sources.get(provider))
+                           if sources is not None else None)
+        if sources is not None and (expected_source is None or row is None
+                                    or row["source"] != expected_source):
+            row = None
+        result.append(row or {"provider": provider,
+            "source": expected_source or "unavailable", "observed_at": None,
+            "status": "unknown", "unit": "percent", "windows": []})
+    return result[:32]
 
 
 def _job_guidance(status: str, category: str | None, pr: int | None,
@@ -103,7 +218,9 @@ def _read_jobs(db: Path) -> tuple[list[sqlite3.Row], list[sqlite3.Row], list[sql
 
 def status_snapshot(state_dir: Path, *, max_parallel: int,
                     ready_issues: Iterable[int] | None = None,
-                    observed_at: datetime | None = None) -> dict:
+                    observed_at: datetime | None = None,
+                    quota_providers: Iterable[str] = (),
+                    quota_sources: Mapping[str, str] | None = None) -> dict:
     """Return a safe local snapshot; pass verified remote queue IDs separately.
 
     None means the remote queue was not queried. This function never contacts a
@@ -162,6 +279,8 @@ def status_snapshot(state_dir: Path, *, max_parallel: int,
         "counts": counts, "jobs": jobs, "jobs_truncated": truncated,
         "provider_cooldown": [{"provider": row["provider_id"],
                                "retry_at": row["retry_at"]} for row in cooldowns],
+        "quota_observations": quota_status(state_dir, quota_providers, now=now,
+                                            sources=quota_sources),
         "usage": [{"provider": row["provider_id"], "model": row["model_id"],
                    "attempts": row["attempts"],
                    "measured_attempts": row["measured_attempts"],
