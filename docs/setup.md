@@ -291,7 +291,7 @@ If `main` advances and the accepted file contents need no changes, put `SEMI_REB
 
 ## Stop, update and roll back
 
-Stop this unit before changing its checkout, image, config or secret file. Ensure no other controller or maintenance command is using the same `state_dir`. Preserve its state and workspace and reconcile any interrupted Issue, branch and PR with GitHub before retrying a write. The first database open by the updated controller migrates the preview SQLite database in place to schema version 1. Back up the complete private state before that open. Record the old commit and image ID so a rollback targets exact versions:
+Stop this unit before changing its checkout, image, config or secret file. Ensure no other controller or maintenance command is using the same `state_dir`. Preserve its state and workspace and reconcile any interrupted Issue, branch and PR with GitHub before retrying a write. The first database open by the updated controller migrates a preview or version 1 SQLite database in place to schema version 2. Back up the complete private state before that open. Record the old commit and image ID so a rollback targets exact versions:
 
 ```sh
 systemctl --user stop ermik.service
@@ -348,9 +348,9 @@ with sqlite3.connect(sys.argv[1]) as db:
 PY
 ```
 
-Expect schema version `1` and integrity `ok`. A read-only `doctor` preflight does not itself migrate the database. Use the same local migration and verification on a disposable copy first when rehearsing the upgrade.
+Expect schema version `2` and integrity `ok`. A read-only `doctor` preflight does not itself migrate the database. Use the same local migration and verification on a disposable copy first when rehearsing the upgrade.
 
-If the new version fails, stop **only** `ermik.service`, restore the recorded commit (`git checkout --detach COMMIT`), the saved config, provider file and unit copies, and verify that the recorded image ID is still available. Rebuild or pull the pinned image if necessary; if you saved an image archive separately, load it. Reload the user manager and repeat the preflight before restarting. The old preview controller must not open a version 1 database. Before starting it, either return to the updated controller or restore the pre-upgrade state backup using the procedure below. Keep the current state and workspace for reconciliation with GitHub. Restoring an older SQLite snapshot after a remote Issue, branch or PR write can replay work, so restore the archived state only after comparing every affected remote identity and local event with the backup. Do not remove state or re-admit an Issue merely because a command timed out.
+If the new version fails, stop **only** `ermik.service`, restore the recorded commit (`git checkout --detach COMMIT`), the saved config, provider file and unit copies, and verify that the recorded image ID is still available. Rebuild or pull the pinned image if necessary; if you saved an image archive separately, load it. Reload the user manager and repeat the preflight before restarting. A controller that understands only schema version 0 or 1 must not open a version 2 database. Before starting it, either return to the updated controller or restore the pre-upgrade state backup using the procedure below. Keep the current state and workspace for reconciliation with GitHub. Restoring an older SQLite snapshot after a remote Issue, branch or PR write can replay work, so restore the archived state only after comparing every affected remote identity and local event with the backup. Do not remove state or re-admit an Issue merely because a command timed out.
 
 After setting `backup_dir` to the saved directory, the local rollback commands are:
 
@@ -426,9 +426,9 @@ with sqlite3.connect(root / "state.sqlite3") as db:
     integrity = db.execute("PRAGMA quick_check").fetchone()[0]
     print("restored schema version", version)
     print("integrity", integrity)
-    if version != 0 or integrity != "ok":
-        raise RuntimeError("restored preview state failed validation")
+    if version not in (0, 1) or integrity != "ok":
+        raise RuntimeError("restored pre-upgrade state failed validation")
 PY
 ```
 
-Expect schema version `0` for an unversioned preview snapshot and integrity `ok`. Inspect `docker ps --all --filter "label=ermik.namespace=$(cat "$state_dir/container-namespace")"` before polling. Startup cleanup removes only containers with that exact label; investigate an unexpected container or cleanup failure before retrying. Reconcile the restored ledger against GitHub once more, then run `systemctl --user start ermik-preflight.service`, inspect its journal, and start only this polling unit. For a rollback that does not require restoring the preview snapshot, run that preflight after selecting the compatible state. Retain `$post_upgrade_state` until its remote writes and local records have been accounted for.
+Expect the backed-up pre-upgrade schema version (`0` or `1`) and integrity `ok`. Inspect `docker ps --all --filter "label=ermik.namespace=$(cat "$state_dir/container-namespace")"` before polling. Startup cleanup removes only containers with that exact label; investigate an unexpected container or cleanup failure before retrying. Reconcile the restored ledger against GitHub once more, then run `systemctl --user start ermik-preflight.service`, inspect its journal, and start only this polling unit. For a rollback that does not require restoring the pre-upgrade snapshot, run that preflight after selecting the compatible state. Retain `$post_upgrade_state` until its remote writes and local records have been accounted for.

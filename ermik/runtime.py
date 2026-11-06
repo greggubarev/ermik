@@ -812,7 +812,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 # reset a blocked correction's bounded retry state.
                 gh.label(row["issue"], add="state:in-progress", remove="state:blocked")
                 conn.execute("DELETE FROM retry_state WHERE issue=?", (row["issue"],))
-            conn.execute("UPDATE jobs SET status='correcting',last_request=?,updated_at=CURRENT_TIMESTAMP WHERE issue=?",
+            conn.execute("UPDATE jobs SET status='correcting',reason_code=NULL,last_request=?,updated_at=CURRENT_TIMESTAMP WHERE issue=?",
                          (comment["id"], row["issue"]))
             state.event(conn, row["issue"], "correction_started", head_sha=row["head_sha"])
             if reserved is not None and provider:
@@ -1090,7 +1090,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                             if row["status"] == "retry_wait":
                                 conn.execute("DELETE FROM retry_state WHERE issue=?",
                                              (row["issue"],))
-                                conn.execute("UPDATE jobs SET status='correcting',"
+                                conn.execute("UPDATE jobs SET status='correcting',reason_code=NULL,"
                                              "updated_at=CURRENT_TIMESTAMP WHERE issue=?",
                                              (row["issue"],))
                             raise
@@ -1108,7 +1108,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                                 # the PR API still reports the previous head.
                                 conn.execute("DELETE FROM retry_state WHERE issue=?",
                                              (row["issue"],))
-                                conn.execute("UPDATE jobs SET status='correcting',"
+                                conn.execute("UPDATE jobs SET status='correcting',reason_code=NULL,"
                                              "updated_at=CURRENT_TIMESTAMP WHERE issue=?",
                                              (row["issue"],))
                             continue

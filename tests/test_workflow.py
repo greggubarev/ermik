@@ -213,15 +213,16 @@ class WorkflowTests(unittest.TestCase):
         with state.connect(self.cfg.state_dir) as conn:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
                          (1, spec.body_sha256, '["src/example.py"]'))
-            conn.execute("INSERT INTO jobs(issue,branch,base_sha,head_sha,pr,status,allowed_json,last_request) "
-                         "VALUES(?,?,?,?,?,?,?,?)", (1, "work/issue-1-delivery", SHA_A,
-                         SHA_B, 10, "blocked", '["src/example.py"]', 100))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,head_sha,pr,status,allowed_json,last_request,reason_code) "
+                         "VALUES(?,?,?,?,?,?,?,?,?)", (1, "work/issue-1-delivery", SHA_A,
+                         SHA_B, 10, "blocked", '["src/example.py"]', 100, "provider_auth"))
             conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
                          "failure_id) VALUES(?,?,?,?,?)", (1, 3, "identity", "correcting", "failed"))
             with patch.object(runtime, "_route_provider", return_value="provider"):
                 correction = runtime._correction(FakeHub("owner/repo"), self.cfg, conn)
             self.assertEqual(correction[2], 101)
             self.assertEqual(state.job(conn, 1)["status"], "correcting")
+            self.assertIsNone(state.job(conn, 1)["reason_code"])
             self.assertIsNone(conn.execute("SELECT * FROM retry_state WHERE issue=1").fetchone())
             self.assertIn("state:in-progress", FakeHub.issues[1]["names"])
             self.assertNotIn("state:blocked", FakeHub.issues[1]["names"])
