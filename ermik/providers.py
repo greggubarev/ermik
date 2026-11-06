@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import math
 import re
 import sqlite3
 from typing import Literal, Mapping, Sequence
@@ -131,7 +132,9 @@ CREATE TABLE IF NOT EXISTS provider_leases (
   lease_id TEXT PRIMARY KEY,
   provider_id TEXT NOT NULL,
   model_id TEXT NOT NULL,
-  expires_at INTEGER NOT NULL
+  expires_at INTEGER NOT NULL,
+  route_key TEXT,
+  reserved_cost REAL NOT NULL DEFAULT 0
 )
 """
 
@@ -148,21 +151,68 @@ def _epoch(value: datetime | int | float | None) -> int:
     return int(value)
 
 
+def _budget(conn: sqlite3.Connection, provider_id: str, policies: Mapping | None,
+            instant: int) -> tuple[float, float] | None:
+    if not policies or provider_id not in policies:
+        return None
+    policy = policies[provider_id]
+    ceiling = getattr(policy, "estimated_budget_ceiling", None)
+    reservation = getattr(policy, "attempt_reservation", None)
+    if (type(ceiling) not in (float, int) or not math.isfinite(ceiling) or ceiling <= 0
+            or type(reservation) not in (float, int) or not math.isfinite(reservation)
+            or reservation < 0):
+        raise ValueError("invalid budget policy")
+    start = datetime.fromtimestamp(instant, timezone.utc).strftime("%Y-%m-01 00:00:00")
+    year, month = map(int, start[:7].split("-"))
+    end = (f"{year + 1:04d}-01-01 00:00:00" if month == 12 else
+           f"{year:04d}-{month + 1:02d}-01 00:00:00")
+    usage_table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                               "AND name='usage_events'").fetchone()
+    observed = 0.0
+    if usage_table:
+        row = conn.execute("SELECT coalesce(sum(estimated_cost),0),"
+                           "sum(CASE WHEN estimated_cost IS NULL AND NOT ("
+                           "result_code=-2 AND finished_at IS NULL AND EXISTS ("
+                           "SELECT 1 FROM provider_leases l WHERE l.lease_id=usage_events.attempt_id "
+                           "AND l.provider_id=usage_events.provider_id AND l.expires_at>?)) "
+                           "THEN 1 ELSE 0 END) FROM usage_events "
+                           "WHERE provider_id=? AND created_at>=? AND created_at<?",
+                           (instant, provider_id, start, end)).fetchone()
+        if row[1]:
+            return (float(ceiling), math.inf)
+        observed = float(row[0])
+    reserved = conn.execute("SELECT coalesce(sum(reserved_cost),0) "
+                            "FROM provider_leases WHERE provider_id=? AND expires_at>?",
+                            (provider_id, instant)).fetchone()[0]
+    return float(ceiling), observed + float(reserved)
+
+
+def _budget_allows(conn: sqlite3.Connection, provider_id: str,
+                   policies: Mapping | None, instant: int) -> bool:
+    budget = _budget(conn, provider_id, policies, instant)
+    return budget is None or budget[1] + float(getattr(
+        policies[provider_id], "attempt_reservation")) <= budget[0]
+
+
 def choose_model(conn: sqlite3.Connection, candidates: Sequence[ModelCandidate],
-                 now: datetime | int | float | None = None) -> ModelCandidate | None:
+                 now: datetime | int | float | None = None,
+                 policies: Mapping | None = None) -> ModelCandidate | None:
     """Select the first available candidate in configured priority order."""
     conn.execute(_SCHEMA)
+    conn.execute(_LEASE_SCHEMA)
     instant = _epoch(now)
     for candidate in candidates:
         row = conn.execute("SELECT retry_at FROM provider_cooldowns "
                            "WHERE provider_id=?", (candidate.provider_id,)).fetchone()
-        if row is None or row[0] <= instant:
+        if (row is None or row[0] <= instant) and _budget_allows(
+                conn, candidate.provider_id, policies, instant):
             return candidate
     return None
 
 
 def available_capacity(conn: sqlite3.Connection, candidates: Sequence[ModelCandidate],
-                       now: datetime | int | float | None = None) -> int:
+                       now: datetime | int | float | None = None,
+                       policies: Mapping | None = None) -> int:
     """Count free account slots before claiming jobs in a controller cycle."""
     conn.execute(_SCHEMA)
     conn.execute(_LEASE_SCHEMA)
@@ -176,18 +226,38 @@ def available_capacity(conn: sqlite3.Connection, candidates: Sequence[ModelCandi
             continue
         used = conn.execute("SELECT count(*) FROM provider_leases WHERE provider_id=? "
                             "AND expires_at>?", (provider_id, instant)).fetchone()[0]
-        total += max(0, capacity - used)
+        free = max(0, capacity - used)
+        budget = _budget(conn, provider_id, policies, instant)
+        if budget is not None:
+            reservation = float(getattr(policies[provider_id], "attempt_reservation"))
+            remaining = budget[0] - budget[1]
+            free = min(free, max(0, math.floor(remaining / reservation)) if
+                       reservation and math.isfinite(remaining) else
+                       (free if remaining >= 0 else 0))
+        total += free
     return total
 
 
 def claim_model(conn: sqlite3.Connection, candidates: Sequence[ModelCandidate],
                 lease_id: str, now: datetime | int | float | None = None,
                 ttl_seconds: int = 3600) -> ModelCandidate | None:
-    """Reserve one execution slot atomically; commit the claim before starting Docker."""
+    """Compatibility wrapper for the priority-only claim API."""
+    return claim_model_decision(conn, candidates, lease_id, now=now,
+                                ttl_seconds=ttl_seconds)["chosen"]
+
+
+def claim_model_decision(conn: sqlite3.Connection, candidates: Sequence[ModelCandidate],
+                         lease_id: str, *, policies: Mapping | None = None,
+                         route_key: str | None = None,
+                         now: datetime | int | float | None = None,
+                         ttl_seconds: int = 3600) -> dict:
+    """Atomically reserve capacity and estimated cost for one model."""
     if not isinstance(lease_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", lease_id):
         raise ValueError("invalid lease ID")
     if type(ttl_seconds) is not int or not 1 <= ttl_seconds <= 86400:
         raise ValueError("invalid lease duration")
+    if route_key is not None and (type(route_key) is not str or len(route_key) > 128):
+        raise ValueError("invalid route key")
     capacities: dict[str, int] = {}
     for candidate in candidates:
         prior = capacities.setdefault(candidate.provider_id, candidate.max_parallel)
@@ -203,25 +273,41 @@ def claim_model(conn: sqlite3.Connection, candidates: Sequence[ModelCandidate],
         conn.execute("DELETE FROM provider_leases WHERE expires_at<=?", (instant,))
         if conn.execute("SELECT 1 FROM provider_leases WHERE lease_id=?", (lease_id,)).fetchone():
             raise ValueError("lease ID already active")
+        eligible = []
+        first_skip = None
         for candidate in candidates:
             paused = conn.execute("SELECT retry_at FROM provider_cooldowns "
                                   "WHERE provider_id=?", (candidate.provider_id,)).fetchone()
             if paused is not None and paused[0] > instant:
+                first_skip = first_skip or "cooldown"
+                continue
+            if not _budget_allows(conn, candidate.provider_id, policies, instant):
+                first_skip = first_skip or "budget"
                 continue
             active = conn.execute("SELECT count(*) FROM provider_leases "
                                   "WHERE provider_id=?",
                                   (candidate.provider_id,)).fetchone()[0]
             if active >= candidate.max_parallel:
+                first_skip = first_skip or "capacity"
                 continue
-            conn.execute("INSERT INTO provider_leases VALUES(?,?,?,?)",
-                         (lease_id, candidate.provider_id, candidate.model_id,
-                          instant + ttl_seconds))
+            eligible.append(candidate.ref)
+        chosen = next((candidate for candidate in candidates
+                       if candidate.ref in eligible), None)
+        if chosen is not None:
+            reserve = (float(getattr(policies[chosen.provider_id], "attempt_reservation"))
+                       if policies and chosen.provider_id in policies else 0.0)
+            conn.execute("INSERT INTO provider_leases(lease_id,provider_id,model_id,"
+                         "expires_at,route_key,reserved_cost) VALUES(?,?,?,?,?,?)",
+                         (lease_id, chosen.provider_id, chosen.model_id,
+                          instant + ttl_seconds, route_key, reserve))
             if own_tx:
                 conn.commit()
-            return candidate
+            return {"chosen": chosen, "eligible": tuple(eligible),
+                    "reason": first_skip or "priority"}
         if own_tx:
             conn.commit()
-        return None
+        return {"chosen": None, "eligible": (),
+                "reason": first_skip or "no_eligible"}
     except BaseException:
         if own_tx:
             conn.rollback()

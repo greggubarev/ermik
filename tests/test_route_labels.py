@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import tempfile
@@ -11,7 +12,7 @@ import unittest
 from unittest.mock import patch
 
 from ermik import runtime, state
-from ermik.config import Config
+from ermik.config import Config, ProviderPolicy
 from ermik.policy import parse_issue
 from ermik.providers import ModelCandidate, choose_model, claim_model, record_exhaustion
 
@@ -191,6 +192,53 @@ class RouteLabelTests(unittest.TestCase):
                 selected, error, _ = self.perform(routes, docker_error="quota_once")
                 self.assertEqual(selected, [KIMI.ref, GO.ref])
                 self.assertIsInstance(error, StopAttempt)
+                with state.connect(self.cfg.state_dir) as conn:
+                    decisions = conn.execute("SELECT model,decision_reason,eligible_json "
+                        "FROM events WHERE issue=1 AND kind='route_decision' "
+                        "ORDER BY id DESC LIMIT 2").fetchall()[::-1]
+                self.assertEqual([(row["model"], row["decision_reason"])
+                                  for row in decisions],
+                                 [(KIMI.ref, "priority"), (GO.ref, "quota_fallback")])
+                self.assertEqual(json.loads(decisions[0]["eligible_json"]),
+                                 [KIMI.ref, GO.ref])
+
+    def test_fresh_quality_snapshot_changes_auto_order(self):
+        path = self.cfg.state_dir.parent / "quality.json"
+        path.write_text(json.dumps({
+            "version": 1, "repo": self.cfg.repo,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "providers": {
+                "kimi-code": {"samples": 2, "first_review_acceptances": 1,
+                              "quality_score": 0.5},
+                "opencode-go": {"samples": 2, "first_review_acceptances": 2,
+                                "quality_score": 1.0}}}), encoding="utf-8")
+        self.cfg = replace(self.cfg, quality_metrics_file=path,
+                           quality_min_samples=2)
+        selected, error, _ = self.perform(["route:auto"])
+        self.assertEqual(selected, [GO.ref])
+        self.assertIsInstance(error, StopAttempt)
+        with state.connect(self.cfg.state_dir) as conn:
+            decision = conn.execute("SELECT model,decision_reason FROM events "
+                                    "WHERE issue=1 AND kind='route_decision'").fetchone()
+        self.assertEqual(tuple(decision), (GO.ref, "quality"))
+
+    def test_budget_ceiling_keeps_ready_issue_unclaimed_and_logs_decision(self):
+        self.cfg = replace(self.cfg, provider_policies={
+            "kimi-code": ProviderPolicy(1.0, 1.0)})
+        hub = QueueHub({1: "route:kimi"})
+        with state.connect(self.cfg.state_dir) as conn:
+            state.record_usage(conn, "spent", 99, "kimi-code", "k3-256k",
+                               {"complete": True, "input": 1, "output": 0,
+                                "reasoning": 0, "cache_read": 0,
+                                "cache_write": 0, "total": 1,
+                                "estimated_cost": 0.5}, 0)
+            with patch.object(runtime, "resource_guard", return_value={"admit": True}), patch.object(
+                    runtime, "_approved_on_github", return_value=True):
+                self.assertIsNone(runtime._claim_new(hub, self.cfg, conn))
+            decision = conn.execute("SELECT model,decision_reason,eligible_json "
+                                    "FROM events WHERE issue=1 AND kind='route_decision'").fetchone()
+            self.assertIsNone(state.job(conn, 1))
+        self.assertEqual(tuple(decision), (None, "no_eligible", "[]"))
 
     def test_preferred_auto_route_falls_back_after_quota(self):
         selected, error, _ = self.perform(["route:auto"], docker_error="quota_once",

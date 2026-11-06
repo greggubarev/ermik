@@ -1,6 +1,7 @@
 """Outcome attribution across separate controller and maintainer installations."""
 
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
@@ -9,7 +10,8 @@ import unittest
 from ermik.config import Config
 from ermik import state
 from ermik.evidence_store import write_evidence
-from ermik.outcomes import build_outcome_report
+from ermik.outcomes import build_outcome_report, build_quality_snapshot
+from ermik.providers import ModelCandidate
 
 
 class OutcomeTests(unittest.TestCase):
@@ -272,6 +274,69 @@ class OutcomeTests(unittest.TestCase):
             build_outcome_report(self.cfg, self.maintainer)
         with self.assertRaisesRegex(ValueError, "separate"):
             build_outcome_report(self.cfg, self.cfg.state_dir)
+
+    def test_quality_snapshot_counts_only_confirmed_single_provider_merges(self):
+        head, old = "b" * 40, "c" * 40
+        for issue in (1, 2):
+            self.add_job(issue, issue + 10, "route:fast", head)
+            self.attempt(issue, f"attempt-{issue}", 0, provider="provider-a")
+        self.journal(1, 11, head, [(head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        self.journal(2, 12, head, [(old, "reviewed"),
+                                   (old, "changes_requested"),
+                                   (head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        observed_at = datetime(2026, 10, 5, 4, 30, tzinfo=timezone(timedelta(hours=4)))
+        self.assertEqual(build_quality_snapshot(self.cfg, self.maintainer,
+                                                observed_at=observed_at), {
+            "version": 1, "repo": self.cfg.repo,
+            "observed_at": "2026-10-05T00:30:00+00:00",
+            "providers": {"provider-a": {"samples": 2,
+                                          "first_review_acceptances": 1,
+                                          "quality_score": 0.5}},
+        })
+
+    def test_quality_snapshot_excludes_stale_missing_and_mixed_provider_jobs(self):
+        old, head = "b" * 40, "c" * 40
+        for issue in (1, 2, 3):
+            self.add_job(issue, issue + 10, "route:fast", head)
+            self.attempt(issue, f"attempt-{issue}", 0, provider="provider-a")
+        self.journal(1, 11, old, [(old, "reviewed"), (old, "merge_intent"),
+                                  (old, "merged")])
+        self.journal(3, 13, head, [(head, "reviewed"), (head, "merge_intent"),
+                                   (head, "merged")])
+        self.attempt(3, "fallback", 0, provider="provider-b")
+        self.assertEqual(build_quality_snapshot(self.cfg, self.maintainer,
+                                                observed_at=datetime.now(timezone.utc))
+                         ["providers"], {})
+
+    def test_quality_snapshot_excludes_pending_incomplete_and_unattributed_attempts(self):
+        head = "b" * 40
+        for issue in (1, 2, 3):
+            self.add_job(issue, issue + 10, "route:fast", head)
+            self.attempt(issue, f"attempt-{issue}", 0, provider="provider-a")
+            self.journal(issue, issue + 10, head,
+                         [(head, "reviewed"), (head, "merge_intent"),
+                          (head, "merged")])
+        self.attempt(1, "pending", -2, pending=True)
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET attempts_count=2 WHERE issue=2")
+        self.attempt(3, "unattributed", 0, provider="")
+        self.assertEqual(build_quality_snapshot(self.cfg, self.maintainer)
+                         ["providers"], {})
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            build_quality_snapshot(self.cfg, self.maintainer,
+                                   observed_at=datetime(2026, 10, 5))
+
+    def test_quality_snapshot_configured_provider_without_samples_is_unknown(self):
+        candidate = ModelCandidate("unused", "model", "UNUSED_API_KEY",
+                                   base_url="https://example.com")
+        cfg = replace(self.cfg, models=(candidate,))
+        self.add_job(1, 11, "route:fast", "b" * 40)
+        self.assertEqual(build_quality_snapshot(cfg, self.maintainer)["providers"], {
+            "unused": {"samples": 0, "first_review_acceptances": 0,
+                       "quality_score": None},
+        })
 
 
 if __name__ == "__main__":

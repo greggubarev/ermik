@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
 import re
 
@@ -15,9 +16,17 @@ _REQUIRED = {"repo", "maintainer", "state_dir", "workspace", "image",
 _OPTIONAL = {"worker_env", "base_branch", "models", "min_free_gb",
              "publish_repo", "publish_token_env", "routes", "draft_pr_socket",
              "draft_pr_evidence_dir", "retention_days", "artifact_warn_mb",
-             "evidence_publisher", "evidence_publisher_id"}
+             "evidence_publisher", "evidence_publisher_id", "provider_policies",
+             "quality_metrics_file", "quality_min_samples", "quality_max_age_seconds"}
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ROUTE = re.compile(r"^route:[a-z][a-z0-9_-]{0,39}$")
+
+
+@dataclass(frozen=True)
+class ProviderPolicy:
+    estimated_budget_ceiling: float
+    attempt_reservation: float
+    cooldown_seconds: int = 900
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,10 @@ class Config:
     artifact_warn_mb: int = 1024
     evidence_publisher: str | None = None
     evidence_publisher_id: int | None = None
+    provider_policies: dict[str, ProviderPolicy] = field(default_factory=dict)
+    quality_metrics_file: Path | None = None
+    quality_min_samples: int = 20
+    quality_max_age_seconds: int = 86400
 
 
 def _command(value: object, name: str) -> tuple[str, ...]:
@@ -144,6 +157,43 @@ def load_config(path: Path) -> Config:
                    or provider not in capacities
                    for label, provider in routes.items())):
         raise ValueError("routes must map route labels to configured provider IDs")
+    policy_rows = raw.get("provider_policies", {})
+    if (not isinstance(policy_rows, dict) or len(policy_rows) > 32
+            or any(provider not in capacities for provider in policy_rows)):
+        raise ValueError("provider_policies must name configured providers")
+    provider_policies = {}
+    for provider, limits in policy_rows.items():
+        if (not isinstance(limits, dict)
+                or set(limits) - {"estimated_budget_ceiling", "attempt_reservation",
+                                      "cooldown_seconds"}
+                or not {"estimated_budget_ceiling", "attempt_reservation"}.issubset(limits)):
+            raise ValueError("provider policy requires budget and reservation")
+        ceiling, reservation = (limits["estimated_budget_ceiling"],
+                                limits["attempt_reservation"])
+        cooldown = limits.get("cooldown_seconds", 900)
+        if (type(ceiling) not in (int, float) or not math.isfinite(ceiling)
+                or not 0 < ceiling <= 10**6
+                or type(reservation) not in (int, float)
+                or not math.isfinite(reservation)
+                or not 0 < reservation <= ceiling
+                or type(cooldown) is not int or not 60 <= cooldown <= 86400):
+            raise ValueError("invalid provider budget or cooldown")
+        provider_policies[provider] = ProviderPolicy(
+            float(ceiling), float(reservation), cooldown)
+    quality_file = raw.get("quality_metrics_file")
+    if quality_file is not None:
+        if (not isinstance(quality_file, str) or not Path(quality_file).is_absolute()
+                or Path(quality_file).resolve() != Path(quality_file)):
+            raise ValueError("quality_metrics_file must be a canonical absolute path")
+        quality_file = Path(quality_file)
+    min_samples = raw.get("quality_min_samples", 20)
+    max_age = raw.get("quality_max_age_seconds", 86400)
+    if (type(min_samples) is not int or not 2 <= min_samples <= 10000
+            or type(max_age) is not int or not 60 <= max_age <= 2592000):
+        raise ValueError("invalid quality sample or age limit")
+    if quality_file is None and ("quality_min_samples" in raw
+                                 or "quality_max_age_seconds" in raw):
+        raise ValueError("quality thresholds require quality_metrics_file")
     min_free_gb = raw.get("min_free_gb", 2)
     if type(min_free_gb) is not int or not 0 <= min_free_gb <= 1000:
         raise ValueError("min_free_gb must be 0..1000")
@@ -175,4 +225,5 @@ def load_config(path: Path) -> Config:
                   tuple(worker_env), base_branch, models, min_free_gb,
                   publish_repo, publish_token_env, dict(routes), draft_pr_socket,
                   draft_pr_evidence_dir, retention_days, artifact_warn_mb,
-                  evidence_publisher, evidence_publisher_id)
+                  evidence_publisher, evidence_publisher_id, provider_policies,
+                  quality_file, min_samples, max_age)

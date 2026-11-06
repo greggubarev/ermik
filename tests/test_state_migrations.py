@@ -125,7 +125,9 @@ def ledger(root: Path) -> dict:
                                  "attempt_id,issue,provider_id,model_id,complete,input_tokens,"
                                  "output_tokens,reasoning_tokens,cache_read_tokens,cache_write_tokens,"
                                  "total_tokens,estimated_cost,result_code,created_at"
-                                 if name == "usage_events" else "*")
+                                 if name == "usage_events" else
+                                 "id,issue,kind,model,head_sha,created_at"
+                                 if name == "events" else "*")
                     + f" FROM {name} ORDER BY 1").fetchall()
                 for name in ("admissions", "jobs", "retry_state", "events",
                              "usage_events")}
@@ -141,9 +143,14 @@ class StateMigrationTests(unittest.TestCase):
     @staticmethod
     def v3_schema() -> str:
         return (state.SCHEMA.replace(",\n  route_key TEXT", "")
+                .replace(",\n  policy_version INTEGER,\n  eligible_json TEXT,\n  decision_reason TEXT", "")
                 .replace(",\n  phase TEXT CHECK(phase IN ('initial','correction')),\n"
                          "  finished_at TEXT,\n"
                          "  duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0)", ""))
+
+    @staticmethod
+    def v4_schema() -> str:
+        return state.SCHEMA.replace(",\n  policy_version INTEGER,\n  eligible_json TEXT,\n  decision_reason TEXT", "")
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -188,6 +195,87 @@ class StateMigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "schema"):
             state.initialize(bad)
         self.assertEqual(self.version(bad), 3)
+
+    def test_v4_upgrade_preserves_events_and_provider_leases(self):
+        root = self.base / "v4"
+        root.mkdir()
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(self.v4_schema())
+            conn.execute("CREATE TABLE provider_leases ("
+                         "lease_id TEXT PRIMARY KEY, provider_id TEXT NOT NULL, "
+                         "model_id TEXT NOT NULL, expires_at INTEGER NOT NULL)")
+            conn.execute("INSERT INTO events(issue,kind,model) VALUES(7,'model_selected','p/m')")
+            conn.execute("INSERT INTO provider_leases VALUES('lease-1','p','m',42)")
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+        state.initialize(root)
+        with state.connect(root) as conn:
+            row = conn.execute("SELECT * FROM events").fetchone()
+            self.assertEqual((row["model"], row["policy_version"], row["eligible_json"],
+                              row["decision_reason"]), ("p/m", None, None, None))
+            lease = conn.execute("SELECT * FROM provider_leases").fetchone()
+            self.assertEqual((lease["route_key"], lease["reserved_cost"]), (None, 0))
+
+    def test_v4_migration_rejects_unknown_column_and_rolls_back_interruption(self):
+        root = self.base / "v4-interrupted"
+        root.mkdir()
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(self.v4_schema())
+            conn.execute("INSERT INTO events(issue,kind) VALUES(7,'admitted')")
+            conn.execute("PRAGMA user_version = 4")
+            conn.commit()
+        original = state._migrate_v4
+
+        def interrupted(conn):
+            original(conn)
+            raise OSError("interrupted route migration")
+
+        with patch.object(state, "_migrate_v4", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "interrupted route migration"):
+                state.initialize(root)
+        self.assertEqual(self.version(root), 4)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            self.assertNotIn("policy_version", {row[1] for row in conn.execute(
+                "PRAGMA table_info(events)")})
+            self.assertEqual(conn.execute("SELECT issue,kind FROM events").fetchall(),
+                             [(7, "admitted")])
+            conn.execute("ALTER TABLE events ADD COLUMN unexpected TEXT")
+            conn.commit()
+        with self.assertRaisesRegex(ValueError, "schema"):
+            state.initialize(root)
+        self.assertEqual(self.version(root), 4)
+
+    def test_route_decision_event_bounded_and_redacted(self):
+        root = self.base / "route-events"
+        with state.connect(root) as conn:
+            state.event(conn, 7, "route_decision", policy_version=1,
+                        eligible=["p/m", "p/n"], model="p/m",
+                        decision_reason="priority")
+            state.event(conn, 7, "route_decision", policy_version=1,
+                        eligible=[], decision_reason="no_eligible")
+            rows = conn.execute("SELECT * FROM events ORDER BY id").fetchall()
+            self.assertEqual(json.loads(rows[0]["eligible_json"]), ["p/m", "p/n"])
+            self.assertEqual((rows[0]["model"], rows[0]["decision_reason"]),
+                             ("p/m", "priority"))
+            self.assertIsNone(rows[1]["model"])
+            self.assertNotIn("task", rows[0].keys())
+            self.assertNotIn("key", rows[0].keys())
+            for kwargs in ({"policy_version": 0, "eligible": [], "decision_reason": "priority"},
+                           {"policy_version": 1, "eligible": ["p/m"] * 33,
+                            "decision_reason": "priority"},
+                           {"policy_version": 1, "eligible": ["p/m secret"],
+                            "decision_reason": "priority"},
+                           {"policy_version": 1, "eligible": [],
+                            "decision_reason": "private error"},
+                           {"policy_version": 1, "eligible": [],
+                            "decision_reason": "priority", "model": "p/m secret"},
+                           {"policy_version": 1, "eligible": [],
+                            "decision_reason": "priority", "head_sha": "a" * 40}):
+                with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    state.event(conn, 7, "route_decision", **kwargs)
+            with self.assertRaises(ValueError):
+                state.event(conn, 7, "model_selected", policy_version=1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM events").fetchone()[0], 2)
 
     def test_attempt_start_is_durable_and_finish_is_idempotent(self):
         root = self.base / "attempts"
@@ -492,7 +580,11 @@ class StateMigrationTests(unittest.TestCase):
         state.initialize(self.root)
         with closing(sqlite3.connect(self.root / "state.sqlite3")) as conn:
             for name, rows in before.items():
-                self.assertEqual(conn.execute(f"SELECT * FROM {name}").fetchall(), rows)
+                columns = ("lease_id,provider_id,model_id,expires_at"
+                           if name == "provider_leases" else "*")
+                self.assertEqual(conn.execute(f"SELECT {columns} FROM {name}").fetchall(), rows)
+            lease = conn.execute("SELECT route_key,reserved_cost FROM provider_leases").fetchone()
+            self.assertEqual(lease, (None, 0))
         self.assertEqual(ledger(self.root), self.before)
 
     def test_backup_restores_preview_state_after_upgrade(self):
