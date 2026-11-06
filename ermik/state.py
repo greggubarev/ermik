@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   last_model TEXT, result_model TEXT, attempts_count INTEGER NOT NULL DEFAULT 0,
   review_next_check_at INTEGER NOT NULL DEFAULT 0,
   image_id TEXT,
-  reason_code TEXT CHECK(reason_code IN ('provider_auth','provider_quota','local_check_failed'))
+  reason_code TEXT CHECK(reason_code IN ('provider_auth','provider_quota','local_check_failed','broker_unavailable','publication_unconfirmed','publish_credential_unavailable'))
 );
 CREATE TABLE IF NOT EXISTS retry_state (
   issue INTEGER PRIMARY KEY REFERENCES jobs(issue),
@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _TABLE_COLUMNS = {
     "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
@@ -103,7 +103,7 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
 
 
 def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
-                     v1: bool = False) -> None:
+                     v1: bool = False, v2: bool = False) -> None:
     tables, indexes = _schema_objects(conn)
     if (not set(_TABLE_COLUMNS).issubset(tables)
             or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
@@ -149,8 +149,11 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
         "usage_events": ("CHECK(completeIN(0,1))",),
     }
     if "reason_code" in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
-        checks["jobs"] = ("CHECK(reason_codeIN('provider_auth','provider_quota',"
-                          "'local_check_failed'))",)
+        reason_check = ("CHECK(reason_codeIN('provider_auth','provider_quota',"
+                        "'local_check_failed'"
+                        + ("" if v2 else ",'broker_unavailable','publication_unconfirmed',"
+                           "'publish_credential_unavailable'") + "))")
+        checks["jobs"] = (reason_check,)
     if "provider_cooldowns" in tables:
         checks["provider_cooldowns"] = ("CHECK(reasonIN('quota'))",)
     for table, required in checks.items():
@@ -192,6 +195,22 @@ def _migrate_v1(conn: sqlite3.Connection) -> None:
                  "('provider_auth','provider_quota','local_check_failed'))")
 
 
+def _migrate_v2(conn: sqlite3.Connection) -> None:
+    # Rebuild the constrained table in one transaction. Keep the jobs name as
+    # the retry_state FK target, and verify all existing references before commit.
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(jobs)")]
+    jobs_ddl = next(statement.strip() for statement in SCHEMA.split(";")
+                    if statement.lstrip().startswith("CREATE TABLE IF NOT EXISTS jobs ("))
+    conn.execute(jobs_ddl.replace("CREATE TABLE IF NOT EXISTS jobs (",
+                                  "CREATE TABLE jobs_v3 (", 1))
+    names = ",".join(columns)
+    conn.execute(f"INSERT INTO jobs_v3({names}) SELECT {names} FROM jobs")
+    conn.execute("DROP TABLE jobs")
+    conn.execute("ALTER TABLE jobs_v3 RENAME TO jobs")
+    if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        raise ValueError("SQLite state foreign key check failed")
+
+
 def initialize(root: Path) -> Path:
     if root.is_symlink():
         raise ValueError("state_dir cannot be a symlink")
@@ -218,8 +237,13 @@ def initialize(root: Path) -> Path:
         elif version == 1:
             _validate_schema(conn, v1=True)
             _migrate_v1(conn)
+        elif version == 2:
+            pass
         elif version != SCHEMA_VERSION:
             raise ValueError(f"unsupported SQLite state schema version: {version}")
+        if version in (0, 1, 2) and not fresh:
+            _validate_schema(conn, v2=True)
+            _migrate_v2(conn)
         _validate_schema(conn)
         if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

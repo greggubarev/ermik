@@ -208,6 +208,73 @@ class StateMigrationTests(unittest.TestCase):
         state.initialize(root)
         self.assertEqual(self.version(root), state.SCHEMA_VERSION)
 
+    def test_v2_upgrade_preserves_jobs_retry_fk_and_reason_constraint(self):
+        root = self.base / "v2-reasons"
+        root.mkdir()
+        old = "'provider_auth','provider_quota','local_check_failed'"
+        new = old + ",'broker_unavailable','publication_unconfirmed','publish_credential_unavailable'"
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(state.SCHEMA.replace(new, old))
+            conn.execute("PRAGMA user_version = 2")
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,reason_code) "
+                         "VALUES(7,'work-7',?,'retry_wait','[]','provider_quota')", ("a" * 40,))
+            conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,failure_id) "
+                         "VALUES(7,1,'provider','running','failure-7')")
+            conn.commit()
+        before = ledger(root)
+        state.initialize(root)
+        self.assertEqual(self.version(root), state.SCHEMA_VERSION)
+        self.assertEqual(ledger(root), before)
+        with state.connect(root) as conn:
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(conn.execute("PRAGMA foreign_key_list(retry_state)").fetchone()[2], "jobs")
+            conn.execute("UPDATE jobs SET reason_code='publication_unconfirmed' WHERE issue=7")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("UPDATE jobs SET reason_code='private reply' WHERE issue=7")
+
+    def test_interrupted_v2_rebuild_rolls_back_rows_and_constraint(self):
+        root = self.base / "v2-interrupted"
+        root.mkdir()
+        old = "'provider_auth','provider_quota','local_check_failed'"
+        new = old + ",'broker_unavailable','publication_unconfirmed','publish_credential_unavailable'"
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(state.SCHEMA.replace(new, old))
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        original = state._migrate_v2
+
+        def interrupted(conn):
+            original(conn)
+            raise OSError("interrupted table rebuild")
+
+        with patch.object(state, "_migrate_v2", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "interrupted table rebuild"):
+                state.initialize(root)
+        self.assertEqual(self.version(root), 2)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            self.assertEqual(conn.execute("SELECT name FROM sqlite_master WHERE name='jobs_v3'").fetchone(), None)
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,reason_code) "
+                             "VALUES(7,'work-7',?,'blocked','[]','broker_unavailable')", ("a" * 40,))
+        state.initialize(root)
+        self.assertEqual(self.version(root), state.SCHEMA_VERSION)
+
+    def test_v2_without_bounded_reason_constraint_is_rejected(self):
+        root = self.base / "v2-unsafe-reason"
+        root.mkdir()
+        old = "'provider_auth','provider_quota','local_check_failed'"
+        new = old + ",'broker_unavailable','publication_unconfirmed','publish_credential_unavailable'"
+        schema = state.SCHEMA.replace(new, old)
+        schema = schema.replace(f"reason_code TEXT CHECK(reason_code IN ({old}))",
+                                "reason_code TEXT")
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(schema)
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        with self.assertRaisesRegex(ValueError, "schema"):
+            state.initialize(root)
+        self.assertEqual(self.version(root), 2)
+
     def test_v1_manifest_fails_closed_and_survives_populated_upgrade(self):
         root = self.base / "manifest-preview"
         create_preview(root, with_image=True)

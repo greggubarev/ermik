@@ -95,7 +95,10 @@ class ObservabilityTests(unittest.TestCase):
             for issue, status, reason in ((1, "blocked", "provider_auth"),
                                           (2, "retry_wait", "provider_quota"),
                                           (3, "blocked", "local_check_failed"),
-                                          (4, "awaiting_review", "provider_auth")):
+                                          (4, "awaiting_review", "provider_auth"),
+                                          (5, "retry_wait", "publication_unconfirmed"),
+                                          (6, "blocked", "broker_unavailable"),
+                                          (7, "blocked", "publish_credential_unavailable")):
                 conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
                              "reason_code,error) VALUES(?,?,?,?,?,?,?)",
                              (issue, f"work-{issue}", "a" * 40, status, "[]", reason,
@@ -107,6 +110,9 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(jobs[2]["reason_code"], "provider_quota")
         self.assertEqual(jobs[3]["next_action"], "inspect_local_check_results")
         self.assertEqual(jobs[4]["reason_code"], "pr_identity_unverified")
+        self.assertEqual(jobs[5]["next_action"], "reconcile_publication_remotely")
+        self.assertEqual(jobs[6]["next_action"], "inspect_broker_manually")
+        self.assertEqual(jobs[7]["next_action"], "verify_fork_credential_manually")
         self.assertNotIn("private token text", str(jobs))
 
     def test_resource_guard_is_non_destructive(self):

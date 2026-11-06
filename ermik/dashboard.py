@@ -30,6 +30,9 @@ _RECORDED_ACTIONS = {"admitted", "claimed", "model_selected", "quota_paused",
 _GUIDANCE = {
     "provider_auth": ("blocked", "verify_provider_credential_manually"),
     "local_check_failed": ("blocked", "inspect_local_check_results"),
+    "broker_unavailable": ("blocked", "inspect_broker_manually"),
+    "publication_unconfirmed": ("blocked", "reconcile_publication_remotely"),
+    "publish_credential_unavailable": ("blocked", "verify_fork_credential_manually"),
     "provider_quota": ("retry_wait", "wait_for_controller_reconciliation"),
     "requires_inspection": ("blocked", "reconcile_issue_branch_and_pr_manually"),
     "provider_capacity_wait": ("retry_wait", "wait_for_controller_reconciliation"),
@@ -86,8 +89,13 @@ def public_snapshot(source: dict) -> dict:
         result_model = _safe_id(row.get("result_model"))
         reason = row.get("reason_code")
         action = row.get("next_action")
+        allowed = _GUIDANCE.get(reason) if isinstance(reason, str) else None
+        if (allowed is not None and reason in
+                {"broker_unavailable", "publication_unconfirmed", "publish_credential_unavailable"}
+                and status == "retry_wait"):
+            allowed = ("retry_wait", allowed[1])
         if (not isinstance(reason, str) or not isinstance(action, str)
-                or _GUIDANCE.get(reason) != (status, action)):
+                or allowed != (status, action)):
             reason, action = None, None
         recorded = row.get("last_recorded_action")
         jobs.append({"issue": issue,

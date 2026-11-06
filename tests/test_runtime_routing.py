@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -76,6 +78,64 @@ class RoutingTests(unittest.TestCase):
             runtime.LocalCheckFailure("check")), "local_check_failed")
         self.assertIsNone(runtime._failure_reason(runtime.WorkerFailure(75)))
         self.assertIsNone(runtime._failure_reason(runtime.WorkflowError("secret auth failure")))
+        self.assertEqual(runtime._failure_reason(runtime.BrokerUnavailable()), "broker_unavailable")
+        self.assertEqual(runtime._failure_reason(runtime.PublicationUnconfirmed()), "publication_unconfirmed")
+        self.assertEqual(runtime._failure_reason(runtime.PublishCredentialUnavailable()),
+                         "publish_credential_unavailable")
+
+    def test_broker_connection_and_reply_boundaries(self):
+        cfg = replace(self.cfg, draft_pr_socket=self.cfg.state_dir / "broker.sock")
+
+        class Client:
+            def __init__(self, *, connect_error=False, send_error=False, reply=b'{"ok":true,"pr":11}\n'):
+                self.connect_error = connect_error
+                self.send_error = send_error
+                self.reply = reply
+                self.closed = False
+                self.sent = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+
+            def settimeout(self, _seconds):
+                pass
+
+            def connect(self, _path):
+                if self.connect_error:
+                    raise OSError("private connection detail")
+
+            def sendall(self, _payload):
+                self.sent = True
+                if self.send_error:
+                    raise OSError("partial send")
+
+            def makefile(self, _mode):
+                return io.BytesIO(self.reply)
+
+        def publish(client):
+            with patch.object(runtime.socket, "AF_UNIX", 1, create=True), \
+                    patch.object(runtime.socket, "socket", return_value=client):
+                return runtime._draft_pr(cfg, Hub(self.cfg.repo), issue=1,
+                                         branch="work/issue-1", head=BASE, base=BASE,
+                                         paths=["file.txt"], proof={"result": "passed"},
+                                         model=None, body_sha256="c" * 64, title="Issue 1")
+
+        disconnected = Client(connect_error=True)
+        with self.assertRaises(runtime.BrokerUnavailable):
+            publish(disconnected)
+        self.assertTrue(disconnected.closed)
+        self.assertFalse(disconnected.sent)
+        for client in (Client(send_error=True), Client(reply=b""),
+                       Client(reply=b'{"ok":false}\n'), Client(reply=b'{"ok":true,"pr":"11"}\n')):
+            with self.subTest(reply=client.reply, send_error=client.send_error):
+                with self.assertRaises(runtime.PublicationUnconfirmed):
+                    publish(client)
+                self.assertTrue(client.closed)
+                self.assertTrue(client.sent)
+        self.assertEqual(publish(Client()), 11)
 
     def test_only_confirmed_check_command_exit_has_typed_failure(self):
         checkout = self.cfg.workspace / "checkout"

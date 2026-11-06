@@ -160,6 +160,24 @@ class RuntimeRecoveryTests(unittest.TestCase):
         with state.connect(self.cfg.state_dir) as conn:
             self.assertEqual(state.job(conn, 1)["error"], "WorkerFailure")
 
+    def test_unconfirmed_publication_records_reconciliation_action(self):
+        with patch.object(runtime, "_perform", side_effect=runtime.PublicationUnconfirmed()):
+            result = runtime.run_once(self.cfg)
+        self.assertEqual(result[0]["status"], "retry_wait")
+        with state.connect(self.cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual(row["reason_code"], "publication_unconfirmed")
+            self.assertEqual(row["status"], "retry_wait")
+
+    def test_missing_fork_credential_blocks_without_retry(self):
+        with patch.object(runtime, "_perform", side_effect=runtime.PublishCredentialUnavailable()):
+            result = runtime.run_once(self.cfg)
+        self.assertEqual(result[0]["status"], "blocked")
+        with state.connect(self.cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual(row["reason_code"], "publish_credential_unavailable")
+            self.assertEqual(row["status"], "blocked")
+
     def test_changed_issue_identity_blocks_due_retry(self):
         due = self._first_failure()
         Hub.issues[1]["body"] = BODY.replace("src/example.py", "src/other.py")

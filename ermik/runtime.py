@@ -89,7 +89,10 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
                 f"Execution image: `{image_id}`\n"
                 f"Execution image config: `{image_config_digest}`\n"
                 f"Local checks passed on `{head}`.\nReview the full diff and acceptance criteria.")
-        return gh.open_pr(branch, body, title, cfg.base_branch)
+        try:
+            return gh.open_pr(branch, body, title, cfg.base_branch)
+        except GitHubError as exc:
+            raise PublicationUnconfirmed("draft PR response is unconfirmed") from exc
     root = cfg.draft_pr_evidence_dir or cfg.state_dir / "evidence"
     if cfg.draft_pr_evidence_dir is not None:
         if os.name != "posix" or root.is_symlink() or not root.is_dir():
@@ -120,19 +123,29 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
     request = {"op": "create_draft", "issue": issue, "branch": branch,
                "head_sha": head, "base_sha": base}
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise BrokerUnavailable("draft PR broker connection unavailable") from exc
+    with client:
+        try:
             client.settimeout(45)
             client.connect(str(cfg.draft_pr_socket))
+        except OSError as exc:
+            raise BrokerUnavailable("draft PR broker connection unavailable") from exc
+        try:
             client.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
             with client.makefile("rb") as response:
                 line = response.readline(4096)
+        except OSError as exc:
+            raise PublicationUnconfirmed("draft PR broker response is unconfirmed") from exc
+    try:
         answer = json.loads(line)
         if (not isinstance(answer, dict) or answer.get("ok") is not True
                 or type(answer.get("pr")) is not int or answer["pr"] <= 0):
-            raise GitHubError("draft PR broker refused publication")
+            raise PublicationUnconfirmed("draft PR broker response is unconfirmed")
         return answer["pr"]
-    except (OSError, ValueError) as exc:
-        raise GitHubError("draft PR broker unavailable") from exc
+    except ValueError as exc:
+        raise PublicationUnconfirmed("draft PR broker response is unconfirmed") from exc
 
 
 def _admission_marker(issue: int, spec: IssueSpec) -> str:
@@ -160,6 +173,18 @@ class LocalCheckFailure(WorkflowError):
     pass
 
 
+class BrokerUnavailable(GitHubError):
+    pass
+
+
+class PublicationUnconfirmed(GitHubError):
+    pass
+
+
+class PublishCredentialUnavailable(WorkflowError):
+    pass
+
+
 class ProviderQuotaExhausted(WorkflowError):
     pass
 
@@ -182,6 +207,12 @@ def _failure_reason(exc: Exception) -> str | None:
         return "provider_quota"
     if isinstance(exc, LocalCheckFailure):
         return "local_check_failed"
+    if isinstance(exc, BrokerUnavailable):
+        return "broker_unavailable"
+    if isinstance(exc, PublicationUnconfirmed):
+        return "publication_unconfirmed"
+    if isinstance(exc, PublishCredentialUnavailable):
+        return "publish_credential_unavailable"
     return None
 
 
@@ -285,7 +316,7 @@ def _publish_git(cfg: Config, path: Path, *args: str, timeout: int = 300) -> str
         return git(path, *args, timeout=timeout)
     token_name = cfg.publish_token_env
     if not token_name or not os.environ.get(token_name):
-        raise WorkflowError("fork publication credential is unavailable")
+        raise PublishCredentialUnavailable("fork publication credential is unavailable")
     helper = cfg.state_dir / "fork-askpass"
     if os.name == "nt":
         raise WorkflowError("fork publication requires a POSIX server")
@@ -1415,6 +1446,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
             _require_pr(gh, existing, cfg, branch=branch, number=pr_number,
                         head_sha=expected_head)
         if cfg.publish_repo:
+            if not cfg.publish_token_env or not os.environ.get(cfg.publish_token_env):
+                raise PublishCredentialUnavailable("fork publication credential is unavailable")
             gh.validate_publish_access()
         push = ["push", "origin"]
         if pr_number is not None and base != expected_base:
