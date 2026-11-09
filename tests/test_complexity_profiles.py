@@ -85,6 +85,7 @@ class ReadmitHub:
         self.notes = []
         self.pr_reads = 0
         self.advance_head = False
+        self.cancel_on_request = False
 
     def identity(self):
         return "owner"
@@ -96,6 +97,8 @@ class ReadmitHub:
     def comments(self, number):
         if number == 1:
             return self.notes
+        if self.cancel_on_request:
+            self.names.discard("queue:worker")
         return [{"id": self.request_id,
                  "body": f"SEMI_REWORK issue=1 head={'b' * 40}",
                  "user": {"login": "owner"}}]
@@ -293,6 +296,33 @@ class ComplexityProfileTests(unittest.TestCase):
                 self.assertEqual((row["status"], row["complexity"]),
                                  ("blocked", "easy"))
 
+    def test_changed_scope_rejects_before_any_admission_write(self):
+        cfg, hub = self.readmission_hub()
+        hub.body = BODY.replace("file.txt", "other.txt")
+        names = set(hub.names)
+        notes = list(hub.notes)
+        with patch.object(runtime, "GitHub", return_value=hub), patch.object(
+                runtime, "_require_pr"):
+            with self.assertRaisesRegex(runtime.WorkflowError,
+                                        "allowed paths changed"):
+                runtime.admit(cfg, 1, "hard")
+        self.assertEqual(hub.names, names)
+        self.assertEqual(hub.notes, notes)
+
+    def test_separate_maintainer_state_rejects_scope_change_before_write(self):
+        cfg, hub = self.readmission_hub()
+        cfg = replace(cfg, state_dir=cfg.state_dir.parent / "maintainer-state")
+        hub.body = BODY.replace("file.txt", "other.txt")
+        names = set(hub.names)
+        notes = list(hub.notes)
+        with patch.object(runtime, "GitHub", return_value=hub), patch.object(
+                runtime, "_require_pr"):
+            with self.assertRaisesRegex(runtime.WorkflowError,
+                                        "allowed paths changed"):
+                runtime.admit(cfg, 1, "hard")
+        self.assertEqual(hub.names, names)
+        self.assertEqual(hub.notes, notes)
+
     def test_changed_head_during_readmission_keeps_job_blocked(self):
         cfg, hub = self.readmission_hub()
         hub.advance_head = True
@@ -302,6 +332,16 @@ class ComplexityProfileTests(unittest.TestCase):
                 row = state.job(conn, 1)
                 self.assertEqual((row["status"], row["complexity"], row["head_sha"]),
                                  ("blocked", "easy", "b" * 40))
+
+    def test_canceled_issue_during_readmission_keeps_job_blocked(self):
+        cfg, hub = self.readmission_hub()
+        hub.cancel_on_request = True
+        with patch.object(runtime, "_require_pr"):
+            with state.connect(cfg.state_dir) as conn:
+                self.assertIsNone(runtime._correction(hub, cfg, conn))
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["complexity"], row["route_key"]),
+                                 ("blocked", "easy", "route:auto"))
 
     def test_blocked_prepublication_job_cannot_readmit_as_pr(self):
         cfg, hub = self.readmission_hub()

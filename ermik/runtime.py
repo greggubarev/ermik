@@ -814,12 +814,32 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
                 or not re.fullmatch(r"[0-9a-f]{40}",
                                     reviewed_pr.get("headRefOid") or "")):
             raise WorkflowError("blocked PR lacks an exact draft HEAD")
+        scope = hashlib.sha256(json.dumps(
+            spec.allowed_paths, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        prior_scopes = []
+        for comment in gh.comments(number):
+            if comment.get("user", {}).get("login") != cfg.maintainer:
+                continue
+            first = (comment.get("body") or "").splitlines()[0:1]
+            match = re.fullmatch(
+                rf"SEMI_ADMIT issue={number} body=[0-9a-f]{{64}} "
+                r"scope=([0-9a-f]{64})(?: tier=(?:easy|medium|hard) "
+                r"route=route:[a-z][a-z0-9_-]{0,39} profile=[0-9a-f]{64})?",
+                first[0]) if first else None
+            if match:
+                prior_scopes.append(match.group(1))
+        if not prior_scopes or any(previous != scope for previous in prior_scopes):
+            raise WorkflowError("blocked PR allowed paths changed")
     with state.connect(cfg.state_dir) as conn:
         existing = state.job(conn, number)
         if existing and not (blocked_readmission and existing["status"] == "blocked"
                              and existing["pr"] == reviewed_pr["number"]
                              and existing["head_sha"] == reviewed_pr["headRefOid"]):
             raise WorkflowError("issue already has a job")
+        if (existing and blocked_readmission
+                and tuple(json.loads(existing["allowed_json"])) != spec.allowed_paths):
+            raise WorkflowError("blocked PR allowed paths changed")
     if cfg.complexity_profiles:
         if complexity not in cfg.complexity_profiles:
             raise WorkflowError("admit requires a configured --complexity tier")
@@ -994,6 +1014,8 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 fresh_pr = gh.pr(row["pr"])
                 if (parse_issue(fresh_issue.get("body") or "").body_sha256
                         != spec.body_sha256
+                        or not {"queue:worker", "state:blocked"}.issubset(
+                            labels(fresh_issue))
                         or _route_key(fresh_issue) != route
                         or _complexity_key(fresh_issue) != key
                         or not _approved_on_github(
