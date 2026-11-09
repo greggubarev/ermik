@@ -167,14 +167,19 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
         return manifest
 
 
-def verify_manifest(cfg: Config, pr_number: int, manifest: dict) -> dict:
-    """Verify a portable observation against current GitHub and local policy."""
+def verify_manifest(cfg: Config, pr_number: int, manifest: dict,
+                    *, _live_result=None) -> dict:
+    """Verify a portable observation against GitHub and local policy.
+
+    A supplied live result belongs to one read-only packet request whose
+    caller performs a second remote identity check before displaying it.
+    """
     record = validate_manifest(manifest)
     if record["version"] < 2:
         return {"status": "stale", "reason": "image_identity_missing"}
-    gh = _github(cfg)
     try:
-        pr, issue_number, spec, paths = _live(cfg, gh, pr_number)
+        pr, issue_number, spec, paths = (_live_result if _live_result is not None
+                                         else _live(cfg, _github(cfg), pr_number))
     except WorkflowError:
         return {"status": "stale", "reason": "remote_identity"}
     try:

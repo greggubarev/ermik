@@ -57,9 +57,8 @@ class ReviewPacketTests(unittest.TestCase):
 
     def test_current_evidence_has_bounded_claims_and_missing_review(self):
         record = self.record()
-        with (patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, record)),
-              patch("ermik.review_packet._published_records", return_value=[])):
+        with patch("ermik.review_packet.fetch_manifest",
+                   return_value=({"status": "current"}, record)):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
         self.assertEqual(packet["review"], {"status": "missing"})
@@ -75,15 +74,49 @@ class ReviewPacketTests(unittest.TestCase):
 
     def test_current_correction_keeps_previous_head_as_history(self):
         record = self.record()
-        with (patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, record)),
-              patch("ermik.review_packet._published_records", return_value=[
-                  ({"id": 1}, {"head": OLD}), ({"id": 2}, record)])):
+        def fetched(_cfg, _number, *, _records_out, **_kwargs):
+            _records_out.extend([({"id": 1}, {"head": OLD}),
+                                 ({"id": 2}, record)])
+            return {"status": "current"}, record
+        with patch("ermik.review_packet.fetch_manifest", side_effect=fetched):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
         self.assertEqual(packet["previous_head"], OLD)
         self.assertEqual(packet["head"], HEAD)
         self.assertEqual(packet["evidence"]["head"], HEAD)
+
+    def test_packet_reuses_first_verified_snapshot_and_comment_list(self):
+        record = self.record()
+        first = (self.pr, 7, self.spec, ["src/one.py"])
+        def fetched(_cfg, _number, *, _live_result, _records_out):
+            self.assertEqual(_live_result, first)
+            _records_out.extend([({"id": 1}, {"head": OLD}),
+                                 ({"id": 2}, record)])
+            return {"status": "current"}, record
+        with (patch("ermik.review_packet._live", side_effect=[first, first]) as live,
+              patch("ermik.review_packet.fetch_manifest", side_effect=fetched) as fetch):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(live.call_count, 2)
+        fetch.assert_called_once()
+        self.assertEqual(packet["previous_head"], OLD)
+        self.assertEqual(packet["status"], "current")
+
+    def test_reused_snapshot_cannot_hide_head_change_on_final_read(self):
+        record = self.record()
+        first = (self.pr, 7, self.spec, ["src/one.py"])
+        moved = ({**self.pr, "headRefOid": "e" * 40}, 7, self.spec,
+                 ["src/one.py"])
+        def fetched(_cfg, _number, *, _live_result, _records_out):
+            self.assertEqual(_live_result, first)
+            _records_out.append(({"id": 2}, record))
+            return {"status": "current"}, record
+        with (patch("ermik.review_packet._live", side_effect=[first, moved]),
+              patch("ermik.review_packet.fetch_manifest", side_effect=fetched)):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "stale")
+        self.assertFalse(packet["head_verified"])
+        self.assertIsNone(packet["head"])
+        self.assertNotIn("checks", packet["evidence"])
 
     def test_current_local_review_is_separate_from_publisher_claim(self):
         (self.cfg.state_dir / "reviews").mkdir(parents=True)
@@ -101,8 +134,7 @@ class ReviewPacketTests(unittest.TestCase):
         with (patch("ermik.review_packet._load", return_value=local),
               patch("ermik.review_packet._review_policy", return_value=IMAGE),
               patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, self.record())),
-              patch("ermik.review_packet._published_records", return_value=[])):
+                    return_value=({"status": "current"}, self.record()))):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
         self.assertEqual(packet["review"], {"status": "current", "head": HEAD})
@@ -120,8 +152,7 @@ class ReviewPacketTests(unittest.TestCase):
                  "decision": "reviewed", "ci": {"result": "passed"}}
         with (patch("ermik.review_packet._load", return_value=local),
               patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, self.record())),
-              patch("ermik.review_packet._published_records", return_value=[])):
+                    return_value=({"status": "current"}, self.record()))):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
         self.assertEqual(packet["review"], {
@@ -144,8 +175,7 @@ class ReviewPacketTests(unittest.TestCase):
         with (patch("ermik.review_packet.published_image_config_digest",
                     side_effect=[IMAGE_CONFIG_DIGEST, "sha256:" + "0" * 64]),
               patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, self.record())),
-              patch("ermik.review_packet._published_records", return_value=[])):
+                    return_value=({"status": "current"}, self.record()))):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "stale")
         self.assertEqual(packet["evidence"], {"status": "stale",
@@ -153,16 +183,14 @@ class ReviewPacketTests(unittest.TestCase):
 
     def test_head_moves_between_live_snapshot_and_current_fetch(self):
         second_head = "e" * 40
-        with (patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, self.record(second_head))),
-              patch("ermik.review_packet._published_records") as history):
+        with patch("ermik.review_packet.fetch_manifest",
+                   return_value=({"status": "current"}, self.record(second_head))):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "stale")
         self.assertEqual(packet["evidence"], {"status": "stale",
                                               "reason": "identity_changed"})
         self.assertEqual(packet["head"], HEAD)
         self.assertNotIn("checks", packet["evidence"])
-        history.assert_not_called()
 
     def test_head_moves_during_comment_history_read(self):
         moved = {**self.pr, "headRefOid": "e" * 40}
@@ -172,8 +200,7 @@ class ReviewPacketTests(unittest.TestCase):
               patch("ermik.review_packet._review_summary",
                     return_value={"status": "current", "head": HEAD}),
               patch("ermik.review_packet.fetch_manifest",
-                    return_value=({"status": "current"}, self.record())),
-              patch("ermik.review_packet._published_records", return_value=[])):
+                    return_value=({"status": "current"}, self.record()))):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "stale")
         self.assertEqual(packet["evidence"], {"status": "stale",
