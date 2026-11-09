@@ -109,14 +109,16 @@ class ModelCandidate:
 
 def model_spec(candidate: ModelCandidate) -> str:
     """Serialize only public routing metadata for the disposable worker."""
-    return json.dumps({"provider_id": candidate.provider_id,
-                       "model_id": candidate.model_id,
-                       "credential_env": candidate.credential_env,
-                       "base_url": candidate.base_url,
-                       "package": candidate.package,
-                       "max_parallel": candidate.max_parallel,
-                       "effort": candidate.effort,
-                       "supported_efforts": candidate.supported_efforts}, separators=(",", ":"),
+    fields = {"provider_id": candidate.provider_id,
+              "model_id": candidate.model_id,
+              "credential_env": candidate.credential_env,
+              "base_url": candidate.base_url,
+              "package": candidate.package,
+              "max_parallel": candidate.max_parallel}
+    if candidate.effort is not None:
+        fields["effort"] = candidate.effort
+        fields["supported_efforts"] = candidate.supported_efforts
+    return json.dumps(fields, separators=(",", ":"),
                       sort_keys=True)
 
 

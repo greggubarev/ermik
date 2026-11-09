@@ -185,9 +185,11 @@ def _admission_marker(issue: int, spec: IssueSpec, cfg: Config | None = None,
     return marker
 
 
-def _approved_on_github(gh: GitHub, cfg: Config, issue: int, spec: IssueSpec) -> bool:
+def _approved_on_github(gh: GitHub, cfg: Config, issue: int, spec: IssueSpec,
+                        current: dict | None = None) -> bool:
     try:
-        current = gh.issue(issue) if cfg.complexity_profiles else None
+        if cfg.complexity_profiles and current is None:
+            current = gh.issue(issue)
         marker = _admission_marker(issue, spec, cfg, current)
     except ValueError:
         return False
@@ -196,9 +198,16 @@ def _approved_on_github(gh: GitHub, cfg: Config, issue: int, spec: IssueSpec) ->
                for comment in gh.comments(issue))
 
 
+def _row_complexity(row) -> str | None:
+    try:
+        return row["complexity"]
+    except (KeyError, IndexError):
+        return None
+
+
 def _job_complexity_matches(cfg: Config, current: dict, row) -> bool:
     if not cfg.complexity_profiles:
-        return row["complexity"] is None
+        return _row_complexity(row) is None
     key = _complexity_key(current)
     tier = key.removeprefix("complexity:") if key else None
     route = _route_key(current)
@@ -1022,7 +1031,9 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
     return None
 
 
-def _last_selected_effort(conn: sqlite3.Connection, row) -> str | None:
+def _last_selected_effort(conn: sqlite3.Connection | None, row) -> str | None:
+    if conn is None or _row_complexity(row) is None:
+        return None
     selected = conn.execute(
         "SELECT effort FROM events WHERE issue=? AND kind='model_selected' "
         "AND model=? ORDER BY id DESC LIMIT 1",
@@ -1030,8 +1041,8 @@ def _last_selected_effort(conn: sqlite3.Connection, row) -> str | None:
     return selected["effort"] if selected else None
 
 
-def _rebuild_published_evidence(cfg: Config, conn: sqlite3.Connection,
-                                row, pr: dict) -> dict:
+def _rebuild_published_evidence(cfg: Config, row, pr: dict,
+                                *, conn: sqlite3.Connection | None = None) -> dict:
     """Rerun checks on an exact local commit after an acknowledged PR write was lost."""
     if not row["image_id"] or published_image_id(pr.get("body") or "") != row["image_id"]:
         raise WorkflowError("published PR image differs from recorded execution image")
@@ -1071,7 +1082,7 @@ def _rebuild_published_evidence(cfg: Config, conn: sqlite3.Connection,
             "head": local_head, "base": base, "paths": paths, "ci": proof,
             "model": row["last_model"],
             "effort": _last_selected_effort(conn, row),
-            "complexity": row["complexity"]}
+            "complexity": _row_complexity(row)}
 
 
 def _published_evidence_matches(conn: sqlite3.Connection, proof: dict, row, pr: dict,
@@ -1091,8 +1102,8 @@ def _published_evidence_matches(conn: sqlite3.Connection, proof: dict, row, pr: 
             and proof.get("body_sha256") == spec.body_sha256
             and (proof.get("model") in (None, row["last_model"])
                  or rebuilt and isinstance(proof.get("model"), str))
-            and (row["complexity"] is None or
-                 (proof.get("complexity") == row["complexity"]
+            and (_row_complexity(row) is None or
+                 (proof.get("complexity") == _row_complexity(row)
                   and proof.get("effort") == _last_selected_effort(conn, row)))
             and isinstance(proof.get("ci"), dict)
             and proof["ci"].get("result") == "passed"
@@ -1102,8 +1113,9 @@ def _published_evidence_matches(conn: sqlite3.Connection, proof: dict, row, pr: 
             == published_image_config_digest(pr.get("body") or ""))
 
 
-def _recover_unacknowledged_push(gh: GitHub, cfg: Config, conn: sqlite3.Connection, row,
-                                 issue: dict, spec: IssueSpec, remote: str) -> dict:
+def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
+                                 issue: dict, spec: IssueSpec, remote: str,
+                                 *, conn: sqlite3.Connection | None = None) -> dict:
     """Publish a checked local commit when push succeeded but its reply was lost."""
     match = re.fullmatch(r"([0-9a-f]{40})\s+refs/heads/" + re.escape(row["branch"]),
                          remote.strip())
@@ -1137,9 +1149,10 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, conn: sqlite3.Connecti
     finally:
         if checkout.exists():
             _remove_checkout(cfg, checkout)
-    if (parse_issue(gh.issue(row["issue"]).get("body") or "").body_sha256 != spec.body_sha256
-            or not _approved_on_github(gh, cfg, row["issue"], spec)
-            or not _job_complexity_matches(cfg, issue, row)
+    fresh_issue = gh.issue(row["issue"])
+    if (parse_issue(fresh_issue.get("body") or "").body_sha256 != spec.body_sha256
+            or not _approved_on_github(gh, cfg, row["issue"], spec, fresh_issue)
+            or not _job_complexity_matches(cfg, fresh_issue, row)
             or main_sha(gh, cfg) != row["base_sha"]):
         raise WorkflowError("orphan branch approval or base changed")
     if cfg.publish_repo:
@@ -1176,7 +1189,7 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, conn: sqlite3.Connecti
             "head": head, "base": row["base_sha"], "paths": paths,
             "ci": proof, "model": row["last_model"],
             "effort": _last_selected_effort(conn, row),
-            "complexity": row["complexity"],
+            "complexity": _row_complexity(row),
             "body_sha256": spec.body_sha256}
 
 
@@ -1293,7 +1306,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     proof = read_evidence(evidence)
                 if not evidence.is_file() or not _published_evidence_matches(
                         conn, proof, row, pr, spec):
-                    proof = _rebuild_published_evidence(cfg, conn, row, pr)
+                    proof = _rebuild_published_evidence(cfg, row, pr, conn=conn)
                     proof["body_sha256"] = spec.body_sha256
                     if not _published_evidence_matches(conn, proof, row, pr, spec,
                                                        rebuilt=True):
@@ -1363,7 +1376,8 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     if match is None:
                         raise WorkflowError("orphan branch requires inspection")
                     leftover = _verify_leftover_checkout(cfg, row, match.group(1))
-                    proof = _recover_unacknowledged_push(gh, cfg, conn, row, issue, spec, remote)
+                    proof = _recover_unacknowledged_push(
+                        gh, cfg, row, issue, spec, remote, conn=conn)
                     evidence = (cfg.state_dir / "evidence" / str(row["issue"])
                                 / f"{proof['head']}.json")
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)

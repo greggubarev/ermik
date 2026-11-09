@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from ermik import recovery, review, runtime, state
 from ermik.config import Config
+from ermik.providers import ModelCandidate
 
 
 BODY = """## Goal
@@ -313,6 +314,58 @@ class FaultWindowTests(unittest.TestCase):
                 runtime._recover_unacknowledged_push(
                     self.gh, self.cfg, row, self.gh.issue(1), self.spec,
                     f"{'c' * 40}\trefs/heads/{BRANCH}")
+        self.assertEqual(self.gh.open_calls, 0)
+
+    def test_unacknowledged_push_rejects_route_change_after_local_checks(self):
+        model = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY",
+                               supported_efforts=("low",))
+        selected = replace(model, effort="low")
+        self.cfg = replace(self.cfg, models=(model,),
+                           routes={"route:primary": "kimi-code",
+                                   "route:reserve": "kimi-code"},
+                           complexity_profiles={"easy": (selected,),
+                                                "medium": (selected,),
+                                                "hard": (selected,)})
+        self.gh.names = {"queue:worker", "state:in-progress",
+                         "complexity:easy", "route:primary"}
+        initial = self.gh.issue(1)
+        self.gh.notes[1] = [{"body": runtime._admission_marker(
+            1, self.spec, self.cfg, initial), "user": {"login": "owner"}}]
+        row = {"issue": 1, "branch": BRANCH, "status": "running", "pr": None,
+               "base_sha": BASE, "last_model": selected.ref, "image_id": IMAGE,
+               "complexity": "easy", "route_key": "route:primary",
+               "profile_sha": runtime._profile_sha(self.cfg, "easy", "route:primary")}
+
+        def fake_git(_path, *args, **_kwargs):
+            if args[:2] == ("rev-parse", f"refs/heads/{BRANCH}"):
+                return HEAD
+            if args[:2] == ("merge-base", "HEAD"):
+                return BASE
+            if args[:2] == ("diff", "--name-only"):
+                return "src/example.py"
+            if args[:2] == ("worktree", "add"):
+                Path(args[3]).mkdir(parents=True)
+            return ""
+
+        def changed_after_checks(*_args, **_kwargs):
+            self.gh.names.remove("route:primary")
+            self.gh.names.add("route:reserve")
+            self.gh.notes[1].append({"body": runtime._admission_marker(
+                1, self.spec, self.cfg, self.gh.issue(1)),
+                "user": {"login": "owner"}})
+            return {"result": "passed", "image_id": IMAGE,
+                    "image_config_digest": CONFIG}
+
+        with patch.object(runtime, "mirror", return_value=self.cfg.workspace), patch.object(
+                runtime, "git", side_effect=fake_git), patch.object(
+                runtime, "_remove_checkout"), patch.object(
+                runtime, "local_checks", side_effect=changed_after_checks), patch.object(
+                runtime, "main_sha", return_value=BASE):
+            with self.assertRaisesRegex(runtime.WorkflowError,
+                                        "orphan branch approval or base changed"):
+                runtime._recover_unacknowledged_push(
+                    self.gh, self.cfg, row, initial, self.spec,
+                    f"{HEAD}\trefs/heads/{BRANCH}")
         self.assertEqual(self.gh.open_calls, 0)
 
     def test_retry_wait_push_loss_reconciles_without_second_execution(self):
