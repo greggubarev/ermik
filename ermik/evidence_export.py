@@ -14,7 +14,7 @@ from .github import GitHub, GitHubError
 from .policy import parse_issue, validate_changed_paths
 from .review import _checks_sha256
 from .runtime import (_approved_on_github, _complexity_key, _route_key,
-                      _portable_image_digest, _profile_sha, labels,
+                      _portable_image_digest, _profile_candidates, _profile_sha, labels,
                       _resolve_image_id, main_sha, published_image_id,
                       published_image_config_digest, WorkflowError)
 
@@ -151,7 +151,8 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
                         cfg, complexity, job["route_key"] or "route:auto")
                     or (model, job["result_effort"]) not in
                     {(candidate.ref, candidate.effort)
-                     for candidate in cfg.complexity_profiles[complexity]}):
+                     for candidate in _profile_candidates(
+                         cfg, complexity, job["route_key"] or "route:auto")}):
                 raise WorkflowError("approved complexity evidence is stale")
         manifest = make_manifest(repo=cfg.repo, issue=issue_number, pr=pr_number,
                                  branch=pr["headRefName"],
@@ -238,7 +239,7 @@ def verify_manifest(cfg: Config, pr_number: int, manifest: dict,
                 or (record["model"] is not None and
                     (record["model"], record["effort"]) not in
                     {(candidate.ref, candidate.effort)
-                     for candidate in cfg.complexity_profiles[tier]})):
+                     for candidate in _profile_candidates(cfg, tier, route)})):
             return {"status": "stale", "reason": "complexity_changed"}
     elif record["version"] == 3:
         return {"status": "stale", "reason": "complexity_changed"}

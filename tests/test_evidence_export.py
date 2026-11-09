@@ -160,6 +160,56 @@ class EvidenceExportTests(unittest.TestCase):
             self.assertEqual(verify_manifest(cfg, 12, record,
                                              _live_result=live)["status"], "stale")
 
+    def test_routed_profile_rejects_model_from_another_provider(self):
+        one = ModelCandidate("one", "model", "ONE_API_KEY",
+                             "https://one.example.net/v1",
+                             supported_efforts=("low",))
+        go = ModelCandidate("go", "model", "GO_API_KEY",
+                            "https://go.example.net/v1",
+                            supported_efforts=("low",))
+        selected = (replace(one, effort="low"), replace(go, effort="low"))
+        cfg = replace(self.cfg, models=(one, go), routes={"route:go": "go"},
+                      complexity_profiles={tier: selected for tier in
+                                           ("easy", "medium", "hard")})
+        issue = {"body": BODY, "labels": [{"name": name} for name in
+                 ("queue:worker", "state:in-progress", "complexity:easy", "route:go")]}
+        gh = FakeGitHub(cfg)
+        marker = _admission_marker(7, self.spec, cfg, issue)
+        profile = _profile_sha(cfg, "easy", "route:go")
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET route_key='route:go',complexity='easy',"
+                         "profile_sha=?,result_effort='low' WHERE issue=7", (profile,))
+        fields = dict(repo=cfg.repo, head_repository=cfg.repo, issue=7, pr=12,
+                      branch="work/issue-7-delivery", base=BASE, head=HEAD,
+                      body_sha256=self.spec.body_sha256,
+                      scope_sha256=_scope_sha256(self.spec.allowed_paths),
+                      checks_sha256=_checks_sha256(cfg), paths=["src/one.py"],
+                      checks=[{"index": 1, "result": "passed",
+                               "log_sha256": "d" * 64}],
+                      image=IMAGE, image_config_digest=CONFIG_DIGEST,
+                      model=one.ref, attempts=1, usage={"observation": "unknown"},
+                      unknowns=["usage"], complexity="easy",
+                      profile_sha256=profile, effort="low")
+        record = make_manifest(**fields)
+        with (patch("ermik.evidence_export._github", return_value=gh),
+              patch.object(gh, "issue", return_value=issue),
+              patch.object(gh, "comments", return_value=[
+                  {"body": marker, "user": {"login": cfg.maintainer}}]),
+              patch("ermik.evidence_export._resolve_image_id", return_value=IMAGE),
+              patch("ermik.evidence_export._portable_image_digest",
+                    return_value=CONFIG_DIGEST)):
+            self.assertEqual(verify_manifest(cfg, 12, record),
+                             {"status": "stale", "reason": "complexity_changed"})
+            with self.assertRaisesRegex(WorkflowError,
+                                        "approved complexity evidence is stale"):
+                export_manifest(cfg, 12)
+            with state.connect(cfg.state_dir) as conn:
+                conn.execute("UPDATE jobs SET result_model=? WHERE issue=7", (go.ref,))
+            self.assertEqual(export_manifest(cfg, 12)["model"], go.ref)
+            self.assertEqual(verify_manifest(cfg, 12,
+                             make_manifest(**{**fields, "model": go.ref}))["status"],
+                             "current")
+
     def test_cross_host_local_id_may_differ_when_config_matches(self):
         gh_patch, image_patch, digest_patch = self._patches()
         with gh_patch, image_patch, digest_patch:

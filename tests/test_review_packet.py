@@ -114,6 +114,13 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(packet["status"], "stale")
         self.assertEqual(packet["evidence"]["reason"], "identity_changed")
 
+    def test_profile_change_reason_survives_packet(self):
+        with patch("ermik.review_packet.fetch_manifest", return_value=(
+                {"status": "stale", "reason": "complexity_changed"}, None)):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["evidence"], {"status": "stale",
+                                               "reason": "complexity_changed"})
+
     def test_current_correction_keeps_previous_head_as_history(self):
         record = self.record()
         def fetched(_cfg, _number, *, _records_out, **_kwargs):

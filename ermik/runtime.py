@@ -149,7 +149,7 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
         raise PublicationUnconfirmed("draft PR broker response is unconfirmed") from exc
 
 
-def _profile_sha(cfg: Config, tier: str, route: str = "route:auto") -> str:
+def _profile_candidates(cfg: Config, tier: str, route: str = "route:auto"):
     entries = cfg.complexity_profiles[tier]
     if route != "route:auto":
         provider = cfg.routes.get(route)
@@ -158,6 +158,11 @@ def _profile_sha(cfg: Config, tier: str, route: str = "route:auto") -> str:
         entries = tuple(model for model in entries if model.provider_id == provider)
     if not entries:
         raise ValueError("approved profile has no models for route")
+    return entries
+
+
+def _profile_sha(cfg: Config, tier: str, route: str = "route:auto") -> str:
+    entries = _profile_candidates(cfg, tier, route)
     data = json.dumps([route, [json.loads(model_spec(model)) for model in entries]],
                       separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
