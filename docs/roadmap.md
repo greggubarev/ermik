@@ -66,6 +66,16 @@ The [optional maintainer view](https://github.com/greggubarev/ermik/issues/18) d
 
 **Acceptance:** Provide an optional interface that shows each issue's verified identity, current state, PR and HEAD, check result, and next available maintainer action from the same underlying records as the commands. In a trial, compare the interface and command output for an admitted task, blocked task, correction, and stale review; they must agree. An unavailable interface must leave admission, review, and explicit merge usable through the documented commands. No interface action may weaken the checks or grant the execution host merge authority.
 
+## 7. v0.6: Approved task complexity and safe recovery (planned)
+
+**Goal:** Bind a maintainer's explicit effort approval to the Issue-to-PR lifecycle and recover eligible blocked work without replaying uncertain publication.
+
+Sequence: [#106](https://github.com/greggubarev/ermik/issues/106) adds optional, validated manual complexity profiles bound at admission; claim, correction, and fallback remain within the approved profile. Then [#109](https://github.com/greggubarev/ermik/issues/109) reconciles issue, scope, local worktree, remote branch, and uncertain writes before re-admitting a blocked pre-publication job. Uncertain or changed state blocks with a specific next action. Both retain maintainer approval and explicit merge.
+
+This milestone binds an explicit approval to the auditable Issue-to-PR handoff and its recovery state; it does not claim effort selection itself as unique. Desktop fleet control and generic orchestration are outside scope. Automatic complexity classification or effort calibration should be considered only after comparable accepted-PR and cost evidence exists.
+
+**Acceptance:** Verify allowed and exhausted profile routing, changed-approval rejection, and legacy behavior. For recovery, verify one safely resumed disposable job and one changed-branch rejection after restart, with no duplicate PR, replayed execution, or discarded work. Do not infer automatic classification or cost/quality calibration from manually approved tiers.
+
 ## Outside the current claim
 
 Multiple controller hosts sharing one queue or state database are unsupported. Project correctness beyond configured checks and maintainer review is unverified. Provider authentication, quota, and timeout behavior has not been exercised for every compatible endpoint. Automated policy choices, official quota observations, and the optional maintainer view remain open work. The cross-store image trial covers the tested Docker versions and image, not every image format. These are explicit limits of the preview, not implied promises in the phases above.
