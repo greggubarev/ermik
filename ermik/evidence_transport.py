@@ -13,7 +13,8 @@ from .github import GitHub, GitHubError
 
 
 MARKER = "Ermik evidence v2\n\n```json\n"
-_MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER}
+_MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER,
+            3: "Ermik evidence v3\n\n```json\n"}
 _SUFFIX = "```"
 MAX_COMMENTS = 1000
 
@@ -93,7 +94,7 @@ def _published_records(cfg: Config, gh: GitHub, pr_number: int) -> list[tuple[di
                 bounded = False
             if not bounded:
                 raise EvidenceRecordError("publisher evidence comment is malformed")
-            if marker.group(1) not in ("1", "2"):
+            if marker.group(1) not in ("1", "2", "3"):
                 raise UnsupportedEvidenceVersion("publisher evidence version is unsupported")
         if not any(body.startswith(value) for value in _MARKERS.values()):
             if marker:
@@ -119,6 +120,9 @@ def _sanitized_export(cfg: Config, pr_number: int) -> dict:
               if key not in ("version", "sha256")}
     fields["model"] = None
     fields["unknowns"] = sorted(set(fields["unknowns"]) | {"model"})
+    if "effort" in fields:
+        fields["effort"] = None
+        fields["unknowns"] = sorted(set(fields["unknowns"]) | {"effort"})
     return make_manifest(**fields)
 
 

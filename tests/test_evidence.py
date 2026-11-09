@@ -54,7 +54,7 @@ class EvidenceTests(unittest.TestCase):
     def test_fixture_version_dispatch_and_rejections(self):
         raw = self.fixture("h1")
         record = loads_manifest(raw)
-        for version in (3, 0, 1.0, "1", True):
+        for version in (4, 0, 1.0, "1", True):
             changed = {**record, "version": version, "future_required": "value"}
             with self.subTest(version=version), self.assertRaisesRegex(
                     UnsupportedManifestVersion, "unsupported manifest version"):

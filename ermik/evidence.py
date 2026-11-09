@@ -25,6 +25,7 @@ _V1_FIELDS = {"version", "repo", "head_repository", "issue", "pr", "branch",
               "base", "head", "body_sha256", "scope_sha256", "checks_sha256",
               "paths", "checks", "image", "model", "attempts", "usage", "unknowns"}
 _V2_FIELDS = _V1_FIELDS | {"image_config_digest"}
+_V3_FIELDS = _V2_FIELDS | {"complexity", "profile_sha256", "effort"}
 _TOKENS = ("input", "output", "reasoning", "cache_read", "cache_write", "total")
 
 
@@ -54,9 +55,10 @@ def _valid_path(path: object) -> bool:
 def validate_manifest(record: dict) -> dict:
     """Validate an exact v1 or v2 record without changing its version."""
     _require(type(record) is dict and "version" in record, "invalid manifest fields")
-    if type(record["version"]) is not int or record["version"] not in (1, 2):
+    if type(record["version"]) is not int or record["version"] not in (1, 2, 3):
         raise UnsupportedManifestVersion("unsupported manifest version")
-    fields = _V1_FIELDS if record["version"] == 1 else _V2_FIELDS
+    fields = (_V1_FIELDS if record["version"] == 1 else
+              _V2_FIELDS if record["version"] == 2 else _V3_FIELDS)
     _require(set(record) == fields | {"sha256"}, "invalid manifest fields")
     for key in ("repo", "head_repository"):
         _require(type(record[key]) is str and bool(_REPO.fullmatch(record[key]))
@@ -91,7 +93,7 @@ def validate_manifest(record: dict) -> dict:
     _require(type(record["image"]) is str
              and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", record["image"])),
              "invalid image identity")
-    if record["version"] == 2:
+    if record["version"] >= 2:
         _require(type(record["image_config_digest"]) is str
                  and bool(re.fullmatch(r"sha256:[0-9a-f]{64}",
                                        record["image_config_digest"])),
@@ -99,11 +101,23 @@ def validate_manifest(record: dict) -> dict:
     unknowns = record["unknowns"]
     _require(type(unknowns) is list and all(type(item) is str for item in unknowns)
              and unknowns == sorted(set(unknowns))
-             and set(unknowns) <= {"model", "usage"}, "invalid unknowns")
+             and set(unknowns) <= ({"model", "usage", "effort"} if
+                                   record["version"] == 3 else {"model", "usage"}),
+             "invalid unknowns")
     model = record["model"]
     _require((model is None and "model" in unknowns)
              or (type(model) is str and bool(_MODEL.fullmatch(model))
                  and "model" not in unknowns), "invalid model observation")
+    if record["version"] == 3:
+        _require(record["complexity"] in ("easy", "medium", "hard"),
+                 "invalid approved complexity")
+        _require(type(record["profile_sha256"]) is str and
+                 bool(_DIGEST.fullmatch(record["profile_sha256"])),
+                 "invalid complexity profile digest")
+        _require((record["effort"] in ("low", "medium", "high")
+                  and "effort" not in unknowns and model is not None)
+                 or (record["effort"] is None and "effort" in unknowns
+                     and model is None), "invalid effort observation")
     _require(type(record["attempts"]) is int and 1 <= record["attempts"] <= 10000,
              "invalid attempts")
     usage = record["usage"]
@@ -129,9 +143,11 @@ def validate_manifest(record: dict) -> dict:
 
 
 def make_manifest(**fields: object) -> dict:
-    """Create a validated v2 record; historical v1 records remain read-only."""
-    _require(set(fields) == _V2_FIELDS - {"version"}, "invalid manifest fields")
-    payload = {"version": VERSION, **fields}
+    """Create a validated v2 or approved-complexity v3 record."""
+    version = 3 if "complexity" in fields else VERSION
+    _require(set(fields) == (_V3_FIELDS if version == 3 else _V2_FIELDS) - {"version"},
+             "invalid manifest fields")
+    payload = {"version": version, **fields}
     try:
         digest = hashlib.sha256(_canonical(payload)).hexdigest()
     except (TypeError, ValueError) as exc:

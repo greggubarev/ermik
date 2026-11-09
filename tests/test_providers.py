@@ -226,6 +226,20 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(kimi["permission"]["bash"], "deny")
         self.assertEqual(go["permission"]["external_directory"], "deny")
 
+    def test_worker_defines_selected_effort_variant(self):
+        worker = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "examples" / "opencode-worker.py"))
+        for provider, model, env in (("kimi-code", "k3-256k", "KIMI_CODE_API_KEY"),
+                                     ("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY")):
+            candidate = ModelCandidate(provider, model, env, effort="low",
+                                       supported_efforts=("low",))
+            with self.subTest(provider=provider), patch.dict(os.environ, {env: "test-key"}):
+                configured = worker["_config"](candidate)["provider"][provider]
+                self.assertEqual(configured["models"][model]["variants"]["low"],
+                                 {"reasoningEffort": "low"})
+                self.assertEqual(opencode_command(candidate, "Task")[4:6],
+                                 ("--variant", "low"))
+
     def test_worker_requires_valid_custom_spec_and_ref_match(self):
         worker = runpy.run_path(str(Path(__file__).resolve().parents[1] /
                                     "examples" / "opencode-worker.py"))

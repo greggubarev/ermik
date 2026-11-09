@@ -2,6 +2,28 @@
 
 The controller selects a model for each attempt. It passes `ERMIK_MODEL_REF`, the public `ERMIK_MODEL_SPEC`, and only the selected provider's key variable to the container. Key values are not stored in controller JSON, SQLite, command arguments, or logs. Inside the disposable container, the key temporarily resides in a private `0600` OpenCode configuration file, removed after the attempt. The container prints one outcome code: `WORKER_OK`, `WORKER_QUOTA_EXHAUSTED`, `WORKER_AUTH_FAILURE`, `WORKER_EXECUTION_ERROR`, or `WORKER_CONFIGURATION_ERROR`. A `WORKER_USAGE` line contains aggregate token data, without session text or keys. If session export is unavailable, `complete=false` and all numeric values are `null`.
 
+## Optional approved complexity profiles
+
+The maintainer can assign an explicit easy, medium, or hard tier at admission. This policy is optional and lives in trusted local configuration. Each model used by a profile declares the reasoning efforts checked for that provider and model:
+
+```json
+{
+  "models": [
+    {"provider_id": "kimi-code", "model_id": "k3-256k", "credential_env": "KIMI_CODE_API_KEY", "supported_efforts": ["low", "medium", "high"]},
+    {"provider_id": "opencode-go", "model_id": "kimi-k3", "credential_env": "OPENCODE_GO_API_KEY", "supported_efforts": ["low", "medium", "high"]}
+  ],
+  "complexity_profiles": {
+    "easy": [{"model_ref": "kimi-code/k3-256k", "effort": "low"}],
+    "medium": [{"model_ref": "kimi-code/k3-256k", "effort": "medium"}],
+    "hard": [{"model_ref": "opencode-go/kimi-k3", "effort": "high"}]
+  }
+}
+```
+
+The example shows the format, not verified support for these exact combinations. Confirm that the pinned worker version and provider apply each selected variant before relying on this policy. The pinned OpenCode 1.18 worker defines the selected variant in its temporary configuration and passes it using `--variant`; a provider package may still ignore an unsupported reasoning setting. Syntax validation does not prove effective reasoning effort or a hard cost limit. The provider budget guard remains an estimate.
+
+Create the `complexity:easy`, `complexity:medium`, and `complexity:hard` labels in the target repository before enabling this policy. With profiles enabled, run `admit NUMBER --complexity easy|medium|hard`. Approval binds the issue body and scope hashes, current route label, tier, and effective profile digest. The controller checks those values at claim, correction, and before publication. Changed route or profile requires a new admission. Issue text and worker output cannot choose the tier. Quota fallback stays inside the approved profile; exhausted candidates leave the job waiting or blocked. Installations without `complexity_profiles` retain the prior routing and admission format.
+
 ## Image and command
 
 Build the image pinned to OpenCode 1.18.35:

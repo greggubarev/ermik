@@ -57,6 +57,8 @@ class ModelCandidate:
     base_url: str | None = None
     package: str | None = None
     max_parallel: int = 1
+    effort: str | None = None
+    supported_efforts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (not isinstance(self.provider_id, str) or not _IDENTIFIER.fullmatch(self.provider_id)
@@ -80,6 +82,16 @@ class ModelCandidate:
                 raise ValueError("custom provider package is not allowed")
         if type(self.max_parallel) is not int or not 1 <= self.max_parallel <= 8:
             raise ValueError("max_parallel must be 1..8")
+        if self.effort not in (None, "low", "medium", "high"):
+            raise ValueError("invalid reasoning effort")
+        if (type(self.supported_efforts) is not tuple
+                or any(type(value) is not str for value in self.supported_efforts)
+                or len(set(self.supported_efforts)) != len(self.supported_efforts)
+                or any(value not in ("low", "medium", "high")
+                       for value in self.supported_efforts)):
+            raise ValueError("invalid supported reasoning efforts")
+        if self.effort is not None and self.effort not in self.supported_efforts:
+            raise ValueError("reasoning effort is not declared for the model")
 
     @property
     def ref(self) -> str:
@@ -102,7 +114,9 @@ def model_spec(candidate: ModelCandidate) -> str:
                        "credential_env": candidate.credential_env,
                        "base_url": candidate.base_url,
                        "package": candidate.package,
-                       "max_parallel": candidate.max_parallel}, separators=(",", ":"),
+                       "max_parallel": candidate.max_parallel,
+                       "effort": candidate.effort,
+                       "supported_efforts": candidate.supported_efforts}, separators=(",", ":"),
                       sort_keys=True)
 
 
@@ -110,14 +124,19 @@ def candidate_from_dict(raw: Mapping[str, object]) -> ModelCandidate:
     """Parse a trusted local config entry, rejecting unknown fields and IDs."""
     if not isinstance(raw, Mapping) or not {"provider_id", "model_id", "credential_env"}.issubset(raw):
         raise ValueError("model requires provider_id, model_id, credential_env")
-    if set(raw) - {"provider_id", "model_id", "credential_env", "base_url", "package", "max_parallel"}:
+    if set(raw) - {"provider_id", "model_id", "credential_env", "base_url", "package", "max_parallel", "effort", "supported_efforts"}:
         raise ValueError("unknown model option")
     for key, value in raw.items():
-        if key == "max_parallel":
+        if key in ("max_parallel", "supported_efforts"):
             continue
         if value is not None and not isinstance(value, str):
             raise ValueError("model options must be strings")
-    return ModelCandidate(**raw)  # type: ignore[arg-type]
+    fields = dict(raw)
+    if "supported_efforts" in fields:
+        if not isinstance(fields["supported_efforts"], list):
+            raise ValueError("supported_efforts must be an array")
+        fields["supported_efforts"] = tuple(fields["supported_efforts"])
+    return ModelCandidate(**fields)  # type: ignore[arg-type]
 
 
 _SCHEMA = """
@@ -380,5 +399,6 @@ def classify_failure(stdout: str, stderr: str, returncode: int) -> Failure:
 def opencode_command(candidate: ModelCandidate, prompt: str) -> tuple[str, ...]:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("prompt must be nonempty")
-    return ("opencode", "run", "--model", candidate.ref,
-            "--agent", "build", "--format", "json", "--", prompt)
+    return (("opencode", "run", "--model", candidate.ref)
+            + (("--variant", candidate.effort) if candidate.effort else ())
+            + ("--agent", "build", "--format", "json", "--", prompt))

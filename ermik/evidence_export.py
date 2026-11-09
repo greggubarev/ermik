@@ -13,7 +13,7 @@ from .evidence_store import read_evidence
 from .github import GitHub, GitHubError
 from .policy import parse_issue, validate_changed_paths
 from .review import _checks_sha256
-from .runtime import (_approved_on_github, _portable_image_digest,
+from .runtime import (_approved_on_github, _portable_image_digest, _profile_sha,
                       _resolve_image_id, main_sha, published_image_id,
                       published_image_config_digest, WorkflowError)
 
@@ -143,6 +143,15 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
             unknowns.append("model")
         if not measured:
             unknowns.append("usage")
+        complexity = job["complexity"]
+        if complexity is not None:
+            if (complexity not in cfg.complexity_profiles
+                    or job["profile_sha"] != _profile_sha(
+                        cfg, complexity, job["route_key"] or "route:auto")
+                    or (model, job["result_effort"]) not in
+                    {(candidate.ref, candidate.effort)
+                     for candidate in cfg.complexity_profiles[complexity]}):
+                raise WorkflowError("approved complexity evidence is stale")
         manifest = make_manifest(repo=cfg.repo, issue=issue_number, pr=pr_number,
                                  branch=pr["headRefName"],
                                  head_repository=cfg.publish_repo or cfg.repo,
@@ -153,7 +162,11 @@ def export_manifest(cfg: Config, pr_number: int) -> dict:
                                  checks=checks, image=job["image_id"],
                                  image_config_digest=proof["image_config_digest"],
                                  model=model,
-                                 attempts=attempts, usage=usage, unknowns=unknowns)
+                                 attempts=attempts, usage=usage, unknowns=unknowns,
+                                 **({"complexity": complexity,
+                                     "profile_sha256": job["profile_sha"],
+                                     "effort": job["result_effort"]}
+                                    if complexity is not None else {}))
         current, _, current_spec, current_paths = _live(cfg, gh, pr_number)
         if (current["headRefOid"] != pr["headRefOid"]
                 or current["baseRefOid"] != pr["baseRefOid"]
@@ -199,6 +212,24 @@ def verify_manifest(cfg: Config, pr_number: int, manifest: dict,
     for key, value in expected.items():
         if record.get(key) != value:
             return {"status": "stale", "reason": "identity_changed"}
+    if cfg.complexity_profiles:
+        current_issue = gh.issue(issue_number)
+        tier_keys = {row["name"] for row in current_issue.get("labels", [])
+                     if row["name"].startswith("complexity:")}
+        tier = next(iter(tier_keys)).removeprefix("complexity:") if len(tier_keys) == 1 else None
+        if (record["version"] != 3 or tier not in cfg.complexity_profiles
+                or record["complexity"] != tier
+                or record["profile_sha256"] != _profile_sha(
+                    cfg, tier, next(iter({row["name"] for row in current_issue.get("labels", [])
+                                         if row["name"].startswith("route:")}),
+                                    "route:auto"))
+                or (record["model"] is not None and
+                    (record["model"], record["effort"]) not in
+                    {(candidate.ref, candidate.effort)
+                     for candidate in cfg.complexity_profiles[tier]})):
+            return {"status": "stale", "reason": "complexity_changed"}
+    elif record["version"] == 3:
+        return {"status": "stale", "reason": "complexity_changed"}
     try:
         image_id = _resolve_image_id(cfg.image)
         image_config_digest = _portable_image_digest(cfg.image, image_id)

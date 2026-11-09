@@ -161,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     maintainer_view_parser.add_argument("--port", type=int, default=8766)
     admit_parser = commands.add_parser("admit")
     admit_parser.add_argument("issue", type=int)
+    admit_parser.add_argument("--complexity", choices=("easy", "medium", "hard"))
     review_parser = commands.add_parser("review")
     review_parser.add_argument("pr", type=int)
     packet_parser = commands.add_parser("review-packet")
@@ -209,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
                           sources={provider: source.kind for provider, source
                                    in cfg.quota_sources.items()})}
         elif args.command == "admit":
-            result = admit(cfg, args.issue)
+            result = admit(cfg, args.issue, args.complexity)
         elif args.command == "run-once":
             try:
                 work = run_once(cfg)

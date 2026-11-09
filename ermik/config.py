@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -18,7 +18,7 @@ _OPTIONAL = {"worker_env", "base_branch", "models", "min_free_gb",
              "draft_pr_evidence_dir", "retention_days", "artifact_warn_mb",
              "evidence_publisher", "evidence_publisher_id", "provider_policies",
              "quality_metrics_file", "quality_min_samples", "quality_max_age_seconds",
-             "quota_sources"}
+             "quota_sources", "complexity_profiles"}
 _ENV = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ROUTE = re.compile(r"^route:[a-z][a-z0-9_-]{0,39}$")
 
@@ -66,6 +66,7 @@ class Config:
     quality_min_samples: int = 20
     quality_max_age_seconds: int = 86400
     quota_sources: dict[str, QuotaSource] = field(default_factory=dict)
+    complexity_profiles: dict[str, tuple] = field(default_factory=dict)
 
 
 def _command(value: object, name: str) -> tuple[str, ...]:
@@ -150,10 +151,35 @@ def load_config(path: Path) -> Config:
         raise ValueError("models must be an array with at most 32 entries")
     from .providers import candidate_from_dict
     models = tuple(candidate_from_dict(row) for row in model_rows)
+    if any(model.effort is not None for model in models):
+        raise ValueError("model effort must be selected by complexity_profiles")
     if publish_token_env and publish_token_env in {model.credential_env for model in models}:
         raise ValueError("publish_token_env cannot be a worker model credential")
     if len({model.ref for model in models}) != len(models):
         raise ValueError("model references must be unique")
+    profile_rows = raw.get("complexity_profiles", {})
+    if (not isinstance(profile_rows, dict) or (profile_rows and
+            set(profile_rows) != {"easy", "medium", "hard"})):
+        raise ValueError("complexity_profiles requires easy, medium, hard")
+    complexity_profiles = {}
+    for tier, entries in profile_rows.items():
+        if not isinstance(entries, list) or not 1 <= len(entries) <= 32:
+            raise ValueError("complexity profile must be a nonempty bounded list")
+        selected = []
+        for entry in entries:
+            if (not isinstance(entry, dict) or set(entry) != {"model_ref", "effort"}
+                    or type(entry["model_ref"]) is not str
+                    or entry["effort"] not in ("low", "medium", "high")):
+                raise ValueError("invalid complexity profile entry")
+            base = next((model for model in models if model.ref == entry["model_ref"]), None)
+            if base is None:
+                raise ValueError("complexity profile names an unconfigured model")
+            if entry["effort"] not in base.supported_efforts:
+                raise ValueError("complexity effort is not declared for the model")
+            selected.append(replace(base, effort=entry["effort"]))
+        if len({model.ref for model in selected}) != len(selected):
+            raise ValueError("duplicate complexity profile model")
+        complexity_profiles[tier] = tuple(selected)
     capacities = {model.provider_id: model.max_parallel for model in models}
     if any(model.max_parallel != capacities[model.provider_id] for model in models):
         raise ValueError("models on one provider must share max_parallel")
@@ -258,4 +284,5 @@ def load_config(path: Path) -> Config:
                   publish_repo, publish_token_env, dict(routes), draft_pr_socket,
                   draft_pr_evidence_dir, retention_days, artifact_warn_mb,
                   evidence_publisher, evidence_publisher_id, provider_policies,
-                  quality_file, min_samples, max_age, quota_sources)
+                  quality_file, min_samples, max_age, quota_sources,
+                  complexity_profiles)

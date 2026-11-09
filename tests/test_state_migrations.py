@@ -140,9 +140,48 @@ def evidence(root: Path) -> dict:
 
 
 class StateMigrationTests(unittest.TestCase):
+    def test_v5_upgrade_adds_complexity_fields_without_changing_prior_jobs(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root))
+        old = (state.SCHEMA.replace(",\n  complexity TEXT", "")
+               .replace(",\n  profile_sha TEXT", "")
+               .replace(",\n  result_effort TEXT", "")
+               .replace(",\n  effort TEXT", ""))
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(old)
+            conn.execute("PRAGMA user_version = 5")
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
+                         "VALUES(7,'work-7',?,'running','[]')", ("a" * 40,))
+            conn.commit()
+        original = state._migrate_v5
+
+        def interrupted(conn):
+            original(conn)
+            raise OSError("interrupted complexity migration")
+
+        with patch.object(state, "_migrate_v5", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "interrupted complexity migration"):
+                state.initialize(root)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertNotIn("complexity", {column[1] for column in
+                             conn.execute("PRAGMA table_info(jobs)")})
+        state.initialize(root)
+        with state.connect(root) as conn:
+            row = conn.execute("SELECT complexity,profile_sha,result_effort "
+                               "FROM jobs WHERE issue=7").fetchone()
+            self.assertEqual(tuple(row), (None, None, None))
+            self.assertIn("complexity", {column[1] for column in conn.execute(
+                "PRAGMA table_info(events)")})
+
     @staticmethod
     def v3_schema() -> str:
-        return (state.SCHEMA.replace(",\n  route_key TEXT", "")
+        return (state.SCHEMA.replace(",\n  complexity TEXT", "")
+                .replace(",\n  profile_sha TEXT", "")
+                .replace(",\n  result_effort TEXT", "")
+                .replace(",\n  effort TEXT", "")
+                .replace("\n  ,complexity TEXT", "")
+                .replace(",\n  route_key TEXT", "")
                 .replace(",\n  policy_version INTEGER,\n  eligible_json TEXT,\n  decision_reason TEXT", "")
                 .replace(",\n  phase TEXT CHECK(phase IN ('initial','correction')),\n"
                          "  finished_at TEXT,\n"
@@ -150,7 +189,12 @@ class StateMigrationTests(unittest.TestCase):
 
     @staticmethod
     def v4_schema() -> str:
-        return state.SCHEMA.replace(",\n  policy_version INTEGER,\n  eligible_json TEXT,\n  decision_reason TEXT", "")
+        return (state.SCHEMA.replace(",\n  complexity TEXT", "")
+                .replace(",\n  profile_sha TEXT", "")
+                .replace(",\n  result_effort TEXT", "")
+                .replace(",\n  effort TEXT", "")
+                .replace("\n  ,complexity TEXT", "")
+                .replace(",\n  policy_version INTEGER,\n  eligible_json TEXT,\n  decision_reason TEXT", ""))
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
