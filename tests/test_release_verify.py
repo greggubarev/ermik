@@ -94,6 +94,11 @@ class ReleaseVerifyTests(unittest.TestCase):
     def test_valid_bundle(self):
         self._verify()
 
+    def test_valid_windows_docker_report(self):
+        report = _report(docker=True, platform="windows")
+        self.docker.write_text(json.dumps(report), encoding="utf-8")
+        self._verify()
+
     def test_rejects_missing_oversized_and_malformed_report(self):
         for content in (None, b"x" * (release_verify._MAX_REPORT + 1), b"not json"):
             with self.subTest(content=content is None and "missing" or len(content)):
@@ -113,6 +118,7 @@ class ReleaseVerifyTests(unittest.TestCase):
             (self.windows, lambda r: r["unit"].update(executed=0)),
             (self.windows, lambda r: r["unit"].update(failures=1)),
             (self.windows, lambda r: r["unit"].update(unexpected_skips=[{"case": "x"}])),
+            (self.docker, lambda r: r.update(platform="darwin")),
             (self.docker, lambda r: r["host"].pop("smoke")),
             (self.docker, lambda r: r["host"]["container_recovery"].update(result="failed")),
             (self.docker, lambda r: r["docker"].pop("image_id")),

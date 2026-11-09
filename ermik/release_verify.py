@@ -59,10 +59,10 @@ def _count(value: object) -> bool:
     return type(value) is int and 0 <= value <= 1_000_000
 
 
-def _host(path: Path, commit: str, platform: str, docker: bool) -> None:
+def _host(path: Path, commit: str, platforms: tuple[str, ...], docker: bool) -> None:
     report = _json(path, _MAX_REPORT, "host_report_invalid")
     if (report.get("commit") != commit or report.get("result") != "passed"
-            or report.get("dirty") is not False or report.get("platform") != platform):
+            or report.get("dirty") is not False or report.get("platform") not in platforms):
         raise BundleError("host_report_failed")
     unit = report.get("unit")
     if not isinstance(unit, dict) or unit.get("result") != "passed":
@@ -188,9 +188,9 @@ def _artifacts(commit: str, manifest_path: Path, archive_path: Path,
 def verify(commit: str, previous_tag: str, windows: Path, linux: Path,
            docker: Path, manifest: Path, archive: Path, checksum: Path) -> None:
     _release(commit, previous_tag)
-    _host(windows, commit, "windows", False)
-    _host(linux, commit, "linux", False)
-    _host(docker, commit, "linux", True)
+    _host(windows, commit, ("windows",), False)
+    _host(linux, commit, ("linux",), False)
+    _host(docker, commit, ("windows", "linux"), True)
     _artifacts(commit, manifest, archive, checksum)
 
 
