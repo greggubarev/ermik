@@ -116,6 +116,22 @@ Both `run-once` calls should return the same PR number with different HEADs. Aft
 
 The trial establishes behavior for its specific configuration. It does not establish safety of another worker or completeness of another project's checks.
 
+## Reusable acceptance worksheet
+
+Use a disposable target repository for each integration. Keep the evidence with the Issue or PR and fill one row per stack. Record the exact configuration revision and image ID from the local files or runtime; do not infer either from a tag or description.
+
+| Stack / repository | Setup revision | Config revision / image ID | Issue / admitted scope | PR and first → corrected HEAD | Review of each HEAD | Explicit merge / post-merge checks | Rejections |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+|  |  |  |  |  |  |  | Out-of-scope edit: blocked before PR? Check failure: blocked before PR? |
+
+Acceptance requires one ordinary scoped task, a correction on the same PR, independent review of both exact HEADs, an explicit maintainer merge, and passing checks on the resulting default branch. Run one out-of-scope edit and one configured check failure; both must stop before an accepted PR is published. Record the positive and negative outcomes and link the evidence. Supply project-specific manual acceptance criteria: configured checks and review do not prove application correctness.
+
+### Two-stack trial
+
+The [Issue #38 evidence](https://github.com/greggubarev/ermik/issues/38#issuecomment-6747491231) records two disposable integrations: a Python transaction-ledger task and a PowerShell settings-parser task. Each used its own image, task command, checks, controller state, and maintainer state. Both completed task, same-PR correction, independent review at each HEAD, explicit merge, passing post-merge checks, and Issue closure. The paired out-of-scope edits and failed local checks blocked before PR creation. Exact setup commits, PR/HEADs, and merge commits are in the linked record.
+
+Limits: both trials published direct branches with broad same-account GitHub authentication; they do not verify split-credential or fork boundaries. The evidence covers scoped disposable tasks only and does not support a claim that arbitrary Issues can be completed. Out-of-scope path rejection currently surfaces a generic `ValueError`, which gives operators limited diagnosis.
+
 ## Publication through a separate fork
 
 If the server account must not write upstream contents, create a fork and set `"publish_repo": "publisher/project"` and `"publish_token_env": "ERMIK_FORK_TOKEN"` in server `config.json`. `repo` remains the target `owner/project`; `publish_repo` is the fork's full `owner/name`. Set the same two fields on the maintainer computer so review verifies the PR source. Omit them for direct branch publication to the target repository.
