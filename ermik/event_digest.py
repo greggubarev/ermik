@@ -24,8 +24,11 @@ _KINDS = {"pr_published": "draft_pr", "blocked": "blocked",
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _BRANCH = re.compile(r"work/issue-(\d+)-[a-z0-9-]+\Z")
 _CLOSES = re.compile(r"(?im)\bCloses\s+#(\d+)\b")
+_JOURNAL = re.compile(r"pr-[1-9][0-9]{0,11}\.json\Z")
 _STATE_NAME = "event-digest.json"
 _MAX_SEEN = 2048
+_MAX_JOURNALS = 10000
+_MAX_STATE_BYTES = 1048576
 _INTERVAL = 60
 
 
@@ -51,27 +54,40 @@ def _read(path: Path) -> dict:
     if path.is_symlink():
         raise ValueError("digest state cannot be a symlink")
     try:
-        if path.stat().st_size > 262144:
+        if path.stat().st_size > _MAX_STATE_BYTES:
             raise ValueError("digest state is too large")
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"version": 1, "cursor": 0, "seen": [], "next_at": 0, "failures": 0}
+        return {"version": 2, "cursor": 0, "seen": [], "next_at": 0,
+                "failures": 0, "decision_cursor": "", "decision_positions": {}}
+    if type(data) is dict and data.get("version") == 1:
+        data = {**data, "version": 2, "decision_cursor": "",
+                "decision_positions": {}}
     if (type(data) is not dict or set(data) !=
-            {"version", "cursor", "seen", "next_at", "failures"}
-            or data["version"] != 1 or type(data["cursor"]) is not int
+            {"version", "cursor", "seen", "next_at", "failures",
+             "decision_cursor", "decision_positions"}
+            or data["version"] != 2 or type(data["cursor"]) is not int
             or data["cursor"] < 0 or type(data["next_at"]) is not int
             or data["next_at"] < 0 or type(data["failures"]) is not int
             or not 0 <= data["failures"] <= 20 or type(data["seen"]) is not list
             or len(data["seen"]) > _MAX_SEEN
             or any(type(key) is not str or not re.fullmatch(r"[0-9a-f]{64}", key)
-                   for key in data["seen"])):
+                   for key in data["seen"])
+            or type(data["decision_cursor"]) is not str
+            or (data["decision_cursor"] and not _JOURNAL.fullmatch(
+                data["decision_cursor"]))
+            or type(data["decision_positions"]) is not dict
+            or len(data["decision_positions"]) > _MAX_JOURNALS
+            or any(not _JOURNAL.fullmatch(name)
+                   or type(position) is not int or not 0 <= position <= 128
+                   for name, position in data["decision_positions"].items())):
         raise ValueError("digest state is malformed")
     return data
 
 
 def _save(path: Path, data: dict) -> None:
     encoded = (json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n").encode()
-    if len(encoded) > 262144:
+    if len(encoded) > _MAX_STATE_BYTES:
         raise ValueError("digest state is too large")
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -115,8 +131,12 @@ def _lock(root: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def _key(repo: str, kind: str, issue: int, pr: int | None, head: str | None) -> str:
-    value = json.dumps([repo.lower(), kind, issue, pr, head], separators=(",", ":"))
+def _key(repo: str, kind: str, issue: int, pr: int | None, head: str | None,
+         source: str | None = None) -> str:
+    fields = [repo.lower(), kind, issue, pr, head]
+    if source is not None:
+        fields.append(source)
+    value = json.dumps(fields, separators=(",", ":"))
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -153,32 +173,63 @@ def _event_candidate(cfg, cursor: int) -> tuple[int, dict | None]:
             continue
         return cursor, {"kind": kind, "issue": issue, "pr": pr,
                         "head": head if isinstance(head, str) and _SHA.fullmatch(head) else None,
-                        "branch": row["branch"]}
+                        "branch": row["branch"], "source": f"event:{row['id']}"}
     return cursor, None
 
 
-def _decision_candidate(cfg, seen: set[str]) -> dict | None:
+def _decision_candidate(cfg, data: dict) -> dict | None:
     root = cfg.state_dir / "decision-trail"
     if not root.is_dir():
+        data["decision_cursor"] = ""
+        data["decision_positions"] = {}
         return None
-    for path in sorted(root.glob("pr-*.json"))[:100]:
-        match = re.fullmatch(r"pr-(\d+)\.json", path.name)
-        if match is None:
-            continue
+    paths = sorted(path for path in root.glob("pr-*.json")
+                   if _JOURNAL.fullmatch(path.name))
+    if len(paths) > _MAX_JOURNALS:
+        raise ValueError("digest decision journal limit reached")
+    names = {path.name for path in paths}
+    data["decision_positions"] = {name: position for name, position
+                                  in data["decision_positions"].items() if name in names}
+    if not paths:
+        data["decision_cursor"] = ""
+        return None
+    start = next((i + 1 for i, path in enumerate(paths)
+                  if path.name == data["decision_cursor"]), 0) % len(paths)
+    for offset in range(min(100, len(paths))):
+        index = (start + offset) % len(paths)
+        path = paths[index]
         try:
-            journal = read_decisions(cfg, int(match.group(1)))
+            journal = read_decisions(cfg, int(path.stem[3:]))
         except (ValueError, OSError):
+            data["decision_cursor"] = path.name
             continue
-        for entry in journal["entries"]:
+        position = data["decision_positions"].get(path.name, 0)
+        for entry_index in range(position, len(journal["entries"])):
+            entry = journal["entries"][entry_index]
             if entry["decision"] not in ("changes_requested", "merged"):
+                data["decision_positions"][path.name] = entry_index + 1
                 continue
             kind = ("correction_requested" if entry["decision"] == "changes_requested"
                     else "completed")
-            key = _key(cfg.repo, kind, entry["issue"], entry["pr"], entry["head"])
-            if key not in seen:
-                return {"kind": kind, "issue": entry["issue"], "pr": entry["pr"],
-                        "head": entry["head"], "branch": None}
+            source = f"decision:{entry['pr']}:{entry_index}"
+            key = _key(cfg.repo, kind, entry["issue"], entry["pr"], entry["head"], source)
+            legacy = _key(cfg.repo, kind, entry["issue"], entry["pr"], entry["head"])
+            if key in data["seen"] or legacy in data["seen"]:
+                data["decision_positions"][path.name] = entry_index + 1
+                continue
+            data["decision_cursor"] = paths[(index - 1) % len(paths)].name
+            return {"kind": kind, "issue": entry["issue"], "pr": entry["pr"],
+                    "head": entry["head"], "branch": None, "source": source,
+                    "journal": path.name, "position": entry_index + 1}
+        data["decision_positions"][path.name] = len(journal["entries"])
+        data["decision_cursor"] = path.name
     return None
+
+
+def _ack(data: dict, cursor: int, item: dict) -> None:
+    data["cursor"] = cursor
+    if "journal" in item:
+        data["decision_positions"][item["journal"]] = item["position"]
 
 
 def _verified(cfg, gh: GitHub, item: dict) -> bool:
@@ -244,13 +295,14 @@ def _deliver_locked(cfg, settings, gh, now) -> dict:
     cursor, item = _event_candidate(cfg, data["cursor"])
     if item is None:
         data["cursor"] = cursor
-        item = _decision_candidate(cfg, set(data["seen"]))
+        item = _decision_candidate(cfg, data)
     if item is None:
         _save(path, data)
         return {"status": "empty"}
-    key = _key(cfg.repo, item["kind"], item["issue"], item["pr"], item["head"])
+    key = _key(cfg.repo, item["kind"], item["issue"], item["pr"], item["head"],
+               item["source"])
     if key in data["seen"]:
-        data["cursor"] = cursor
+        _ack(data, cursor, item)
         _save(path, data)
         return {"status": "duplicate"}
     try:
@@ -259,7 +311,7 @@ def _deliver_locked(cfg, settings, gh, now) -> dict:
     except (OSError, ValueError, RuntimeError, KeyError, TypeError):
         return {"status": "identity_unverified"}
     if not verified:
-        data["cursor"] = cursor
+        _ack(data, cursor, item)
         data["seen"] = (data["seen"] + [key])[-_MAX_SEEN:]
         _save(path, data)
         return {"status": "identity_rejected"}
@@ -274,7 +326,7 @@ def _deliver_locked(cfg, settings, gh, now) -> dict:
         data["next_at"] = now + max(retry, min(3600, 60 * 2 ** (data["failures"] - 1)))
         _save(path, data)
         return {"status": "retry_wait"}
-    data["cursor"] = cursor
+    _ack(data, cursor, item)
     data["seen"] = (data["seen"] + [key])[-_MAX_SEEN:]
     data["failures"] = 0
     data["next_at"] = now + _INTERVAL

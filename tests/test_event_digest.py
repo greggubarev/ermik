@@ -120,6 +120,19 @@ class DigestTests(unittest.TestCase):
                              "delivered")
         self.assertEqual(events, ["blocked", "completed"])
 
+    def test_repeated_blocked_transitions_have_distinct_keys(self):
+        self.event("blocked")
+        self.event("blocked")
+        keys = []
+        with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest._send", side_effect=lambda u, t, p, k:
+                keys.append(k) or None):
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=100)["status"],
+                             "delivered")
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=160)["status"],
+                             "delivered")
+        self.assertEqual(len(set(keys)), 2)
+
     def test_corrected_publication_is_not_new_draft(self):
         self.event("pr_published")
         with patch.dict("os.environ", ENV), patch(
@@ -148,6 +161,79 @@ class DigestTests(unittest.TestCase):
             result = deliver_once(self.cfg, gh=FakeGitHub(), now=100)
         self.assertEqual(result["event"], "correction_requested")
         self.assertEqual(received[0]["pr_url"], "https://github.com/owner/repo/pull/23")
+
+    def test_repeated_correction_same_head_has_distinct_keys(self):
+        root = self.cfg.state_dir / "decision-trail"
+        root.mkdir()
+        path = root / "pr-23.json"
+        common = {"repo": "owner/repo", "issue": 7, "pr": 23,
+                  "base": BASE, "head": HEAD,
+                  "timestamp": "2026-11-09T00:00:00+00:00"}
+        entries = [{**common, "evidence_sha256": "c" * 64, "decision": "reviewed"},
+                   {**common, "evidence_sha256": "c" * 64,
+                    "decision": "changes_requested"}]
+        path.write_text(json.dumps({"version": 1, "repo": "owner/repo",
+                                    "pr": 23, "entries": entries}), encoding="utf-8")
+        keys = []
+        with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest._send", side_effect=lambda u, t, p, k:
+                keys.append(k) or None):
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=100)["status"],
+                             "delivered")
+            entries.extend([{**common, "evidence_sha256": "d" * 64,
+                             "decision": "reviewed"},
+                            {**common, "evidence_sha256": "d" * 64,
+                             "decision": "changes_requested"}])
+            path.write_text(json.dumps({"version": 1, "repo": "owner/repo",
+                                        "pr": 23, "entries": entries}), encoding="utf-8")
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=160)["status"],
+                             "delivered")
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_decision_scan_rotates_beyond_first_hundred_files(self):
+        root = self.cfg.state_dir / "decision-trail"
+        root.mkdir()
+        for number in range(1000, 1100):
+            (root / f"pr-{number}.json").write_text(json.dumps({
+                "version": 1, "repo": "owner/repo", "pr": number,
+                "entries": []}), encoding="utf-8")
+        common = {"repo": "owner/repo", "issue": 7, "pr": 9999,
+                  "base": BASE, "head": HEAD, "evidence_sha256": "c" * 64,
+                  "timestamp": "2026-11-09T00:00:00+00:00"}
+        (root / "pr-9999.json").write_text(json.dumps({
+            "version": 1, "repo": "owner/repo", "pr": 9999,
+            "entries": [{**common, "decision": "reviewed"},
+                        {**common, "decision": "changes_requested"}]}),
+            encoding="utf-8")
+        with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest._verified", return_value=True), patch(
+                "ermik.event_digest._send", return_value=None) as send:
+            self.assertEqual(deliver_once(self.cfg, now=100)["status"], "empty")
+            self.assertEqual(deliver_once(self.cfg, now=101)["status"], "delivered")
+            send.assert_called_once()
+
+    def test_decision_position_survives_seen_key_rollover(self):
+        root = self.cfg.state_dir / "decision-trail"
+        root.mkdir()
+        common = {"repo": "owner/repo", "issue": 7, "pr": 23,
+                  "base": BASE, "head": HEAD, "evidence_sha256": "c" * 64,
+                  "timestamp": "2026-11-09T00:00:00+00:00"}
+        (root / "pr-23.json").write_text(json.dumps({
+            "version": 1, "repo": "owner/repo", "pr": 23,
+            "entries": [{**common, "decision": "reviewed"},
+                        {**common, "decision": "changes_requested"}]}),
+            encoding="utf-8")
+        with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest._send", return_value=None) as send:
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=100)["status"],
+                             "delivered")
+            path = self.cfg.state_dir / "event-digest.json"
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            saved["seen"] = [f"{n:064x}" for n in range(2048)]
+            path.write_text(json.dumps(saved), encoding="utf-8")
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=160)["status"],
+                             "empty")
+            send.assert_called_once()
 
     def test_http_rate_limit_respects_bounded_retry_after(self):
         headers = Message()
