@@ -160,7 +160,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     evidence = {"status": status}
     if status == "current" and record is not None:
         manifest_identity = {
-            "version": 2,
+            "version": 3 if cfg.complexity_profiles else 2,
             "repo": cfg.repo, "issue": issue, "pr": pr_number,
             "head_repository": cfg.publish_repo or cfg.repo,
             "branch": pr["headRefName"], "base": pr["baseRefOid"],

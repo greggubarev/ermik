@@ -6,11 +6,14 @@ import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
+from ermik.evidence import make_manifest
+from ermik.evidence_export import _scope_sha256
 from ermik.github import GitHubError
 from ermik.policy import parse_issue
+from ermik.providers import ModelCandidate
 from ermik.review import _checks_sha256
 from ermik.review_packet import build_review_packet
-from ermik.runtime import WorkflowError
+from ermik.runtime import WorkflowError, _profile_sha
 
 
 HEAD = "b" * 40
@@ -71,6 +74,45 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertNotIn("estimated_cost", str(packet))
         self.assertNotIn("log_sha256", str(packet))
         self.assertNotIn(str(self.cfg.state_dir), str(packet))
+
+    def test_profiled_v3_evidence_is_current_in_review_packet(self):
+        from dataclasses import replace
+
+        model = ModelCandidate("provider", "model", "FREE_API_KEY",
+                               "https://api.example.net/v1",
+                               supported_efforts=("low",))
+        selected = replace(model, effort="low")
+        self.cfg = replace(self.cfg, models=(model,),
+                           complexity_profiles={"easy": (selected,),
+                                                "medium": (selected,),
+                                                "hard": (selected,)})
+        fields = {key: value for key, value in self.record().items()
+                  if key not in ("version", "sha256")}
+        fields["scope_sha256"] = _scope_sha256(self.spec.allowed_paths)
+        fields["attempts"] = 1
+        fields["usage"] = {"observation": "unknown"}
+        fields["unknowns"] = ["usage"]
+        record = make_manifest(**fields, complexity="easy",
+                               profile_sha256=_profile_sha(self.cfg, "easy"),
+                               effort="low")
+        with patch("ermik.review_packet.fetch_manifest",
+                   return_value=({"status": "current"}, record)):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "current")
+        self.assertTrue(packet["head_verified"])
+        self.assertEqual(packet["evidence"]["head"], HEAD)
+
+    def test_profiled_packet_rejects_legacy_version_claim(self):
+        from dataclasses import replace
+
+        self.cfg = replace(self.cfg, complexity_profiles={"easy": (),
+                                                          "medium": (),
+                                                          "hard": ()})
+        with patch("ermik.review_packet.fetch_manifest",
+                   return_value=({"status": "current"}, self.record())):
+            packet = build_review_packet(self.cfg, 12)
+        self.assertEqual(packet["status"], "stale")
+        self.assertEqual(packet["evidence"]["reason"], "identity_changed")
 
     def test_current_correction_keeps_previous_head_as_history(self):
         record = self.record()
