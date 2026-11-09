@@ -153,7 +153,7 @@ def render_html(snapshot: dict) -> bytes:
                    + "</tr>" for row in snapshot["items"])
     heads = "".join(f"<th>{cell(key.replace('_', ' ').title())}</th>" for key in columns)
     data = ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta http-equiv=\"refresh\" content=\"30\"><title>Maintainer queue</title>"
+            "<meta http-equiv=\"refresh\" content=\"120\"><title>Maintainer queue</title>"
             "<style>body{font:15px system-ui;margin:2rem}table{border-collapse:collapse}"
             "td,th{padding:.5rem;border:1px solid #bbb;text-align:left}"
             ".scroll{overflow:auto}</style></head><body><h1>Maintainer queue</h1>"

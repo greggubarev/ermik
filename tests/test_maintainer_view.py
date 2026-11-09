@@ -114,6 +114,7 @@ class MaintainerViewTests(unittest.TestCase):
             "model_route_label", "publisher_model_claim", "evidence", "checks",
             "review", "next_action")}]})
         self.assertNotIn(b"<script>", html)
+        self.assertIn(b'http-equiv="refresh" content="120"', html)
         with patch("ermik.maintainer_view.queue_snapshot", return_value={
                 "repo": "owner/project", "items": []}):
             server = create_server(self.cfg, 0)
