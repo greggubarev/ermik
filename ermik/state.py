@@ -280,6 +280,7 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_v5(conn: sqlite3.Connection) -> None:
+    # The v5 event columns are already present; v6 only adds profile fields.
     for statement in (
             "ALTER TABLE jobs ADD COLUMN complexity TEXT",
             "ALTER TABLE jobs ADD COLUMN profile_sha TEXT",

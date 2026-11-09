@@ -55,7 +55,7 @@ class EvidenceCliTests(unittest.TestCase):
     def test_unsupported_manifest_version_is_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "future.json"
-            path.write_bytes(b'{"version":3,"future_required":"value"}\n')
+            path.write_bytes(b'{"version":4,"future_required":"value"}\n')
             error = StringIO()
             with (patch.object(cli, "load_config", return_value=object()),
                   redirect_stderr(error)):

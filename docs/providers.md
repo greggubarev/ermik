@@ -9,12 +9,12 @@ The maintainer can assign an explicit easy, medium, or hard tier at admission. T
 ```json
 {
   "models": [
-    {"provider_id": "kimi-code", "model_id": "k3-256k", "credential_env": "KIMI_CODE_API_KEY", "supported_efforts": ["low", "medium", "high"]},
+    {"provider_id": "kimi-code", "model_id": "k3-256k", "credential_env": "KIMI_CODE_API_KEY", "supported_efforts": ["low", "high"]},
     {"provider_id": "opencode-go", "model_id": "kimi-k3", "credential_env": "OPENCODE_GO_API_KEY", "supported_efforts": ["low", "medium", "high"]}
   ],
   "complexity_profiles": {
     "easy": [{"model_ref": "kimi-code/k3-256k", "effort": "low"}],
-    "medium": [{"model_ref": "kimi-code/k3-256k", "effort": "medium"}],
+    "medium": [{"model_ref": "kimi-code/k3-256k", "effort": "high"}],
     "hard": [{"model_ref": "opencode-go/kimi-k3", "effort": "high"}]
   }
 }

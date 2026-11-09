@@ -152,6 +152,9 @@ class StateMigrationTests(unittest.TestCase):
             conn.execute("PRAGMA user_version = 5")
             conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json) "
                          "VALUES(7,'work-7',?,'running','[]')", ("a" * 40,))
+            conn.execute("INSERT INTO events(issue,kind,model,policy_version,eligible_json,"
+                         "decision_reason) VALUES(7,'route_decision','provider/model',1,?,"
+                         "'priority')", ('["provider/model"]',))
             conn.commit()
         original = state._migrate_v5
 
@@ -173,6 +176,9 @@ class StateMigrationTests(unittest.TestCase):
             self.assertEqual(tuple(row), (None, None, None))
             self.assertIn("complexity", {column[1] for column in conn.execute(
                 "PRAGMA table_info(events)")})
+            event = conn.execute("SELECT policy_version,eligible_json,decision_reason,"
+                                 "effort,complexity FROM events WHERE issue=7").fetchone()
+            self.assertEqual(tuple(event), (1, '["provider/model"]', "priority", None, None))
 
     @staticmethod
     def v3_schema() -> str:
