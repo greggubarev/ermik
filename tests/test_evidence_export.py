@@ -1,17 +1,21 @@
 """Exact-HEAD export uses local checks; verification needs only live GitHub."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
-from ermik.evidence_export import export_manifest, verify_manifest
+from ermik.evidence_export import export_manifest, verify_manifest, _scope_sha256
 from ermik.evidence import loads_manifest, make_manifest
 from ermik.evidence_store import read_evidence, write_evidence
 from ermik.policy import parse_issue
 from ermik.runtime import _admission_marker, WorkflowError
+from ermik.runtime import _profile_sha
+from ermik.providers import ModelCandidate
+from ermik.review import _checks_sha256
 from ermik import state
 
 
@@ -109,6 +113,52 @@ class EvidenceExportTests(unittest.TestCase):
                            Path(self.temp.name) / "other-work", IMAGE,
                            self.cfg.worker_command, self.cfg.checks, 1, 60, (), "main")
             self.assertEqual(verify_manifest(other, 12, manifest)["status"], "current")
+
+    def test_profiled_verify_reuses_live_snapshot_but_rechecks_route(self):
+        model = ModelCandidate("provider", "model", "FREE_API_KEY",
+                               "https://api.example.net/v1",
+                               supported_efforts=("low",))
+        selected = replace(model, effort="low")
+        cfg = replace(self.cfg, models=(model,),
+                      complexity_profiles={"easy": (selected,),
+                                           "medium": (selected,),
+                                           "hard": (selected,)})
+        gh = FakeGitHub(cfg)
+        issue = {"body": BODY, "labels": [{"name": name} for name in
+                 ("queue:worker", "state:in-progress", "complexity:easy")]}
+        marker = _admission_marker(7, self.spec, cfg, issue)
+        v2 = make_manifest(
+            repo=cfg.repo, head_repository=cfg.repo, issue=7, pr=12,
+            branch="work/issue-7-delivery", base=BASE, head=HEAD,
+            body_sha256=self.spec.body_sha256,
+            scope_sha256=_scope_sha256(self.spec.allowed_paths),
+            checks_sha256=_checks_sha256(cfg),
+            paths=["src/one.py"],
+            checks=[{"index": 1, "result": "passed", "log_sha256": "d" * 64}],
+            image=IMAGE, image_config_digest=CONFIG_DIGEST,
+            model=model.ref, attempts=1, usage={"observation": "unknown"},
+            unknowns=["usage"])
+        fields = {key: value for key, value in v2.items()
+                  if key not in ("version", "sha256")}
+        record = make_manifest(**fields, complexity="easy",
+                               profile_sha256=_profile_sha(cfg, "easy"),
+                               effort="low")
+        live = (gh.pr(12), 7, self.spec, ["src/one.py"])
+        with (patch("ermik.evidence_export._github", return_value=gh),
+              patch.object(gh, "issue", return_value=issue) as issue_read,
+              patch.object(gh, "comments", return_value=[
+                  {"body": marker, "user": {"login": cfg.maintainer}}]),
+              patch("ermik.evidence_export._resolve_image_id", return_value=IMAGE),
+              patch("ermik.evidence_export._portable_image_digest",
+                    return_value=CONFIG_DIGEST)):
+            self.assertEqual(verify_manifest(cfg, 12, record,
+                                             _live_result=live)["status"], "current")
+            self.assertGreaterEqual(issue_read.call_count, 1)
+            changed = {"body": BODY, "labels": issue["labels"] +
+                       [{"name": "route:one"}, {"name": "route:two"}]}
+            issue_read.return_value = changed
+            self.assertEqual(verify_manifest(cfg, 12, record,
+                                             _live_result=live)["status"], "stale")
 
     def test_cross_host_local_id_may_differ_when_config_matches(self):
         gh_patch, image_patch, digest_patch = self._patches()

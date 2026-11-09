@@ -13,7 +13,8 @@ from .evidence_store import read_evidence
 from .github import GitHub, GitHubError
 from .policy import parse_issue, validate_changed_paths
 from .review import _checks_sha256
-from .runtime import (_approved_on_github, _portable_image_digest, _profile_sha,
+from .runtime import (_approved_on_github, _complexity_key, _route_key,
+                      _portable_image_digest, _profile_sha, labels,
                       _resolve_image_id, main_sha, published_image_id,
                       published_image_config_digest, WorkflowError)
 
@@ -190,9 +191,10 @@ def verify_manifest(cfg: Config, pr_number: int, manifest: dict,
     record = validate_manifest(manifest)
     if record["version"] < 2:
         return {"status": "stale", "reason": "image_identity_missing"}
+    gh = _github(cfg) if _live_result is None else None
     try:
         pr, issue_number, spec, paths = (_live_result if _live_result is not None
-                                         else _live(cfg, _github(cfg), pr_number))
+                                         else _live(cfg, gh, pr_number))
     except WorkflowError:
         return {"status": "stale", "reason": "remote_identity"}
     try:
@@ -213,16 +215,26 @@ def verify_manifest(cfg: Config, pr_number: int, manifest: dict,
         if record.get(key) != value:
             return {"status": "stale", "reason": "identity_changed"}
     if cfg.complexity_profiles:
-        current_issue = gh.issue(issue_number)
-        tier_keys = {row["name"] for row in current_issue.get("labels", [])
-                     if row["name"].startswith("complexity:")}
-        tier = next(iter(tier_keys)).removeprefix("complexity:") if len(tier_keys) == 1 else None
-        if (record["version"] != 3 or tier not in cfg.complexity_profiles
+        gh = gh or _github(cfg)
+        try:
+            current_issue = gh.issue(issue_number)
+            key = _complexity_key(current_issue)
+            tier = key.removeprefix("complexity:") if key else None
+            route = _route_key(current_issue)
+            if (parse_issue(current_issue.get("body") or "").body_sha256
+                    != spec.body_sha256
+                    or not {"queue:worker", "state:in-progress"}.issubset(
+                        labels(current_issue))
+                    or not _approved_on_github(gh, cfg, issue_number, spec,
+                                               current_issue)):
+                return {"status": "stale", "reason": "remote_identity"}
+            profile_sha = (_profile_sha(cfg, tier, route)
+                           if tier in cfg.complexity_profiles and route else None)
+        except (GitHubError, ValueError, TypeError):
+            return {"status": "stale", "reason": "remote_identity"}
+        if (record["version"] != 3 or profile_sha is None
                 or record["complexity"] != tier
-                or record["profile_sha256"] != _profile_sha(
-                    cfg, tier, next(iter({row["name"] for row in current_issue.get("labels", [])
-                                         if row["name"].startswith("route:")}),
-                                    "route:auto"))
+                or record["profile_sha256"] != profile_sha
                 or (record["model"] is not None and
                     (record["model"], record["effort"]) not in
                     {(candidate.ref, candidate.effort)
