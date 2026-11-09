@@ -171,8 +171,13 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
             "head": record["head"], "sha256": record["sha256"]}
 
 
-def fetch_manifest(cfg: Config, pr_number: int) -> tuple[dict, dict | None]:
-    """Fetch publisher records without opening controller SQLite or private logs."""
+def fetch_manifest(cfg: Config, pr_number: int, *, _live_result=None,
+                   _records_out: list | None = None) -> tuple[dict, dict | None]:
+    """Fetch publisher records without opening controller SQLite or private logs.
+
+    A packet caller may reuse its first live read and the fetched comment list;
+    it must recheck remote identity before presenting a current result.
+    """
     gh = GitHub(cfg.repo)
     try:
         found = _published_records(cfg, gh, pr_number)
@@ -180,9 +185,11 @@ def fetch_manifest(cfg: Config, pr_number: int) -> tuple[dict, dict | None]:
         return {"status": "unsupported_version"}, None
     except EvidenceRecordError:
         return {"status": "stale", "reason": "invalid_record"}, None
+    if _records_out is not None:
+        _records_out.extend(found)
     if not found:
         return {"status": "missing"}, None
-    pr = gh.pr(pr_number)
+    pr = _live_result[0] if _live_result is not None else gh.pr(pr_number)
     head = pr.get("headRefOid")
     counts: dict[str, int] = {}
     for _, record in found:
@@ -192,7 +199,10 @@ def fetch_manifest(cfg: Config, pr_number: int) -> tuple[dict, dict | None]:
     current = [(row, record) for row, record in found if record["head"] == head]
     if current:
         row, record = current[0]
-        result = verify_manifest(cfg, pr_number, record)
+        result = (verify_manifest(cfg, pr_number, record,
+                                  _live_result=_live_result)
+                  if _live_result is not None else
+                  verify_manifest(cfg, pr_number, record))
         if result["status"] == "current":
             return {"status": "current", "comment_id": row["id"],
                     "head": head, "sha256": record["sha256"]}, record

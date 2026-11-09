@@ -6,7 +6,7 @@ import re
 
 from .config import Config
 from .evidence_export import _github, _live
-from .evidence_transport import _published_records, fetch_manifest
+from .evidence_transport import fetch_manifest
 from .github import GitHub, GitHubError
 from .review import _checks_sha256, _load, _review_policy
 from .runtime import (WorkflowError, published_image_id,
@@ -18,6 +18,7 @@ _UNSAFE_TEXT = re.compile(
     r"authorization|private[ _-]?key)\b|\b[A-Za-z0-9_+=.-]{32,}\b)"
 )
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
+_MODEL_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}\Z")
 _SAFE_PROSE = re.compile(r"[A-Za-z0-9 .,;:!?()'\"-]+\Z")
 
 
@@ -65,7 +66,8 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     if type(pr_number) is not int or pr_number <= 0:
         return {"status": "incomplete", "reason": "invalid_pr_number"}
     try:
-        pr, issue, spec, paths = _live(cfg, _github(cfg), pr_number)
+        live = _live(cfg, _github(cfg), pr_number)
+        pr, issue, spec, paths = live
         image = published_image_id(pr.get("body") or "")
         image_config_digest = published_image_config_digest(pr.get("body") or "")
         if not (_SHA.fullmatch(pr["baseRefOid"])
@@ -140,8 +142,10 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
             packet["review"]["next_action"] = "review_current_head"
         return packet
 
+    records = []
     try:
-        fetched, record = fetch_manifest(cfg, pr_number)
+        fetched, record = fetch_manifest(cfg, pr_number, _live_result=live,
+                                          _records_out=records)
     except (OSError, ValueError, WorkflowError, GitHubError):
         packet.update(status="incomplete", evidence={"status": "unavailable"})
         return finish()
@@ -174,13 +178,11 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         evidence["checks"] = [{"index": row["index"], "result": row["result"]}
                               for row in record["checks"]]
         evidence["observation"] = "publisher_claim"
+        model = record.get("model")
+        evidence["model_ref"] = (model if isinstance(model, str) and
+                                 _MODEL_REF.fullmatch(model) else None)
         # The preceding publisher record is history, never a current check claim.
-        try:
-            history = _published_records(cfg, GitHub(cfg.repo), pr_number)
-        except (GitHubError, ValueError):
-            packet.update(status="incomplete", evidence={"status": "unavailable"})
-            return finish()
-        prior_heads = [saved["head"] for _, saved in history
+        prior_heads = [saved["head"] for _, saved in records
                        if saved["head"] != packet["head"]]
         if prior_heads:
             packet["previous_head"] = prior_heads[-1]
