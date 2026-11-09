@@ -1,7 +1,6 @@
 """Focused delivery and recovery checks for the optional digest."""
 
 import json
-import os
 import tempfile
 from urllib.error import HTTPError
 from email.message import Message
@@ -164,19 +163,23 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(result["event"], "correction_requested")
         self.assertEqual(received[0]["pr_url"], "https://github.com/owner/repo/pull/23")
 
-    @unittest.skipUnless(os.name == "posix", "POSIX permissions required")
-    def test_insecure_decision_journal_is_not_delivered(self):
+    def test_rejected_decision_journal_is_not_delivered(self):
         root = self.cfg.state_dir / "decision-trail"
-        root.mkdir(mode=0o755)
-        root.chmod(0o755)
-        path = root / "pr-23.json"
-        path.write_text(json.dumps({"version": 1, "repo": "owner/repo",
-                                    "pr": 23, "entries": []}), encoding="utf-8")
-        path.chmod(0o644)
+        root.mkdir(mode=0o700)
+        common = {"repo": "owner/repo", "issue": 7, "pr": 23,
+                  "base": BASE, "head": HEAD, "evidence_sha256": "c" * 64,
+                  "timestamp": "2026-11-09T00:00:00+00:00"}
+        write_evidence(root / "pr-23.json", {
+            "version": 1, "repo": "owner/repo", "pr": 23,
+            "entries": [{**common, "decision": "reviewed"},
+                        {**common, "decision": "changes_requested"}]})
         with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest.read_decisions", side_effect=ValueError(
+                    "unsafe journal")) as read, patch(
                 "ermik.event_digest._send") as send:
             self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=100)["status"],
                              "empty")
+            read.assert_called_once_with(self.cfg, 23)
             send.assert_not_called()
 
     def test_repeated_correction_same_head_has_distinct_keys(self):
