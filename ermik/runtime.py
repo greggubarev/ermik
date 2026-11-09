@@ -791,11 +791,34 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
         raise WorkflowError("only the configured maintainer can admit an issue")
     issue = gh.issue(number)
     names = labels(issue)
-    if "queue:worker" not in names or not ({"state:proposed", "state:ready"} & names):
-        raise WorkflowError("issue must be open, queue:worker and state:proposed or state:ready")
+    blocked_readmission = bool(cfg.complexity_profiles and "state:blocked" in names)
+    if blocked_readmission and ({"state:proposed", "state:ready",
+                                 "state:in-progress"} & names):
+        raise WorkflowError("blocked issue has conflicting state labels")
+    if ("queue:worker" not in names or
+            not ({"state:proposed", "state:ready"} & names) and not blocked_readmission):
+        raise WorkflowError("issue must be open and in the scoped worker queue")
     spec = parse_issue(issue.get("body") or "")
+    reviewed_pr = None
+    if blocked_readmission:
+        branch = f"work/issue-{number}-delivery"
+        pr_number = gh.find_branch_pr(branch)
+        if pr_number is None:
+            raise WorkflowError("blocked pre-publication job requires separate recovery")
+        reviewed_pr = gh.pr(pr_number)
+        _require_pr(gh, reviewed_pr, cfg, branch=branch, number=pr_number,
+                    state_name="OPEN")
+        if (not reviewed_pr.get("isDraft")
+                or re.findall(r"(?im)\bCloses\s+#(\d+)\b",
+                              reviewed_pr.get("body") or "") != [str(number)]
+                or not re.fullmatch(r"[0-9a-f]{40}",
+                                    reviewed_pr.get("headRefOid") or "")):
+            raise WorkflowError("blocked PR lacks an exact draft HEAD")
     with state.connect(cfg.state_dir) as conn:
-        if state.job(conn, number):
+        existing = state.job(conn, number)
+        if existing and not (blocked_readmission and existing["status"] == "blocked"
+                             and existing["pr"] == reviewed_pr["number"]
+                             and existing["head_sha"] == reviewed_pr["headRefOid"]):
             raise WorkflowError("issue already has a job")
     if cfg.complexity_profiles:
         if complexity not in cfg.complexity_profiles:
@@ -821,17 +844,21 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
     if already_ready and not cfg.complexity_profiles and not _approved_on_github(gh, cfg, number, spec):
         raise WorkflowError("ready issue lacks the matching maintainer approval")
     with state.connect(cfg.state_dir) as conn:
-        if state.job(conn, number):
+        existing = state.job(conn, number)
+        if existing and not (blocked_readmission and existing["status"] == "blocked"
+                             and existing["pr"] == reviewed_pr["number"]
+                             and existing["head_sha"] == reviewed_pr["headRefOid"]):
             raise WorkflowError("issue already has a job")
-        conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
-                     "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha, "
-                     "allowed_json=excluded.allowed_json",
-                     (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
-        state.event(conn, number, "admitted")
+        if not blocked_readmission:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
+                         "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha, "
+                         "allowed_json=excluded.allowed_json",
+                         (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
+            state.event(conn, number, "admitted")
     if not _approved_on_github(gh, cfg, number, spec):
         gh.comment(number, marker +
                    "\n\nApproved for the scoped worker queue.")
-    if not already_ready:
+    if not already_ready and not blocked_readmission:
         gh.label(number, add="state:ready", remove="state:proposed")
     return {"issue": number, "allowed_paths": spec.allowed_paths,
             "body_sha256": spec.body_sha256,
@@ -894,16 +921,23 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
             spec = None
         try:
             approved_on_github = (spec is not None and
-                                  _approved_on_github(gh, cfg, row["issue"], spec)
-                                  and _job_complexity_matches(cfg, issue, row))
+                                  _approved_on_github(gh, cfg, row["issue"], spec,
+                                                      issue))
         except GitHubError:
             conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                          (now + 60, row["issue"]))
             continue
         expected_state = "state:blocked" if row["status"] == "blocked" else "state:in-progress"
-        if (spec is None or approved is None or approved["body_sha"] != spec.body_sha256
-                or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+        needs_readmission = (spec is not None and
+                             (approved is None or approved["body_sha"] != spec.body_sha256
+                              or not _job_complexity_matches(cfg, issue, row)))
+        if (spec is None or
+                tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+                or (approved is not None and
+                    tuple(json.loads(approved["allowed_json"])) != spec.allowed_paths)
                 or not approved_on_github
+                or needs_readmission and not
+                (cfg.complexity_profiles and row["status"] == "blocked")
                 or not {"queue:worker", expected_state}.issubset(labels(issue))):
             conn.execute("UPDATE jobs SET status='blocked',error='Issue approval changed',reason_code=NULL "
                          "WHERE issue=?", (row["issue"],))
@@ -941,6 +975,51 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                              (now + 60, row["issue"]))
                 break
+            if needs_readmission:
+                marker = _admission_marker(row["issue"], spec, cfg, issue)
+                approval_ids = [
+                    item.get("id") for item in gh.comments(row["issue"])
+                    if (item.get("body") or "").splitlines()[0:1] == [marker]
+                    and item.get("user", {}).get("login") == cfg.maintainer
+                    and type(item.get("id")) is int]
+                if not approval_ids or comment["id"] <= max(approval_ids):
+                    continue
+                key = _complexity_key(issue)
+                tier = key.removeprefix("complexity:") if key else None
+                route = _route_key(issue)
+                if tier not in cfg.complexity_profiles or route is None:
+                    continue
+                digest = _profile_sha(cfg, tier, route)
+                fresh_issue = gh.issue(row["issue"])
+                fresh_pr = gh.pr(row["pr"])
+                if (parse_issue(fresh_issue.get("body") or "").body_sha256
+                        != spec.body_sha256
+                        or _route_key(fresh_issue) != route
+                        or _complexity_key(fresh_issue) != key
+                        or not _approved_on_github(
+                            gh, cfg, row["issue"], spec, fresh_issue)):
+                    continue
+                _require_pr(gh, fresh_pr, cfg, branch=row["branch"],
+                            number=row["pr"], head_sha=row["head_sha"])
+                if (fresh_pr["state"] != "OPEN"
+                        or fresh_pr["headRefOid"] != row["head_sha"]
+                        or fresh_pr.get("isDraft") is not True):
+                    continue
+                conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) "
+                             "VALUES(?,?,?) ON CONFLICT(issue) DO UPDATE SET "
+                             "body_sha=excluded.body_sha,allowed_json=excluded.allowed_json",
+                             (row["issue"], spec.body_sha256,
+                              json.dumps(spec.allowed_paths)))
+                updated = conn.execute(
+                    "UPDATE jobs SET route_key=?,complexity=?,profile_sha=?,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE issue=? AND "
+                    "status='blocked' AND pr=? AND head_sha=?",
+                    (route, tier, digest, row["issue"], row["pr"],
+                     row["head_sha"]))
+                if updated.rowcount != 1:
+                    raise WorkflowError("blocked PR identity changed during readmission")
+                state.event(conn, row["issue"], "readmitted",
+                            complexity=tier, head_sha=row["head_sha"])
             rebase_only = bool(REBASE_ONLY.search(comment.get("body") or ""))
             provider = None if rebase_only else _route_provider(conn, cfg, issue, reserved or {})
             if provider is None and not rebase_only:

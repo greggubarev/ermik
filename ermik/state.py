@@ -420,7 +420,7 @@ def event(conn: sqlite3.Connection, issue: int, kind: str, *,
           eligible: tuple[str, ...] | list[str] | None = None,
           decision_reason: str | None = None) -> None:
     if type(issue) is not int or issue <= 0 or kind not in {
-            "admitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
+            "admitted", "readmitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
             "quota_paused", "checks_passed", "pr_published", "awaiting_review", "blocked",
             "correction_started", "merged", "evidence_delivered",
             "route_decision"}:

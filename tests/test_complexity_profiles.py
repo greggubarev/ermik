@@ -74,6 +74,52 @@ class AdmitHub:
         return self.notes
 
 
+class ReadmitHub:
+    def __init__(self, cfg, *, approval_id=20, request_id=21):
+        self.cfg = cfg
+        self.body = BODY
+        self.names = {"queue:worker", "state:blocked",
+                      "route:go", "complexity:medium"}
+        self.approval_id = approval_id
+        self.request_id = request_id
+        self.notes = []
+        self.pr_reads = 0
+        self.advance_head = False
+
+    def identity(self):
+        return "owner"
+
+    def issue(self, number):
+        return {"body": self.body, "title": "Task",
+                "labels": [{"name": name} for name in self.names]}
+
+    def comments(self, number):
+        if number == 1:
+            return self.notes
+        return [{"id": self.request_id,
+                 "body": f"SEMI_REWORK issue=1 head={'b' * 40}",
+                 "user": {"login": "owner"}}]
+
+    def find_branch_pr(self, branch):
+        return 2
+
+    def pr(self, number):
+        self.pr_reads += 1
+        return {"number": 2, "state": "OPEN", "isDraft": True,
+                "headRefOid": ("c" if self.advance_head and self.pr_reads > 1
+                               else "b") * 40, "body": "Closes #1"}
+
+    def label(self, number, *, add, remove):
+        if remove:
+            self.names.discard(remove)
+        if add:
+            self.names.add(add)
+
+    def comment(self, number, body):
+        self.notes.append({"id": self.approval_id, "body": body,
+                           "user": {"login": "owner"}})
+
+
 class ComplexityProfileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -197,3 +243,70 @@ class ComplexityProfileTests(unittest.TestCase):
         selected, error, _ = self.perform()
         self.assertEqual(selected, [])
         self.assertIsInstance(error, runtime.ProviderCapacityUnavailable)
+
+    def readmission_hub(self, *, approval_id=20, request_id=21):
+        cfg = replace(self.cfg, routes={"route:go": "opencode-go"})
+        hub = ReadmitHub(cfg, approval_id=approval_id, request_id=request_id)
+        hub.comment(1, runtime._admission_marker(1, SPEC, cfg, hub.issue(1)))
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET status='blocked',pr=2,head_sha=?,"
+                         "review_next_check_at=0 WHERE issue=1", ("b" * 40,))
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) "
+                         "VALUES(?,?,?)", (1, SPEC.body_sha256, '["file.txt"]'))
+        return cfg, hub
+
+    def test_blocked_pr_readmission_requires_new_exact_head_request(self):
+        cfg, hub = self.readmission_hub()
+        with patch.object(runtime, "GitHub", return_value=hub), patch.object(
+                runtime, "_require_pr"):
+            result = runtime.admit(cfg, 1, "medium")
+            self.assertEqual(result["complexity"], "medium")
+            with state.connect(cfg.state_dir) as conn:
+                pending = runtime._correction(hub, cfg, conn)
+                self.assertIsNotNone(pending)
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["complexity"], row["route_key"],
+                                  row["head_sha"], row["pr"]),
+                                 ("correcting", "medium", "route:go", "b" * 40, 2))
+                self.assertEqual(row["profile_sha"],
+                                 runtime._profile_sha(cfg, "medium", "route:go"))
+
+    def test_old_request_cannot_readmit_blocked_pr(self):
+        cfg, hub = self.readmission_hub(request_id=19)
+        with patch.object(runtime, "_require_pr"):
+            with state.connect(cfg.state_dir) as conn:
+                self.assertIsNone(runtime._correction(hub, cfg, conn))
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["complexity"], row["route_key"]),
+                                 ("blocked", "easy", "route:auto"))
+
+    def test_changed_scope_cannot_readmit_existing_pr(self):
+        cfg, hub = self.readmission_hub()
+        hub.body = BODY.replace("file.txt", "other.txt")
+        changed = parse_issue(hub.body)
+        hub.notes = [{"id": 20, "body": runtime._admission_marker(
+            1, changed, cfg, hub.issue(1)), "user": {"login": "owner"}}]
+        with patch.object(runtime, "_require_pr"):
+            with state.connect(cfg.state_dir) as conn:
+                self.assertIsNone(runtime._correction(hub, cfg, conn))
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["complexity"]),
+                                 ("blocked", "easy"))
+
+    def test_changed_head_during_readmission_keeps_job_blocked(self):
+        cfg, hub = self.readmission_hub()
+        hub.advance_head = True
+        with patch.object(runtime, "_require_pr"):
+            with state.connect(cfg.state_dir) as conn:
+                self.assertIsNone(runtime._correction(hub, cfg, conn))
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["complexity"], row["head_sha"]),
+                                 ("blocked", "easy", "b" * 40))
+
+    def test_blocked_prepublication_job_cannot_readmit_as_pr(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        with patch.object(runtime, "GitHub", return_value=hub):
+            with self.assertRaisesRegex(runtime.WorkflowError,
+                                        "pre-publication job requires separate recovery"):
+                runtime.admit(cfg, 1, "medium")
