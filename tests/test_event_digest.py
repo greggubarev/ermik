@@ -1,6 +1,7 @@
 """Focused delivery and recovery checks for the optional digest."""
 
 import json
+import os
 import tempfile
 from urllib.error import HTTPError
 from email.message import Message
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 from ermik import state
 from ermik.event_digest import deliver_once, _send
+from ermik.evidence_store import write_evidence
 
 
 HEAD = "a" * 40
@@ -146,14 +148,14 @@ class DigestTests(unittest.TestCase):
 
     def test_requested_correction_from_verified_decision_trail(self):
         root = self.cfg.state_dir / "decision-trail"
-        root.mkdir()
+        root.mkdir(mode=0o700)
         common = {"repo": "owner/repo", "issue": 7, "pr": 23,
                   "base": BASE, "head": HEAD, "evidence_sha256": "c" * 64,
                   "timestamp": "2026-11-09T00:00:00+00:00"}
-        (root / "pr-23.json").write_text(json.dumps({
+        write_evidence(root / "pr-23.json", {
             "version": 1, "repo": "owner/repo", "pr": 23,
             "entries": [{**common, "decision": "reviewed"},
-                        {**common, "decision": "changes_requested"}]}), encoding="utf-8")
+                        {**common, "decision": "changes_requested"}]})
         received = []
         with patch.dict("os.environ", ENV), patch(
                 "ermik.event_digest._send", side_effect=lambda u, t, p, k:
@@ -162,9 +164,24 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(result["event"], "correction_requested")
         self.assertEqual(received[0]["pr_url"], "https://github.com/owner/repo/pull/23")
 
+    @unittest.skipUnless(os.name == "posix", "POSIX permissions required")
+    def test_insecure_decision_journal_is_not_delivered(self):
+        root = self.cfg.state_dir / "decision-trail"
+        root.mkdir(mode=0o755)
+        root.chmod(0o755)
+        path = root / "pr-23.json"
+        path.write_text(json.dumps({"version": 1, "repo": "owner/repo",
+                                    "pr": 23, "entries": []}), encoding="utf-8")
+        path.chmod(0o644)
+        with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest._send") as send:
+            self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=100)["status"],
+                             "empty")
+            send.assert_not_called()
+
     def test_repeated_correction_same_head_has_distinct_keys(self):
         root = self.cfg.state_dir / "decision-trail"
-        root.mkdir()
+        root.mkdir(mode=0o700)
         path = root / "pr-23.json"
         common = {"repo": "owner/repo", "issue": 7, "pr": 23,
                   "base": BASE, "head": HEAD,
@@ -172,8 +189,8 @@ class DigestTests(unittest.TestCase):
         entries = [{**common, "evidence_sha256": "c" * 64, "decision": "reviewed"},
                    {**common, "evidence_sha256": "c" * 64,
                     "decision": "changes_requested"}]
-        path.write_text(json.dumps({"version": 1, "repo": "owner/repo",
-                                    "pr": 23, "entries": entries}), encoding="utf-8")
+        write_evidence(path, {"version": 1, "repo": "owner/repo",
+                              "pr": 23, "entries": entries})
         keys = []
         with patch.dict("os.environ", ENV), patch(
                 "ermik.event_digest._send", side_effect=lambda u, t, p, k:
@@ -184,27 +201,26 @@ class DigestTests(unittest.TestCase):
                              "decision": "reviewed"},
                             {**common, "evidence_sha256": "d" * 64,
                              "decision": "changes_requested"}])
-            path.write_text(json.dumps({"version": 1, "repo": "owner/repo",
-                                        "pr": 23, "entries": entries}), encoding="utf-8")
+            write_evidence(path, {"version": 1, "repo": "owner/repo",
+                                  "pr": 23, "entries": entries})
             self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=160)["status"],
                              "delivered")
         self.assertEqual(len(set(keys)), 2)
 
     def test_decision_scan_rotates_beyond_first_hundred_files(self):
         root = self.cfg.state_dir / "decision-trail"
-        root.mkdir()
+        root.mkdir(mode=0o700)
         for number in range(1000, 1100):
-            (root / f"pr-{number}.json").write_text(json.dumps({
+            write_evidence(root / f"pr-{number}.json", {
                 "version": 1, "repo": "owner/repo", "pr": number,
-                "entries": []}), encoding="utf-8")
+                "entries": []})
         common = {"repo": "owner/repo", "issue": 7, "pr": 9999,
                   "base": BASE, "head": HEAD, "evidence_sha256": "c" * 64,
                   "timestamp": "2026-11-09T00:00:00+00:00"}
-        (root / "pr-9999.json").write_text(json.dumps({
+        write_evidence(root / "pr-9999.json", {
             "version": 1, "repo": "owner/repo", "pr": 9999,
             "entries": [{**common, "decision": "reviewed"},
-                        {**common, "decision": "changes_requested"}]}),
-            encoding="utf-8")
+                        {**common, "decision": "changes_requested"}]})
         with patch.dict("os.environ", ENV), patch(
                 "ermik.event_digest._verified", return_value=True), patch(
                 "ermik.event_digest._send", return_value=None) as send:
@@ -214,15 +230,14 @@ class DigestTests(unittest.TestCase):
 
     def test_decision_position_survives_seen_key_rollover(self):
         root = self.cfg.state_dir / "decision-trail"
-        root.mkdir()
+        root.mkdir(mode=0o700)
         common = {"repo": "owner/repo", "issue": 7, "pr": 23,
                   "base": BASE, "head": HEAD, "evidence_sha256": "c" * 64,
                   "timestamp": "2026-11-09T00:00:00+00:00"}
-        (root / "pr-23.json").write_text(json.dumps({
+        write_evidence(root / "pr-23.json", {
             "version": 1, "repo": "owner/repo", "pr": 23,
             "entries": [{**common, "decision": "reviewed"},
-                        {**common, "decision": "changes_requested"}]}),
-            encoding="utf-8")
+                        {**common, "decision": "changes_requested"}]})
         with patch.dict("os.environ", ENV), patch(
                 "ermik.event_digest._send", return_value=None) as send:
             self.assertEqual(deliver_once(self.cfg, gh=FakeGitHub(), now=100)["status"],
