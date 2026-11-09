@@ -28,6 +28,7 @@ from .review_packet import build_review_packet
 from .maintainer_view import queue_snapshot, create_server as create_maintainer_server
 from .decision_trail import read_decisions
 from .outcomes import build_outcome_report, build_quality_snapshot
+from .event_digest import deliver_once
 
 
 def doctor(cfg) -> dict:
@@ -145,7 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Local issue-to-PR workflow")
     parser.add_argument("--config", type=Path, required=True)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("doctor", "status", "run-once", "poll", "quota-refresh", "quota-status"):
+    for name in ("doctor", "status", "run-once", "poll", "quota-refresh", "quota-status",
+                 "send-digest"):
         commands.add_parser(name)
     storage_parser = commands.add_parser("storage")
     storage_parser.add_argument("--cleanup", action="store_true")
@@ -194,6 +196,8 @@ def main(argv: list[str] | None = None) -> int:
             result = doctor(cfg)
         elif args.command == "status":
             result = status(cfg)
+        elif args.command == "send-digest":
+            result = deliver_once(cfg)
         elif args.command == "maintainer-queue":
             result = queue_snapshot(cfg)
         elif args.command == "quota-refresh":
