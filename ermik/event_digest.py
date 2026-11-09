@@ -126,7 +126,7 @@ def _event_candidate(cfg, cursor: int) -> tuple[int, dict | None]:
         return cursor, None
     with closing(sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute("SELECT e.id,e.issue,e.kind,e.head_sha,j.pr,j.branch,j.head_sha AS job_head, "
+        rows = conn.execute("SELECT e.id,e.issue,e.kind,e.head_sha,j.pr,j.branch, "
                             "(SELECT MIN(e0.id) FROM events e0 WHERE e0.issue=e.issue "
                             "AND e0.kind='pr_published') AS first_pub "
                             "FROM events e LEFT JOIN jobs j ON j.issue=e.issue "
@@ -147,8 +147,7 @@ def _event_candidate(cfg, cursor: int) -> tuple[int, dict | None]:
                                or int(_BRANCH.fullmatch(row["branch"]).group(1)) != issue):
             continue
         if kind == "draft_pr" and (pr is None or not isinstance(head, str)
-                                    or not _SHA.fullmatch(head)
-                                    or row["job_head"] != head):
+                                    or not _SHA.fullmatch(head)):
             continue
         if kind == "completed" and pr is None:
             continue
@@ -196,9 +195,7 @@ def _verified(cfg, gh: GitHub, item: dict) -> bool:
                 and pr.get("headRepository", {}).get("nameWithOwner", "").casefold()
                 == (cfg.publish_repo or cfg.repo).casefold()
                 and pr.get("baseRefName") == cfg.base_branch
-                and _CLOSES.findall(pr.get("body") or "") == [str(item["issue"])]
-                and (item["kind"] != "draft_pr" or
-                     pr.get("headRefOid") == item["head"]))
+                and _CLOSES.findall(pr.get("body") or "") == [str(item["issue"])])
 
 
 def _send(url: str, token: str, payload: dict, key: str) -> int | None:
@@ -257,11 +254,15 @@ def _deliver_locked(cfg, settings, gh, now) -> dict:
         _save(path, data)
         return {"status": "duplicate"}
     try:
-        if not _verified(cfg, gh or GitHub(cfg.repo, cfg.publish_repo,
-                                          cfg.publish_token_env), item):
-            return {"status": "identity_unverified"}
+        verified = _verified(cfg, gh or GitHub(cfg.repo, cfg.publish_repo,
+                                              cfg.publish_token_env), item)
     except (OSError, ValueError, RuntimeError, KeyError, TypeError):
         return {"status": "identity_unverified"}
+    if not verified:
+        data["cursor"] = cursor
+        data["seen"] = (data["seen"] + [key])[-_MAX_SEEN:]
+        _save(path, data)
+        return {"status": "identity_rejected"}
     payload = {"version": 1, "event": item["kind"], "issue": item["issue"],
                "issue_url": f"https://github.com/{cfg.repo}/issues/{item['issue']}",
                "pr": item["pr"],

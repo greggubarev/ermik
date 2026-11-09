@@ -89,8 +89,23 @@ class DigestTests(unittest.TestCase):
 
         with patch.dict("os.environ", ENV), patch("ermik.event_digest._send") as send:
             self.assertEqual(deliver_once(self.cfg, gh=Wrong(), now=100)["status"],
-                             "identity_unverified")
+                             "identity_rejected")
             send.assert_not_called()
+
+    def test_published_draft_remains_reportable_after_head_moves(self):
+        self.event("pr_published")
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET head_sha=? WHERE issue=7", ("d" * 40,))
+
+        class Advanced(FakeGitHub):
+            def pr(self, number):
+                return {**super().pr(number), "headRefOid": "d" * 40}
+
+        with patch.dict("os.environ", ENV), patch(
+                "ermik.event_digest._send", return_value=None) as send:
+            self.assertEqual(deliver_once(self.cfg, gh=Advanced(), now=100)["status"],
+                             "delivered")
+            send.assert_called_once()
 
     def test_blocked_and_completed_are_bounded(self):
         self.event("blocked")
