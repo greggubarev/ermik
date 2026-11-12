@@ -66,7 +66,7 @@ The [optional maintainer view](https://github.com/greggubarev/ermik/issues/18) d
 
 **Acceptance:** Provide an optional interface that shows each issue's verified identity, current state, PR and HEAD, check result, and next available maintainer action from the same underlying records as the commands. In a trial, compare the interface and command output for an admitted task, blocked task, correction, and stale review; they must agree. An unavailable interface must leave admission, review, and explicit merge usable through the documented commands. No interface action may weaken the checks or grant the execution host merge authority.
 
-## 7. v0.6: Approved task complexity and safe recovery (implemented; release gates pending)
+## 7. v0.6: Approved task complexity and safe recovery (preview released)
 
 **Goal:** Bind a maintainer's explicit effort approval to the Issue-to-PR lifecycle and recover eligible blocked work without replaying uncertain publication.
 
@@ -76,7 +76,7 @@ This milestone binds an explicit approval to the auditable Issue-to-PR handoff a
 
 **Acceptance:** Verify allowed and exhausted profile routing, changed-approval rejection, and legacy behavior. For recovery, verify one safely resumed disposable job and one changed-branch rejection after restart, with no duplicate PR, replayed execution, or discarded work. Do not infer automatic classification or cost/quality calibration from manually approved tiers.
 
-The two milestone Issues are closed. [#106](https://github.com/greggubarev/ermik/issues/106) passed an isolated state upgrade and an approved Issue-to-draft-PR trial with rejection of an old approval. [#109](https://github.com/greggubarev/ermik/issues/109) passed a current-source restart and re-admission trial that published one draft PR, plus a changed-branch refusal. These trials cover provably unstarted jobs; started work and uncertain publication remain blocked. The source release still requires the host and archive gates.
+The two milestone Issues are closed. [#106](https://github.com/greggubarev/ermik/issues/106) passed an isolated state upgrade and an approved Issue-to-draft-PR trial with rejection of an old approval. [#109](https://github.com/greggubarev/ermik/issues/109) passed a current-source restart and re-admission trial that published one draft PR, plus a changed-branch refusal. These trials cover provably unstarted jobs; started work and uncertain publication remain blocked. The [v0.6 preview](https://github.com/greggubarev/ermik/releases/tag/v0.6.0-preview.1) passed the source, Windows, Linux, and Docker release gates on one commit.
 
 ## After v0.6: Candidate adoption work
 
