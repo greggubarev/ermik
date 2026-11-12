@@ -892,7 +892,7 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
         # A historical matching admission is not a fresh decision to resume a
         # blocked job. Keep a distinct, one-use marker in this approval comment.
         gh.comment(number, marker + "\n" +
-                   marker.replace("SEMI_ADMIT", "SEMI_READMIT", 1) +
+                   marker.replace("SEMI_ADMIT", "ERMIK_READMIT", 1) +
                    "\n\nApproved to retry the blocked pre-publication job.")
     elif blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
         gh.comment(number, marker +
@@ -1368,7 +1368,7 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
                     tier, route, digest):
                 continue
             marker = _admission_marker(row["issue"], spec, cfg, issue)
-            readmit_marker = marker.replace("SEMI_ADMIT", "SEMI_READMIT", 1)
+            readmit_marker = marker.replace("SEMI_ADMIT", "ERMIK_READMIT", 1)
             readmit_ids = [note.get("id") for note in gh.comments(row["issue"])
                            if note.get("user", {}).get("login") == cfg.maintainer
                            and (note.get("body") or "").splitlines()[:2]

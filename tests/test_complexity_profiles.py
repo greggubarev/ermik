@@ -408,6 +408,9 @@ class ComplexityProfileTests(unittest.TestCase):
                          ("work/issue-1-delivery",))
         with patch.object(runtime, "GitHub", return_value=hub):
             runtime.admit(cfg, 1, "medium")
+        self.assertEqual(hub.notes[-1]["body"].splitlines()[1],
+                         hub.notes[-1]["body"].splitlines()[0].replace(
+                             "SEMI_ADMIT", "ERMIK_READMIT", 1))
         # A new connection stands for a controller restart after approval.
         with patch.object(runtime, "mirror", return_value=source), \
                 patch.object(runtime, "main_sha", return_value=base):
