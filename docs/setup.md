@@ -428,7 +428,7 @@ with sqlite3.connect(root / "state.sqlite3") as db:
     integrity = db.execute("PRAGMA quick_check").fetchone()[0]
     print("restored schema version", version)
     print("integrity", integrity)
-    if version not in (0, 1) or integrity != "ok":
+    if version not in range(6) or integrity != "ok":
         raise RuntimeError("restored pre-upgrade state failed validation")
 PY
 ```
