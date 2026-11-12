@@ -169,6 +169,18 @@ class FaultWindowTests(unittest.TestCase):
                          (1, BRANCH, base, '["src/example.py"]', IMAGE))
         return source, checkout, base, head
 
+    def _checked_unpushed(self):
+        source, checkout, base, head = self._published_leftover()
+        self.gh.prs.clear()
+        self.gh.remote_head = None
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET attempts_count=1,route_key='route:auto' "
+                         "WHERE issue=1")
+            state.begin_attempt(conn, "completed-worker", 1, "", "", "initial")
+            state.finish_attempt(conn, "completed-worker", None, 0, 1)
+            state.event(conn, 1, "checks_passed", head_sha=head)
+        return source, checkout, base, head
+
     def test_admission_comment_response_loss_is_idempotent_on_retry(self):
         self.gh.comment_loss = True
         with patch.object(runtime, "GitHub", return_value=self.gh):
@@ -574,6 +586,186 @@ class FaultWindowTests(unittest.TestCase):
         checks.assert_called_once()
         self.assertEqual(self.gh.open_calls, 2)  # Fixture PR, then recovered PR.
         self.assertFalse(checkout.exists())
+
+    def test_checked_unpushed_commit_recovers_without_worker_replay(self):
+        source, checkout, base, head = self._checked_unpushed()
+        actual_git = runtime.git
+        actual_checked = runtime.checked
+
+        def git(path, *args, **kwargs):
+            if args[:3] == ("ls-remote", "--heads", "origin"):
+                return (f"{self.gh.remote_head}\trefs/heads/{BRANCH}"
+                        if self.gh.remote_head else "")
+            if args and args[0] == "push":
+                self.assertIn(f"--force-with-lease=refs/heads/{BRANCH}:", args)
+                self.gh.remote_head = head
+                return ""
+            return actual_git(path, *args, **kwargs)
+
+        def checked(args, **kwargs):
+            if args[:3] == ["git", "ls-remote", "--heads"]:
+                return (f"{self.gh.remote_head}\trefs/heads/{BRANCH}"
+                        if self.gh.remote_head else "")
+            return actual_checked(args, **kwargs)
+
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "git", side_effect=git), patch.object(
+                runtime, "checked", side_effect=checked), patch.object(
+                runtime, "main_sha", return_value=base), patch.object(
+                runtime, "local_checks", return_value={
+                    "result": "passed", "image_id": IMAGE,
+                    "image_config_digest": CONFIG}) as checks, patch.object(
+                runtime, "_docker") as worker, patch.object(
+                runtime, "_github", return_value=self.gh), patch.object(
+                runtime, "_cleanup_containers"), patch.object(
+                runtime, "recover_stale_worktrees", return_value={
+                    "preserved": [], "removed": []}), patch.object(
+                runtime, "_correction", return_value=None), patch.object(
+                runtime, "_claim_new", return_value=None):
+            self.assertEqual(runtime.run_once(self.cfg), [])
+            with state.connect(self.cfg.state_dir) as conn:
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["pr"], row["head_sha"]),
+                                 ("awaiting_review", 10, head))
+                self.assertEqual(conn.execute(
+                    "SELECT count(*) FROM usage_events WHERE issue=1").fetchone()[0], 1)
+        checks.assert_called_once()
+        worker.assert_not_called()
+        self.assertFalse(checkout.exists())
+
+    def _assert_checked_unpushed_refused(self):
+        source = self.cfg.workspace / "source"
+        base = self.gh.base_sha
+        actual_git = runtime.git
+
+        def git(path, *args, **kwargs):
+            if args[:3] == ("ls-remote", "--heads", "origin"):
+                return ""
+            if args and args[0] == "push":
+                self.fail("unchecked work must not be pushed")
+            return actual_git(path, *args, **kwargs)
+
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "git", side_effect=git), patch.object(
+                runtime, "checked", return_value=""), patch.object(
+                runtime, "main_sha", return_value=base):
+            with state.connect(self.cfg.state_dir) as conn:
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                self.assertEqual(state.job(conn, 1)["status"], "blocked")
+        self.assertTrue((self.cfg.workspace / "jobs" / "issue-1").exists())
+        self.assertIsNone(self.gh.remote_head)
+
+    def test_local_commit_without_check_event_never_pushes(self):
+        self._checked_unpushed()
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("DELETE FROM events WHERE issue=1 AND kind='checks_passed'")
+        self._assert_checked_unpushed_refused()
+
+    def test_dirty_checked_local_commit_never_pushes(self):
+        _source, checkout, _base, _head = self._checked_unpushed()
+        (checkout / "untracked.txt").write_text("preserve\n", encoding="utf-8")
+        self._assert_checked_unpushed_refused()
+        self.assertEqual((checkout / "untracked.txt").read_text(encoding="utf-8"),
+                         "preserve\n")
+
+    def test_missing_started_checkout_never_replays_worker(self):
+        source, checkout, base, _head = self._checked_unpushed()
+        subprocess.check_call(["git", "-C", str(source), "worktree", "remove",
+                               str(checkout)], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        actual_checked = runtime.checked
+
+        def checked(args, **kwargs):
+            if args[:3] == ["git", "ls-remote", "--heads"]:
+                return ""
+            return actual_checked(args, **kwargs)
+
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "checked", side_effect=checked), patch.object(
+                runtime, "main_sha", return_value=base), patch.object(
+                runtime, "_docker") as worker:
+            with state.connect(self.cfg.state_dir) as conn:
+                with self.assertRaisesRegex(runtime.WorkflowError,
+                                            "started interrupted checkout is missing"):
+                    runtime._push_checked_interrupted_job(
+                        self.gh, self.cfg, conn, state.job(conn, 1),
+                        self.gh.issue(1), self.spec)
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                self.assertEqual(state.job(conn, 1)["status"], "blocked")
+        worker.assert_not_called()
+        self.assertIsNone(self.gh.remote_head)
+
+    def test_checked_recovery_rechecks_locally_before_opening_pr(self):
+        source, checkout, base, head = self._checked_unpushed()
+        actual_git = runtime.git
+        actual_checked = runtime.checked
+        initial_pr_calls = self.gh.open_calls
+
+        def git(path, *args, **kwargs):
+            if args[:3] == ("ls-remote", "--heads", "origin"):
+                return (f"{self.gh.remote_head}\trefs/heads/{BRANCH}"
+                        if self.gh.remote_head else "")
+            if args and args[0] == "push":
+                self.gh.remote_head = head
+                return ""
+            return actual_git(path, *args, **kwargs)
+
+        def checked(args, **kwargs):
+            if args[:3] == ["git", "ls-remote", "--heads"]:
+                return (f"{self.gh.remote_head}\trefs/heads/{BRANCH}"
+                        if self.gh.remote_head else "")
+            return actual_checked(args, **kwargs)
+
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "git", side_effect=git), patch.object(
+                runtime, "checked", side_effect=checked), patch.object(
+                runtime, "main_sha", return_value=base), patch.object(
+                runtime, "local_checks", side_effect=runtime.WorkflowError(
+                    "local check failed")) as checks:
+            with state.connect(self.cfg.state_dir) as conn:
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                self.assertEqual(state.job(conn, 1)["status"], "blocked")
+        self.assertEqual(self.gh.remote_head, head)
+        checks.assert_called_once()
+        self.assertEqual(self.gh.open_calls, initial_pr_calls)
+        self.assertTrue(checkout.exists())
+
+    def test_branch_created_during_absent_ref_push_is_not_overwritten(self):
+        source, _checkout, base, _head = self._checked_unpushed()
+        remote = Path(self.temp.name) / "remote.git"
+        subprocess.check_call(["git", "init", "--bare", str(remote)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(["git", "-C", str(source), "remote", "add", "origin",
+                               str(remote)], stdout=subprocess.DEVNULL)
+        subprocess.check_call(["git", "-C", str(source), "push", "origin",
+                               f"{base}:refs/heads/main"], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        actual_git = runtime.git
+        raced = False
+
+        def git(path, *args, **kwargs):
+            nonlocal raced
+            if args[:3] == ("ls-remote", "--heads", "origin") and not raced:
+                subprocess.check_call(["git", "-C", str(source), "push", "origin",
+                                       f"{base}:refs/heads/{BRANCH}"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                raced = True
+                return ""  # The earlier read saw an absent ref.
+            return actual_git(path, *args, **kwargs)
+
+        with patch.object(runtime, "mirror", return_value=source), patch.object(
+                runtime, "git", side_effect=git), patch.object(
+                runtime, "main_sha", return_value=base):
+            with state.connect(self.cfg.state_dir) as conn:
+                row = state.job(conn, 1)
+                with self.assertRaises(runtime.TransientFailure):
+                    runtime._push_checked_interrupted_job(
+                        self.gh, self.cfg, conn, row, self.gh.issue(1), self.spec)
+        actual_remote = subprocess.check_output(
+            ["git", "--git-dir", str(remote), "rev-parse", f"refs/heads/{BRANCH}"],
+            text=True).strip()
+        self.assertEqual(actual_remote, base)
+        self.assertEqual(self.gh.open_calls, 1)  # Fixture only; no new PR.
 
     def test_crash_leftover_dirty_checkout_blocks_and_preserves_files(self):
         source, checkout, _base, _head = self._published_leftover()
