@@ -20,7 +20,8 @@ The file contains a greeting.
 
 class BlockedReviewRequestTests(unittest.TestCase):
     def test_only_correction_identity_accepts_blocked_issue(self):
-        cfg = SimpleNamespace(maintainer="owner", base_branch="main")
+        cfg = SimpleNamespace(maintainer="owner", base_branch="main",
+                              complexity_profiles={})
         gh = Mock()
         gh.identity.return_value = "owner"
         gh.pr.return_value = {
