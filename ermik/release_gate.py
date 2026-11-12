@@ -28,6 +28,7 @@ DOCKERFILES = {"examples/Dockerfile.demo", "examples/Dockerfile.opencode"}
 SUPPORT_FILES = {
     ".github/workflows/release-host-verify.yml",
     "scripts/bootstrap-ubuntu.sh",
+    "scripts/installation_snapshot.py",
     "tests/fixtures/evidence/h1.v1.json",
     "tests/fixtures/evidence/h2.v1.json",
 }

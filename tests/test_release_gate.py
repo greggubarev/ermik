@@ -66,6 +66,7 @@ class ReleaseGateTests(unittest.TestCase):
             ".gitattributes": "*.py text eol=lf\n",
             ".github/workflows/release-host-verify.yml": "on: workflow_dispatch\n",
             "scripts/bootstrap-ubuntu.sh": "#!/bin/sh\n",
+            "scripts/installation_snapshot.py": "print('snapshot')\n",
             "tests/fixtures/evidence/h1.v1.json": "{}\n",
             "tests/fixtures/evidence/h2.v1.json": "{}\n",
         }
@@ -82,11 +83,19 @@ class ReleaseGateTests(unittest.TestCase):
         for name in (
             ".github/workflows/other.yml",
             "scripts/other.sh",
+            "scripts/other.py",
             "tests/fixtures/evidence/h3.v1.json",
             ".git/config",
         ):
             with self.subTest(name=name):
                 self.assertFalse(_allowed_path(name))
+
+    def test_snapshot_helper_does_not_allow_other_scripts_in_archive(self) -> None:
+        self.write("scripts/installation_snapshot.py", "print('snapshot')\n")
+        self.write("scripts/other.py", "print('unexpected')\n")
+        head = self.commit()
+        with self.assertRaisesRegex(ReleaseError, "unexpected release path"):
+            build_release(head, Path(self.temp.name) / "out", self.root)
 
     def test_accepts_documented_service_home_paths(self) -> None:
         self.write("docs/paths.md", "\n".join(
