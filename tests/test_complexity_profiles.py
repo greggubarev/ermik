@@ -401,6 +401,7 @@ class ComplexityProfileTests(unittest.TestCase):
     def test_blocked_prepublication_readmission_resumes_after_restart(self):
         cfg, hub = self.readmission_hub()
         hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
         source, base, _git = self.disposable_git(cfg)
         with state.connect(cfg.state_dir) as conn:
             conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
@@ -416,6 +417,7 @@ class ComplexityProfileTests(unittest.TestCase):
             row = state.job(conn, 1)
             self.assertEqual((row["status"], row["complexity"], row["route_key"]),
                              ("retry_wait", "medium", "route:go"))
+            self.assertEqual(row["last_request"], 22)
             from ermik.recovery import activate_claim, claim_due
             claim = claim_due(conn)[0]
             self.assertTrue(activate_claim(conn, claim))
@@ -424,6 +426,7 @@ class ComplexityProfileTests(unittest.TestCase):
     def test_changed_prepublication_branch_blocks_without_rebinding(self):
         cfg, hub = self.readmission_hub()
         hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
         source, base, git = self.disposable_git(cfg)
         with state.connect(cfg.state_dir) as conn:
             conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
@@ -449,6 +452,7 @@ class ComplexityProfileTests(unittest.TestCase):
     def test_started_prepublication_attempt_cannot_replay(self):
         cfg, hub = self.readmission_hub()
         hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
         with state.connect(cfg.state_dir) as conn:
             conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=?,attempts_count=1 "
                          "WHERE issue=1", ("work/issue-1-delivery",))
@@ -466,6 +470,7 @@ class ComplexityProfileTests(unittest.TestCase):
     def test_unacknowledged_remote_branch_keeps_policy_bound(self):
         cfg, hub = self.readmission_hub()
         hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
         source, base, git = self.disposable_git(cfg)
         with state.connect(cfg.state_dir) as conn:
             conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
@@ -481,3 +486,29 @@ class ComplexityProfileTests(unittest.TestCase):
             row = state.job(conn, 1)
             self.assertEqual((row["status"], row["complexity"]), ("blocked", "easy"))
             self.assertIn("remote branch or push is uncertain", row["error"])
+
+    def test_historical_approval_cannot_readmit_blocked_job(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        hub.route = "route:auto"
+        hub.names.discard("route:go")
+        hub.names.add("route:auto")
+        hub.names.discard("complexity:medium")
+        hub.names.add("complexity:easy")
+        old_marker = runtime._admission_marker(1, SPEC, cfg, hub.issue(1))
+        hub.notes.insert(0, {"id": 10, "body": old_marker,
+                             "user": {"login": "owner"}})
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=?,route_key=?,"
+                         "complexity=?,profile_sha=? WHERE issue=1",
+                         ("work/issue-1-delivery", "route:go", "medium",
+                          runtime._profile_sha(cfg, "medium", "route:go")))
+        with patch.object(runtime, "mirror") as mirror:
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+            mirror.assert_not_called()
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"], row["last_request"]),
+                             ("blocked", "medium", 0))
+            self.assertIn("fresh blocked-job approval is missing", row["error"])

@@ -888,7 +888,13 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
                          "allowed_json=excluded.allowed_json",
                          (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
             state.event(conn, number, "admitted")
-    if blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
+    if prepublication:
+        # A historical matching admission is not a fresh decision to resume a
+        # blocked job. Keep a distinct, one-use marker in this approval comment.
+        gh.comment(number, marker + "\n" +
+                   marker.replace("SEMI_ADMIT", "SEMI_READMIT", 1) +
+                   "\n\nApproved to retry the blocked pre-publication job.")
+    elif blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
         gh.comment(number, marker +
                    "\n\nApproved for the scoped worker queue.")
     if not already_ready and not blocked_readmission:
@@ -1361,6 +1367,17 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
             if (row["complexity"], row["route_key"], row["profile_sha"]) == (
                     tier, route, digest):
                 continue
+            marker = _admission_marker(row["issue"], spec, cfg, issue)
+            readmit_marker = marker.replace("SEMI_ADMIT", "SEMI_READMIT", 1)
+            readmit_ids = [note.get("id") for note in gh.comments(row["issue"])
+                           if note.get("user", {}).get("login") == cfg.maintainer
+                           and (note.get("body") or "").splitlines()[:2]
+                           == [marker, readmit_marker]
+                           and type(note.get("id")) is int
+                           and note["id"] > row["last_request"]]
+            if not readmit_ids:
+                raise WorkflowError("fresh blocked-job approval is missing; run admit again")
+            readmit_id = max(readmit_ids)
             admission = state.admission(conn, row["issue"])
             if (admission is None or row["branch"] != f"work/issue-{row['issue']}-delivery"
                     or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
@@ -1400,6 +1417,12 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
                     or _route_key(fresh) != route or _complexity_key(fresh) != tier_key
                     or gh.find_branch_pr(row["branch"]) is not None):
                 raise WorkflowError("re-admission approval changed during reconciliation")
+            if not any(note.get("id") == readmit_id
+                       and note.get("user", {}).get("login") == cfg.maintainer
+                       and (note.get("body") or "").splitlines()[:2]
+                       == [marker, readmit_marker]
+                       for note in gh.comments(row["issue"])):
+                raise WorkflowError("fresh blocked-job approval changed during reconciliation")
             remote = (_publish_git(cfg, source, "ls-remote", "--heads", row["branch"], timeout=60)
                       if cfg.publish_repo else
                       git(source, "ls-remote", "--heads", "origin", row["branch"], timeout=60))
@@ -1417,6 +1440,8 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
                          "profile_sha=?,error=NULL,reason_code=NULL,updated_at=CURRENT_TIMESTAMP "
                          "WHERE issue=? AND status='blocked' AND pr IS NULL",
                          (route, tier, digest, row["issue"]))
+            conn.execute("UPDATE jobs SET last_request=? WHERE issue=?",
+                         (readmit_id, row["issue"]))
             state.event(conn, row["issue"], "readmitted", complexity=tier)
         except (GitHubError, TransientFailure):
             continue
