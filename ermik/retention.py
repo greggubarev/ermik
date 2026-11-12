@@ -50,6 +50,13 @@ def _safe(path: Path, *, directory: bool) -> os.stat_result:
     if os.name == "posix":
         if info.st_uid != os.geteuid() or info.st_mode & 0o022:
             raise ValueError("unsafe artifact ownership or permissions")
+    elif os.name == "nt":
+        from .windows_ownership import owned_for_cleanup
+        if (info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                or not owned_for_cleanup(str(path))):
+            raise ValueError("unsafe artifact ownership or permissions")
+    else:
+        raise ValueError("artifact ownership cannot be established")
     return info
 
 
