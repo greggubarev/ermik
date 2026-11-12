@@ -56,6 +56,7 @@ class FakeGitHub:
         self.reported_count = None
         self.short_page = False
         self.grow_after_pages = False
+        self.change_timestamp_after_pages = False
 
     def api(self, endpoint, *, timeout=90):
         self.requests.append(endpoint)
@@ -64,7 +65,11 @@ class FakeGitHub:
             if self.grow_after_pages and any("comments?" in request
                                              for request in self.requests):
                 count += 1
-            return {"comments": count}
+            changed = (self.change_timestamp_after_pages
+                       and any("comments?" in request for request in self.requests))
+            return {"comments": count,
+                    "updated_at": "2026-01-02T00:00:00Z" if changed
+                    else "2026-01-01T00:00:00Z"}
         if endpoint.startswith("issues/12/comments?per_page=100&page="):
             page = int(endpoint.rsplit("=", 1)[1])
             batch = self.rows[(page - 1) * 100:page * 100]
@@ -256,9 +261,23 @@ class EvidenceTransportTests(unittest.TestCase):
         with self.assertRaises(GitHubError):
             fetch_manifest(self.cfg, 12)
         self.gh.short_page = False
+        self.gh.requests.clear()
         self.gh.grow_after_pages = True
         with self.assertRaises(GitHubError):
             fetch_manifest(self.cfg, 12)
+        self.gh.grow_after_pages = False
+        self.gh.requests.clear()
+        self.gh.change_timestamp_after_pages = True
+        with self.assertRaises(GitHubError):
+            fetch_manifest(self.cfg, 12)
+
+    def test_scan_wide_deadline_refuses_before_next_page(self):
+        self.gh.rows = [{"id": 1, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}]
+        with patch("ermik.evidence_transport._clock", side_effect=[0, 0, 0, 61]):
+            with self.assertRaisesRegex(GitHubError, "lookup timed out"):
+                fetch_manifest(self.cfg, 12)
+        self.assertEqual(self.gh.requests, ["issues/12"])
 
     def test_full_bounded_timeline_refuses_new_publication(self):
         self.gh.rows = [{"id": n, "body": "ordinary",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from .config import Config
 from .evidence import (MAX_BYTES, UnsupportedManifestVersion, dumps_manifest,
@@ -18,6 +19,8 @@ _MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER,
 _SUFFIX = "```"
 MAX_COMMENTS = 2000
 LOOKUP_TIMEOUT = 10
+LOOKUP_BUDGET = 60
+_clock = time.monotonic
 
 
 class EvidenceRecordError(GitHubError):
@@ -61,16 +64,29 @@ def _record(body: str) -> dict:
 
 
 def _comments(gh: GitHub, pr_number: int) -> list[dict]:
-    before = gh.api(f"issues/{pr_number}", timeout=LOOKUP_TIMEOUT)
+    deadline = _clock() + LOOKUP_BUDGET
+
+    def read(endpoint: str):
+        remaining = deadline - _clock()
+        if remaining <= 2:
+            raise GitHubError("evidence comment lookup timed out")
+        # GitHub.command can make three read attempts with two short backoffs.
+        value = gh.api(endpoint, timeout=min(LOOKUP_TIMEOUT, (remaining - 2) / 3))
+        if _clock() >= deadline:
+            raise GitHubError("evidence comment lookup timed out")
+        return value
+
+    before = read(f"issues/{pr_number}")
     count = before.get("comments") if isinstance(before, dict) else None
-    if type(count) is not int or count < 0:
+    updated = before.get("updated_at") if isinstance(before, dict) else None
+    if (type(count) is not int or count < 0 or not isinstance(updated, str)
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", updated)):
         raise GitHubError("evidence comment count is invalid")
     if count > MAX_COMMENTS:
         raise GitHubError("evidence comment listing exceeds limit")
     rows: list[dict] = []
     for page in range(1, (count + 99) // 100 + 1):
-        batch = gh.api(f"issues/{pr_number}/comments?per_page=100&page={page}",
-                       timeout=LOOKUP_TIMEOUT)
+        batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
         if not isinstance(batch, list):
             raise GitHubError("evidence comment listing is invalid")
         expected = min(100, count - len(rows))
@@ -84,9 +100,9 @@ def _comments(gh: GitHub, pr_number: int) -> list[dict]:
         if any(left["id"] >= right["id"] for left, right in zip(batch, batch[1:])):
             raise GitHubError("evidence comment pagination is incomplete")
         rows.extend(batch)
-    after = gh.api(f"issues/{pr_number}", timeout=LOOKUP_TIMEOUT)
+    after = read(f"issues/{pr_number}")
     if (not isinstance(after, dict) or type(after.get("comments")) is not int
-            or after["comments"] != count):
+            or after["comments"] != count or after.get("updated_at") != updated):
         raise GitHubError("evidence comment pagination changed")
     return rows
 
