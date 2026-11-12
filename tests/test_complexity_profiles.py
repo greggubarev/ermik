@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -451,6 +452,117 @@ class ComplexityProfileTests(unittest.TestCase):
             self.assertEqual((row["status"], row["complexity"], row["route_key"]),
                              ("blocked", "easy", "route:auto"))
             self.assertIn("local branch changed", row["error"])
+
+    def test_ref_moves_after_label_restores_block_and_allows_fresh_admit(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
+        source, base, git = self.disposable_git(cfg)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
+                         ("work/issue-1-delivery",))
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        original_label = hub.label
+
+        def move_ref(number, *, add, remove):
+            original_label(number, add=add, remove=remove)
+            if add == "state:in-progress":
+                git("push", "origin", "main:refs/heads/work/issue-1-delivery")
+
+        hub.label = move_ref
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"], row["attempts_count"],
+                              row["pr"], row["last_request"]),
+                             ("blocked", "easy", 0, None, 22))
+            self.assertIn("ref changed", row["error"])
+        self.assertIn("state:blocked", hub.names)
+        self.assertNotIn("state:in-progress", hub.names)
+        git("push", "origin", "--delete", "work/issue-1-delivery")
+        hub.label = original_label
+        hub.approval_id = 23
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["last_request"]), ("retry_wait", 23))
+
+    def test_ambiguous_label_response_allows_fresh_admit(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
+        source, base, _git = self.disposable_git(cfg)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
+                         ("work/issue-1-delivery",))
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        original_label = hub.label
+
+        def uncertain_label(number, *, add, remove):
+            if add == "state:in-progress":
+                original_label(number, add=add, remove=remove)
+            raise runtime.GitHubError("label response lost")
+
+        hub.label = uncertain_label
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["attempts_count"], row["pr"],
+                              row["last_request"]), ("blocked", 0, None, 22))
+            self.assertIn("label write was unconfirmed", row["error"])
+        self.assertIn("state:in-progress", hub.names)
+        hub.label = original_label
+        hub.approval_id = 23
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            self.assertEqual((state.job(conn, 1)["status"],
+                              state.job(conn, 1)["last_request"]),
+                             ("retry_wait", 23))
+
+    def test_state_write_failure_restores_label_and_rolls_back(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        hub.approval_id = 22
+        source, base, _git = self.disposable_git(cfg)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
+                         ("work/issue-1-delivery",))
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base), \
+                patch.object(state, "event", side_effect=sqlite3.OperationalError("write failed")):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"], row["attempts_count"],
+                              row["pr"], row["last_request"]),
+                             ("blocked", "easy", 0, None, 22))
+            self.assertIsNone(conn.execute("SELECT 1 FROM retry_state WHERE issue=1").fetchone())
+            self.assertIn("state write failed", row["error"])
+        self.assertIn("state:blocked", hub.names)
+        hub.approval_id = 23
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
 
     def test_started_prepublication_attempt_cannot_replay(self):
         cfg, hub = self.readmission_hub()

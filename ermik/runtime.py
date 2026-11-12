@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import socket
 import stat
 import subprocess
@@ -796,9 +797,20 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
         raise WorkflowError("only the configured maintainer can admit an issue")
     issue = gh.issue(number)
     names = labels(issue)
-    blocked_readmission = bool(cfg.complexity_profiles and "state:blocked" in names)
-    if blocked_readmission and ({"state:proposed", "state:ready",
-                                 "state:in-progress"} & names):
+    uncertain_prepublication = bool(
+        cfg.complexity_profiles and "state:in-progress" in names
+        and "state:blocked" not in names
+        and gh.find_branch_pr(f"work/issue-{number}-delivery") is None
+        and any(comment.get("user", {}).get("login") == cfg.maintainer
+                and len((comment.get("body") or "").splitlines()) > 1
+                and (comment.get("body") or "").splitlines()[1].startswith(
+                    f"ERMIK_READMIT issue={number} ")
+                for comment in gh.comments(number)))
+    blocked_readmission = bool(cfg.complexity_profiles and
+                               ("state:blocked" in names or uncertain_prepublication))
+    if blocked_readmission and ({"state:proposed", "state:ready"} & names
+                                or "state:blocked" in names
+                                and "state:in-progress" in names):
         raise WorkflowError("blocked issue has conflicting state labels")
     if ("queue:worker" not in names or
             not ({"state:proposed", "state:ready"} & names) and not blocked_readmission):
@@ -1342,6 +1354,22 @@ def _verify_leftover_checkout(cfg: Config, row, remote_head: str) -> Path | None
     return checkout
 
 
+def _restore_blocked_prepublication_label(gh: GitHub, issue: int) -> bool:
+    """Compensate a possibly applied label write without overriding other states."""
+    try:
+        current = labels(gh.issue(issue))
+        if "state:blocked" in current and "state:in-progress" not in current:
+            return True
+        if not {"queue:worker", "state:in-progress"}.issubset(current) or (
+                {"state:proposed", "state:ready", "state:blocked"} & current):
+            return False
+        gh.label(issue, add="state:blocked", remove="state:in-progress")
+        observed = labels(gh.issue(issue))
+        return "state:blocked" in observed and "state:in-progress" not in observed
+    except GitHubError:
+        return False
+
+
 def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -> None:
     """Resume only a blocked job for which execution provably never began."""
     if not cfg.complexity_profiles:
@@ -1349,6 +1377,8 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
     for row in state.jobs(conn):
         if row["status"] != "blocked" or row["pr"] is not None:
             continue
+        label_attempted = False
+        readmit_id = None
         try:
             issue = gh.issue(row["issue"])
             spec = parse_issue(issue.get("body") or "")
@@ -1409,6 +1439,7 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
             if main_sha(gh, cfg) != row["base_sha"]:
                 raise WorkflowError("re-admission base changed; inspect before retry")
             if "state:blocked" in names:
+                label_attempted = True
                 gh.label(row["issue"], add="state:in-progress", remove="state:blocked")
             fresh = gh.issue(row["issue"])
             if (parse_issue(fresh.get("body") or "").body_sha256 != spec.body_sha256
@@ -1428,26 +1459,51 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
                       git(source, "ls-remote", "--heads", "origin", row["branch"], timeout=60))
             if remote or main_sha(gh, cfg) != row["base_sha"]:
                 raise WorkflowError("re-admission ref changed during reconciliation")
-            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
-                         "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha,"
-                         "allowed_json=excluded.allowed_json",
-                         (row["issue"], spec.body_sha256, json.dumps(spec.allowed_paths)))
-            conn.execute("DELETE FROM retry_state WHERE issue=?", (row["issue"],))
-            conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
-                         "next_retry_at,failure_id) VALUES(?,1,'interrupted','running',?,?)",
-                         (row["issue"], int(time.time()), f"readmitted-{row['issue']}"))
-            conn.execute("UPDATE jobs SET status='retry_wait',route_key=?,complexity=?,"
-                         "profile_sha=?,error=NULL,reason_code=NULL,updated_at=CURRENT_TIMESTAMP "
-                         "WHERE issue=? AND status='blocked' AND pr IS NULL",
-                         (route, tier, digest, row["issue"]))
-            conn.execute("UPDATE jobs SET last_request=? WHERE issue=?",
-                         (readmit_id, row["issue"]))
-            state.event(conn, row["issue"], "readmitted", complexity=tier)
+            conn.execute("SAVEPOINT prepublication_readmit")
+            try:
+                conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
+                             "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha,"
+                             "allowed_json=excluded.allowed_json",
+                             (row["issue"], spec.body_sha256, json.dumps(spec.allowed_paths)))
+                conn.execute("DELETE FROM retry_state WHERE issue=?", (row["issue"],))
+                conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
+                             "next_retry_at,failure_id) VALUES(?,1,'interrupted','running',?,?)",
+                             (row["issue"], int(time.time()), f"readmitted-{row['issue']}"))
+                conn.execute("UPDATE jobs SET status='retry_wait',route_key=?,complexity=?,"
+                             "profile_sha=?,error=NULL,reason_code=NULL,updated_at=CURRENT_TIMESTAMP "
+                             "WHERE issue=? AND status='blocked' AND pr IS NULL",
+                             (route, tier, digest, row["issue"]))
+                conn.execute("UPDATE jobs SET last_request=? WHERE issue=?",
+                             (readmit_id, row["issue"]))
+                state.event(conn, row["issue"], "readmitted", complexity=tier)
+                conn.execute("RELEASE prepublication_readmit")
+            except BaseException:
+                conn.execute("ROLLBACK TO prepublication_readmit")
+                conn.execute("RELEASE prepublication_readmit")
+                raise
         except (GitHubError, TransientFailure):
+            if label_attempted:
+                restored = _restore_blocked_prepublication_label(gh, row["issue"])
+                if readmit_id is not None:
+                    conn.execute("UPDATE jobs SET last_request=? WHERE issue=? AND status='blocked'",
+                                 (readmit_id, row["issue"]))
+                conn.execute("UPDATE jobs SET error=? WHERE issue=? AND status='blocked'",
+                             ("re-admission label write was unconfirmed; "
+                              + ("run admit again" if restored else
+                                 "inspect Issue labels, then run admit again"),
+                              row["issue"]))
             continue
-        except (WorkflowError, ValueError, TypeError, KeyError, OSError) as exc:
+        except (WorkflowError, ValueError, TypeError, KeyError, OSError,
+                sqlite3.Error) as exc:
+            restored = (not label_attempted or
+                        _restore_blocked_prepublication_label(gh, row["issue"]))
+            if label_attempted and readmit_id is not None:
+                conn.execute("UPDATE jobs SET last_request=? WHERE issue=? AND status='blocked'",
+                             (readmit_id, row["issue"]))
             conn.execute("UPDATE jobs SET error=? WHERE issue=? AND status='blocked'",
-                         (str(exc), row["issue"]))
+                         (("re-admission state write failed" if isinstance(exc, sqlite3.Error)
+                           else str(exc)) + ("; inspect Issue labels, then run admit again"
+                                             if not restored else ""), row["issue"]))
 
 
 def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
