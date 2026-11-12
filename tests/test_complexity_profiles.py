@@ -109,6 +109,7 @@ class ReadmitHub:
     def pr(self, number):
         self.pr_reads += 1
         return {"number": 2, "state": "OPEN", "isDraft": True,
+                "createdAt": "2026-01-01T00:00:00Z",
                 "headRefOid": ("c" if self.advance_head and self.pr_reads > 1
                                else "b") * 40, "body": "Closes #1"}
 
@@ -120,6 +121,7 @@ class ReadmitHub:
 
     def comment(self, number, body):
         self.notes.append({"id": self.approval_id, "body": body,
+                           "created_at": "2026-01-02T00:00:00Z",
                            "user": {"login": "owner"}})
 
 
@@ -282,6 +284,27 @@ class ComplexityProfileTests(unittest.TestCase):
                 row = state.job(conn, 1)
                 self.assertEqual((row["status"], row["complexity"], row["route_key"]),
                                  ("blocked", "easy", "route:auto"))
+
+    def test_restored_route_cannot_replay_pre_pr_approval(self):
+        cfg, hub = self.readmission_hub()
+        hub.names.discard("route:go")
+        hub.names.discard("complexity:medium")
+        hub.names.update(("route:auto", "complexity:easy"))
+        hub.notes = [{"id": 10, "body": runtime._admission_marker(
+            1, SPEC, cfg, hub.issue(1)), "created_at": "2025-12-31T00:00:00Z",
+            "user": {"login": "owner"}}]
+        with patch.object(runtime, "_require_pr"):
+            with state.connect(cfg.state_dir) as conn:
+                self.assertIsNone(runtime._correction(hub, cfg, conn))
+                self.assertEqual(state.job(conn, 1)["status"], "blocked")
+        with patch.object(runtime, "GitHub", return_value=hub), patch.object(
+                runtime, "_require_pr"):
+            runtime.admit(cfg, 1, "easy")
+        self.assertEqual(len(hub.notes), 2)
+        with patch.object(runtime, "_require_pr"):
+            with state.connect(cfg.state_dir) as conn:
+                conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+                self.assertIsNotNone(runtime._correction(hub, cfg, conn))
 
     def test_changed_scope_cannot_readmit_existing_pr(self):
         cfg, hub = self.readmission_hub()

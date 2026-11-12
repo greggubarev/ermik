@@ -880,7 +880,7 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
                          "allowed_json=excluded.allowed_json",
                          (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
             state.event(conn, number, "admitted")
-    if not _approved_on_github(gh, cfg, number, spec):
+    if blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
         gh.comment(number, marker +
                    "\n\nApproved for the scoped worker queue.")
     if not already_ready and not blocked_readmission:
@@ -955,7 +955,8 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
         expected_state = "state:blocked" if row["status"] == "blocked" else "state:in-progress"
         needs_readmission = (spec is not None and
                              (approved is None or approved["body_sha"] != spec.body_sha256
-                              or not _job_complexity_matches(cfg, issue, row)))
+                              or not _job_complexity_matches(cfg, issue, row)
+                              or cfg.complexity_profiles and row["status"] == "blocked"))
         if (spec is None or
                 tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
                 or (approved is not None and
@@ -1002,11 +1003,17 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 break
             if needs_readmission:
                 marker = _admission_marker(row["issue"], spec, cfg, issue)
+                created = pr.get("createdAt")
                 approval_ids = [
                     item.get("id") for item in gh.comments(row["issue"])
                     if (item.get("body") or "").splitlines()[0:1] == [marker]
                     and item.get("user", {}).get("login") == cfg.maintainer
-                    and type(item.get("id")) is int]
+                    and type(item.get("id")) is int
+                    and type(created) is str and
+                    re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", created)
+                    and type(item.get("created_at")) is str
+                    and item["created_at"] > created
+                    and item["id"] > row["last_request"]]
                 if not approval_ids or comment["id"] <= max(approval_ids):
                     continue
                 key = _complexity_key(issue)
