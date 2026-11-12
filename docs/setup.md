@@ -295,6 +295,8 @@ If `main` advances and the accepted file contents need no changes, put `SEMI_REB
 
 Stop this unit before changing its checkout, image, config or secret file. Ensure no other controller or maintenance command is using the same `state_dir`. Preserve its state and workspace and reconcile any interrupted Issue, branch and PR with GitHub before retrying a write. The first database open by the updated controller migrates a preview or version 1 through 5 SQLite database in place to schema version 6. Back up the complete private state before that open. Record the old commit and image ID so a rollback targets exact versions:
 
+Prepare a separate checkout at the reviewed target commit and set `target_checkout` to its absolute path before stopping the service. Keep that checkout until the trial and any rollback finish. It supplies the snapshot helper while the installed checkout still runs the older preview.
+
 ```sh
 systemctl --user stop ermik.service
 cd "$HOME/ermik"
@@ -306,29 +308,12 @@ cp -a config.json "$backup_dir/config.json"
 cp -a "$HOME/.config/ermik/providers.env" "$backup_dir/providers.env"
 if test -f "$HOME/.config/ermik/publisher.env"; then cp -a "$HOME/.config/ermik/publisher.env" "$backup_dir/publisher.env"; fi
 cp -a "$HOME/.config/systemd/user/ermik.service" "$HOME/.config/systemd/user/ermik-preflight.service" "$backup_dir/"
-state_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["state_dir"])')"
-test -d "$state_dir" && test -f "$state_dir/state.sqlite3"
-python3 - "$state_dir/state.sqlite3" "$backup_dir/state.sqlite3" <<'PY'
-import sqlite3
-import sys
-from pathlib import Path
-
-source = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
-target = sqlite3.connect(sys.argv[2])
-try:
-    source.backup(target)
-    if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-        raise RuntimeError("SQLite backup integrity check failed")
-    print("backed up SQLite schema version", target.execute("PRAGMA user_version").fetchone()[0])
-finally:
-    target.close()
-    source.close()
-PY
-tar -C "$state_dir" --exclude='./state.sqlite3' --exclude='./state.sqlite3-wal' --exclude='./state.sqlite3-shm' -czf "$backup_dir/state-files.tar.gz" .
-chmod 0600 "$backup_dir"/*
+cp "$target_checkout/scripts/installation_snapshot.py" "$backup_dir/installation_snapshot.py"
+python3 "$backup_dir/installation_snapshot.py" backup --config config.json --snapshot "$backup_dir"
+find "$backup_dir" -maxdepth 1 -type f -exec chmod 0600 {} +
 ```
 
-The backup contains the commit SHA, image ID, config, a consistent SQLite copy, and the other state files. It uses `state_dir` from `config.json`; the database backup includes committed data from any SQLite journal. Keep the workspace in place for reconciliation instead of copying its cached clone and worktrees on every update. Use an immutable image tag or digest, and save the image separately only when it cannot be rebuilt or pulled from its pinned source. The controller records the resolved image ID in the job ledger before launching its first container. Retries, corrections, and recovery use that ID even if the configured tag moves; they stop if the old image is unavailable. Keep an image with the published config digest available on the maintainer host until each PR is finished; its local ID may differ. A new image applies to newly claimed jobs. Run `review` again after any image update. Jobs created by an earlier version without a saved image ID require inspection before resumption; do not infer an ID from a mutable tag. Check available disk space before a large state backup, and retain only backups still needed for rollback after verifying their exact paths. Keep backups outside the checkout and protect them as controller state. Update to a reviewed exact commit, install the matching unit copies if changed, rebuild or pull the pinned image, and run the systemd preflight above before restarting. A shell-level `doctor` is insufficient for this gate. Do not start polling while another controller uses the same state directory.
+The backup contains the commit SHA, image ID, config, a consistent SQLite copy, the other state files, and the complete workspace. Its manifest records file hashes and exact installation paths; the database backup includes committed data from any SQLite journal. Preserve this private backup and its helper outside the checkout. Use an immutable image tag or digest, and save the image separately only when it cannot be rebuilt or pulled from its pinned source. The controller records the resolved image ID in the job ledger before launching its first container. Retries, corrections, and recovery use that ID even if the configured tag moves; they stop if the old image is unavailable. Keep an image with the published config digest available on the maintainer host until each PR is finished; its local ID may differ. A new image applies to newly claimed jobs. Run `review` again after any image update. Jobs created by an earlier version without a saved image ID require inspection before resumption; do not infer an ID from a mutable tag. Check available disk space before a large state backup, and retain only backups still needed for rollback after verifying their exact paths. Keep backups outside the checkout and protect them as controller state. Update to a reviewed exact commit, install the matching unit copies if changed, rebuild or pull the pinned image, and run the systemd preflight above before restarting. A shell-level `doctor` is insufficient for this gate. Do not start polling while another controller uses the same state directory.
 
 The migration runs automatically when the updated controller opens the database; there is no separate migration command. It preserves admissions, jobs, retry state, events and usage records. Version 4 adds a frozen route cohort and records each worker attempt before execution; older attempts retain unknown phase and duration. Version 5 adds route-decision fields and optional lease reservations; older events and leases retain null or zero values. If the migration fails, leave the service stopped and inspect the error and backed-up database before retrying. An unknown newer schema version is rejected. After the systemd preflight, migrate the stopped installation locally and verify it before polling:
 
@@ -374,63 +359,22 @@ Reconcile remote state before running any command from the old checkout against 
 
 ```sh
 set -e
-state_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["state_dir"])')"
-post_upgrade_state="$backup_dir/post-upgrade-state"
-test -d "$state_dir" && test ! -e "$post_upgrade_state"
-test -f "$backup_dir/state.sqlite3" && test -f "$backup_dir/state-files.tar.gz"
-python3 - "$state_dir" "$post_upgrade_state" "$backup_dir/state-files.tar.gz" <<'PY'
-import json
-import hashlib
-import shutil
-import sys
-from pathlib import Path
-import tarfile
-
-root = Path(sys.argv[1]).resolve(strict=True)
-saved = Path(sys.argv[2]).resolve()
-if not root.is_dir() or saved == root or root in saved.parents or saved.exists():
-    raise RuntimeError("invalid post-upgrade state destination")
-config = json.loads(Path("config.json").read_text(encoding="utf-8"))
-namespace = hashlib.sha256(f"{config['repo']}\n{root}".encode("utf-8")).hexdigest()[:32]
-marker = root / "container-namespace"
-if marker.is_symlink() or (marker.exists() and marker.read_text(encoding="ascii").strip() != namespace):
-    raise RuntimeError("current container namespace marker differs")
-with tarfile.open(sys.argv[3], "r:gz") as archive:
-    for entry in archive:
-        if entry.name.removeprefix("./") == "container-namespace":
-            if not entry.isfile() or archive.extractfile(entry).read().decode("ascii").strip() != namespace:
-                raise RuntimeError("backed-up container namespace marker differs")
-saved.mkdir(mode=0o700)
-for entry in root.iterdir():
-    shutil.move(str(entry), str(saved / entry.name))
-PY
-tar -C "$state_dir" -xzf "$backup_dir/state-files.tar.gz"
-install -m 0600 "$backup_dir/state.sqlite3" "$state_dir/state.sqlite3"
-python3 - "$state_dir" <<'PY'
-import hashlib
-import json
-import os
+# Compare every affected Issue, branch, PR HEAD and local event with the snapshot first.
+# Stop if any identity differs or a remote write is uncertain.
+python3 - "$backup_dir/state.sqlite3" <<'PY'
 import sqlite3
 import sys
 from pathlib import Path
+from ermik.state import SCHEMA_VERSION
 
-root = Path(sys.argv[1]).resolve(strict=True)
-config = json.loads(Path("config.json").read_text(encoding="utf-8"))
-namespace = hashlib.sha256(f"{config['repo']}\n{root}".encode("utf-8")).hexdigest()[:32]
-marker = root / "container-namespace"
-if marker.is_symlink() or (marker.exists() and marker.read_text(encoding="ascii").strip() != namespace):
-    raise RuntimeError("restored container namespace marker differs")
-if not marker.exists():
-    marker.write_text(namespace + "\n", encoding="ascii")
-    os.chmod(marker, 0o600)
-with sqlite3.connect(root / "state.sqlite3") as db:
+with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as db:
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    integrity = db.execute("PRAGMA quick_check").fetchone()[0]
-    print("restored schema version", version)
-    print("integrity", integrity)
-    if version not in range(6) or integrity != "ok":
-        raise RuntimeError("restored pre-upgrade state failed validation")
+    if version > SCHEMA_VERSION:
+        raise RuntimeError("restored schema is newer than the selected controller")
+    print("snapshot schema version", version)
 PY
+python3 "$backup_dir/installation_snapshot.py" restore --config config.json --snapshot "$backup_dir"
+state_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["state_dir"])')"
 ```
 
-Expect the backed-up pre-upgrade schema version (`0` through `5`) and integrity `ok`. Inspect `docker ps --all --filter "label=ermik.namespace=$(cat "$state_dir/container-namespace")"` before polling. Startup cleanup removes only containers with that exact label; investigate an unexpected container or cleanup failure before retrying. Reconcile the restored ledger against GitHub once more, then run `systemctl --user start ermik-preflight.service`, inspect its journal, and start only this polling unit. For a rollback that does not require restoring the pre-upgrade snapshot, run that preflight after selecting the compatible state. Retain `$post_upgrade_state` until its remote writes and local records have been accounted for.
+Expect the backed-up schema version (`0` through `6`) and integrity `ok`; verify the selected old controller supports it before polling. The helper verifies the manifest, complete state and workspace copies, database integrity, schema, and container namespace before moving either live directory. A missing, changed, or newer-schema backup refuses without moving the original. It preserves post-upgrade state and workspace in sibling directories reported by the command. Remote identity reconciliation is a separate mandatory operator check before restore and again before polling. Inspect `docker ps --all --filter "label=ermik.namespace=$(cat "$state_dir/container-namespace")"` before polling. Startup cleanup removes only containers with that exact label; investigate an unexpected container or cleanup failure before retrying. Reconcile the restored ledger against GitHub once more, then run `systemctl --user start ermik-preflight.service`, inspect its journal, and start only this polling unit. For a rollback that does not require restoring the pre-upgrade snapshot, run that preflight after selecting the compatible state. Retain the preserved post-upgrade state and workspace until their remote writes and local records have been accounted for.
