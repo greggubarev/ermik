@@ -1354,6 +1354,70 @@ def _verify_leftover_checkout(cfg: Config, row, remote_head: str) -> Path | None
     return checkout
 
 
+def _push_checked_interrupted_job(gh: GitHub, cfg: Config, conn,
+                                  row, issue: dict, spec: IssueSpec) -> bool:
+    """Push one checked local commit after a crash, without running the worker again.
+
+    A checks_passed event is written only after the worker committed its result
+    and the configured local checks passed. The existing orphan-push recovery
+    re-runs those checks before creating a PR.
+    """
+    if (row["status"] != "running" or row["pr"] is not None
+            or row["head_sha"] is not None or row["attempts_count"] < 1):
+        return False
+    if (row["branch"] != f"work/issue-{row['issue']}-delivery"
+            or row["route_key"] != _route_key(issue)
+            or not row["image_id"]):
+        raise WorkflowError("started interrupted job identity requires inspection")
+    source = mirror(cfg)
+    head = git(source, "rev-parse", f"refs/heads/{row['branch']}")
+    if head == row["base_sha"]:
+        raise WorkflowError("started interrupted job has no checked commit")
+    checked = conn.execute(
+        "SELECT head_sha FROM events WHERE issue=? AND kind='checks_passed' "
+        "ORDER BY id DESC LIMIT 1", (row["issue"],)).fetchone()
+    attempt = conn.execute(
+        "SELECT result_code,finished_at FROM usage_events WHERE issue=? "
+        "ORDER BY rowid DESC LIMIT 1", (row["issue"],)).fetchone()
+    if (checked is None or checked["head_sha"] != head or attempt is None
+            or attempt["result_code"] != 0 or attempt["finished_at"] is None
+            or conn.execute("SELECT 1 FROM usage_events WHERE issue=? AND "
+                            "finished_at IS NULL LIMIT 1",
+                            (row["issue"],)).fetchone() is not None):
+        raise WorkflowError("started interrupted job lacks a complete check record")
+    if _verify_leftover_checkout(cfg, row, head) is None:
+        raise WorkflowError("started interrupted checkout is missing")
+    if (main_sha(gh, cfg) != row["base_sha"]
+            or gh.find_branch_pr(row["branch"]) is not None):
+        raise WorkflowError("checked interrupted job base or PR changed")
+    latest = gh.issue(row["issue"])
+    if (parse_issue(latest.get("body") or "").body_sha256 != spec.body_sha256
+            or not {"queue:worker", "state:in-progress"}.issubset(labels(latest))
+            or not _approved_on_github(gh, cfg, row["issue"], spec, latest)
+            or not _job_complexity_matches(cfg, latest, row)
+            or _route_key(latest) != row["route_key"]):
+        raise WorkflowError("checked interrupted job approval changed")
+    remote = (_publish_git(cfg, source, "ls-remote", "--heads",
+                           row["branch"], timeout=60) if cfg.publish_repo else
+              git(source, "ls-remote", "--heads", "origin",
+                  row["branch"], timeout=60))
+    if remote:
+        raise WorkflowError("checked interrupted job remote ref changed")
+    checkout = cfg.workspace / "jobs" / f"issue-{row['issue']}"
+    absent_ref_lease = f"--force-with-lease=refs/heads/{row['branch']}:"
+    if cfg.publish_repo:
+        gh.validate_publish_access()
+        _publish_git(cfg, checkout, "push", absent_ref_lease,
+                     f"HEAD:refs/heads/{row['branch']}", timeout=180)
+    else:
+        try:
+            git(checkout, "push", absent_ref_lease, "origin",
+                f"HEAD:refs/heads/{row['branch']}", timeout=180)
+        except WorkflowError as exc:
+            raise TransientFailure("checked interrupted push outcome is unconfirmed") from exc
+    return True
+
+
 def _restore_blocked_prepublication_label(gh: GitHub, issue: int) -> bool:
     """Compensate a possibly applied label write without overriding other states."""
     try:
@@ -1660,6 +1724,16 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                           checked(["git", "ls-remote", "--heads",
                                    f"https://github.com/{cfg.repo}.git", row["branch"]],
                                   timeout=60))
+                if not remote and _push_checked_interrupted_job(
+                        gh, cfg, conn, row, issue, spec):
+                    source = mirror(cfg)
+                    remote = (_publish_git(cfg, source, "ls-remote", "--heads",
+                                           row["branch"], timeout=60)
+                              if cfg.publish_repo else
+                              git(source, "ls-remote", "--heads", "origin",
+                                  row["branch"], timeout=60))
+                    if not remote:
+                        raise TransientFailure("checked interrupted push is not visible")
                 if remote:
                     match = re.fullmatch(
                         r"([0-9a-f]{40})\s+refs/heads/" + re.escape(row["branch"]),
