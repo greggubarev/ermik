@@ -1575,6 +1575,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
     for row in state.jobs(conn):
         if row["status"] not in ("running", "correcting", "retry_wait"):
             continue
+        pr_read_pending = False
         try:
             issue = gh.issue(row["issue"])
             spec = parse_issue(issue.get("body") or "")
@@ -1588,7 +1589,9 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 raise WorkflowError("interrupted job identity changed")
             pr_number = gh.find_branch_pr(row["branch"])
             if pr_number is not None:
+                pr_read_pending = True
                 pr = gh.pr(pr_number)
+                pr_read_pending = False
                 if row["pr"] is None and cfg.draft_pr_socket is None:
                     _require_initial_draft(
                         gh, pr, cfg, issue=row["issue"], branch=row["branch"],
@@ -1779,7 +1782,33 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                         "retry_scheduled" if decision.status == "retry_wait" else "blocked")
             continue
         except (GitHubError, TransientFailure):
-            # A transport failure says nothing about remote state. Try again next poll.
+            # A found PR with an unreadable identity cannot be treated as an
+            # ordinary retry once the broker intent is durable.
+            if (pr_read_pending and row["pr"] is None
+                    and cfg.draft_pr_socket is not None
+                    and row["attempts_count"] > 0):
+                last_check = conn.execute(
+                    "SELECT head_sha FROM events WHERE issue=? AND kind='checks_passed' "
+                    "ORDER BY id DESC LIMIT 1", (row["issue"],)).fetchone()
+                if last_check is not None and re.fullmatch(
+                        r"[0-9a-f]{40}", last_check["head_sha"] or ""):
+                    root = cfg.draft_pr_evidence_dir or cfg.state_dir / "evidence"
+                    intent = root / str(row["issue"]) / f"{last_check['head_sha']}.json"
+                    if intent.exists() or intent.is_symlink():
+                        conn.execute(
+                            "DELETE FROM retry_state WHERE issue=?", (row["issue"],))
+                        conn.execute(
+                            "UPDATE jobs SET status='blocked',error='Remote PR unreadable; "
+                            "inspect publication',reason_code='publication_unconfirmed',"
+                            "updated_at=CURRENT_TIMESTAMP WHERE issue=?", (row["issue"],))
+                        state.event(conn, row["issue"], "blocked")
+                        try:
+                            gh.label(row["issue"], add="state:blocked",
+                                     remove="state:in-progress")
+                        except GitHubError:
+                            pass
+                        continue
+            # Earlier reads and later broker calls retain their retry behavior.
             continue
         except (WorkflowError, ValueError, TypeError, KeyError,
                 json.JSONDecodeError, OSError):
