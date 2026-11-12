@@ -85,6 +85,13 @@ def _comments(gh: GitHub, pr_number: int) -> list[dict]:
     if count > MAX_COMMENTS:
         raise GitHubError("evidence comment listing exceeds limit")
     rows: list[dict] = []
+    fingerprints: list[tuple] = []
+
+    def fingerprint(row: dict) -> tuple:
+        user = row.get("user")
+        author_id = user.get("id") if isinstance(user, dict) else None
+        return row["id"], row.get("body"), author_id, row.get("updated_at")
+
     for page in range(1, (count + 99) // 100 + 1):
         batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
         if not isinstance(batch, list):
@@ -99,7 +106,18 @@ def _comments(gh: GitHub, pr_number: int) -> list[dict]:
             raise GitHubError("evidence comment pagination is incomplete")
         if any(left["id"] >= right["id"] for left, right in zip(batch, batch[1:])):
             raise GitHubError("evidence comment pagination is incomplete")
+        fingerprints.extend(fingerprint(item) for item in batch)
         rows.extend(batch)
+    if count > 100:
+        for page in range(1, (count + 99) // 100 + 1):
+            batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
+            expected = fingerprints[(page - 1) * 100:page * 100]
+            if (not isinstance(batch, list) or len(batch) != len(expected)
+                    or any(not isinstance(item, dict)
+                           or type(item.get("id")) is not int
+                           or fingerprint(item) != saved
+                           for item, saved in zip(batch, expected))):
+                raise GitHubError("evidence comment pagination changed")
     after = read(f"issues/{pr_number}")
     if (not isinstance(after, dict) or type(after.get("comments")) is not int
             or after["comments"] != count or after.get("updated_at") != updated):

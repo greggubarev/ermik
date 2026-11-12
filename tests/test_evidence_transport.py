@@ -57,6 +57,8 @@ class FakeGitHub:
         self.short_page = False
         self.grow_after_pages = False
         self.change_timestamp_after_pages = False
+        self.same_count_shift = False
+        self.page2_reads = 0
 
     def api(self, endpoint, *, timeout=90):
         self.requests.append(endpoint)
@@ -72,6 +74,12 @@ class FakeGitHub:
                     else "2026-01-01T00:00:00Z"}
         if endpoint.startswith("issues/12/comments?per_page=100&page="):
             page = int(endpoint.rsplit("=", 1)[1])
+            if page == 2:
+                self.page2_reads += 1
+                if self.same_count_shift and self.page2_reads == 1:
+                    self.rows = [row for row in self.rows if row["id"] != 50]
+                    self.rows.append({"id": 102, "body": "ordinary",
+                                      "user": {"login": "other", "id": 99}})
             batch = self.rows[(page - 1) * 100:page * 100]
             return batch[:-1] if self.short_page and page == 1 else batch
         raise AssertionError(endpoint)
@@ -121,8 +129,10 @@ class EvidenceTransportTests(unittest.TestCase):
         self.assertEqual(len(self.gh.rows), 1)
         self.assertNotIn("provider/model", self.gh.rows[0]["body"])
         self.assertIsNone(_record(self.gh.rows[0]["body"])["model"])
+        self.gh.requests.clear()
         result, record = fetch_manifest(self.cfg, 12)
         self.assertEqual(result["status"], "current")
+        self.assertEqual(len(self.gh.requests), 3)
         self.assertEqual(record["sha256"], first["sha256"])
         self.assertTrue(self.gh.rows[0]["body"].startswith(MARKER))
         self.assertEqual(record["image_config_digest"], CONFIG_DIGEST)
@@ -218,7 +228,7 @@ class EvidenceTransportTests(unittest.TestCase):
         result, record = fetch_manifest(self.cfg, 12)
         self.assertEqual(result["status"], "current")
         self.assertEqual(record["sha256"], published["sha256"])
-        self.assertEqual(len(self.gh.requests), 13)
+        self.assertEqual(len(self.gh.requests), 24)
 
     def test_correction_h2_after_old_h1_with_long_timeline(self):
         publish_manifest(self.cfg, 12)
@@ -278,6 +288,39 @@ class EvidenceTransportTests(unittest.TestCase):
             with self.assertRaisesRegex(GitHubError, "lookup timed out"):
                 fetch_manifest(self.cfg, 12)
         self.assertEqual(self.gh.requests, ["issues/12"])
+
+    def test_same_count_shift_cannot_hide_conflicting_record(self):
+        record = manifest(model=None)
+        conflicting = {key: value for key, value in record.items()
+                       if key not in ("version", "sha256", "attempts")}
+        self.gh.rows = [{"id": 1, "body": _body(record),
+                         "user": {"login": "publisher", "id": 42}}]
+        self.gh.rows.extend({"id": n, "body": "ordinary",
+                             "user": {"login": "other", "id": 99}}
+                            for n in range(2, 101))
+        self.gh.rows.append({"id": 101,
+                             "body": _body(make_manifest(**conflicting, attempts=2)),
+                             "user": {"login": "publisher", "id": 42}})
+        self.gh.same_count_shift = True
+        with self.assertRaisesRegex(GitHubError, "pagination changed"):
+            fetch_manifest(self.cfg, 12)
+        self.assertEqual(len(self.gh.rows), 101)
+        self.assertEqual(self.gh.page2_reads, 1)
+
+    def test_exact_two_thousand_comment_boundary(self):
+        self.gh.rows = [{"id": n, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}
+                        for n in range(1, 2000)]
+        self.gh.rows.append({"id": 2000, "body": _body(manifest(model=None)),
+                             "user": {"login": "publisher", "id": 42}})
+        status, record = fetch_manifest(self.cfg, 12)
+        self.assertEqual(status["status"], "current")
+        self.assertEqual(record["head"], HEAD)
+        self.assertEqual(len(self.gh.requests), 42)
+        self.gh.rows.append({"id": 2001, "body": "ordinary",
+                             "user": {"login": "other", "id": 99}})
+        with self.assertRaisesRegex(GitHubError, "exceeds limit"):
+            fetch_manifest(self.cfg, 12)
 
     def test_full_bounded_timeline_refuses_new_publication(self):
         self.gh.rows = [{"id": n, "body": "ordinary",
