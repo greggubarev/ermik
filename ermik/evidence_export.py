@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
+import threading
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 
 from . import state
 from .config import Config
 from .evidence import make_manifest, validate_manifest
 from .evidence_store import read_evidence
-from .github import GitHub, GitHubError
+from .github import GitHub, GitHubError, _read_api_command, _retryable_gh_error
 from .policy import parse_issue, validate_changed_paths
 from .review import _checks_sha256
 from .runtime import (_approved_on_github, _complexity_key, _route_key,
@@ -21,6 +24,7 @@ from .runtime import (_approved_on_github, _complexity_key, _route_key,
 
 _BRANCH = re.compile(r"work/issue-(\d+)-[a-z0-9-]+\Z")
 _LINK = re.compile(r"(?im)\bCloses\s+#(\d+)\b")
+_PAIR_TIMEOUT = 30
 
 
 def _scope_sha256(paths: tuple[str, ...]) -> str:
@@ -33,11 +37,104 @@ def _github(cfg: Config) -> GitHub:
             if cfg.publish_repo else GitHub(cfg.repo))
 
 
+class _PacketGitHub(GitHub):
+    """Keep packet CLI reads cancellable when a sibling read fails."""
+
+    def __init__(self, cfg: Config):
+        super().__init__(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
+        self._cancel = threading.Event()
+        self._active_lock = threading.Lock()
+        self._active: set[subprocess.Popen] = set()
+
+    def cancel_reads(self) -> None:
+        with self._active_lock:
+            self._cancel.set()
+            for process in self._active:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass  # The read may have exited after poll().
+
+    def command(self, args: list[str], *, timeout: int = 90,
+                credential_env: str | None = None) -> str:
+        if credential_env is not None or not _read_api_command(args):
+            return super().command(args, timeout=timeout,
+                                   credential_env=credential_env)
+        for attempt in range(3):
+            if self._cancel.is_set():
+                raise GitHubError("GitHub read cancelled")
+            try:
+                process = subprocess.Popen(["gh", *args], text=True,
+                                           encoding="utf-8", errors="replace",
+                                           stdout=subprocess.PIPE,
+                                           stderr=subprocess.PIPE)
+            except OSError as exc:
+                if attempt < 2 and not isinstance(exc, (FileNotFoundError,
+                                                        PermissionError)):
+                    if self._cancel.wait(0.25 * (2 ** attempt)):
+                        raise GitHubError("GitHub read cancelled") from None
+                    continue
+                raise GitHubError("GitHub command unavailable or timed out") from None
+            with self._active_lock:
+                self._active.add(process)
+                if self._cancel.is_set() and process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+            try:
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                if attempt < 2 and not self._cancel.wait(0.25 * (2 ** attempt)):
+                    continue
+                raise GitHubError("GitHub command unavailable or timed out") from None
+            finally:
+                with self._active_lock:
+                    self._active.discard(process)
+            if self._cancel.is_set():
+                raise GitHubError("GitHub read cancelled")
+            if process.returncode:
+                if attempt < 2 and _retryable_gh_error(stderr or ""):
+                    if self._cancel.wait(0.25 * (2 ** attempt)):
+                        raise GitHubError("GitHub read cancelled") from None
+                    continue
+                raise GitHubError(f"GitHub command failed (exit {process.returncode})")
+            return stdout
+        raise GitHubError("GitHub command unavailable or timed out")
+
+
+def _packet_github(cfg: Config) -> GitHub:
+    return _PacketGitHub(cfg)
+
+
+def _parallel_reads(gh: _PacketGitHub, first, second):
+    with ThreadPoolExecutor(max_workers=2) as reads:
+        left = reads.submit(first)
+        right = reads.submit(second)
+        done, pending = wait((left, right), timeout=_PAIR_TIMEOUT,
+                             return_when=FIRST_EXCEPTION)
+        if pending or any(future.exception() is not None for future in done):
+            gh.cancel_reads()
+            if pending:
+                raise GitHubError("GitHub packet read timed out")
+            for future in done:
+                future.result()
+        return left.result(), right.result()
+
+
 def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, list[str]]:
     """Check remote identity and admission without reading controller state."""
     if type(pr_number) is not int or pr_number <= 0:
         raise WorkflowError("invalid PR number")
-    pr = gh.pr(pr_number)
+    if isinstance(gh, _PacketGitHub):
+        pr, base_sha = _parallel_reads(gh, lambda: gh.pr(pr_number),
+                                      lambda: main_sha(gh, cfg))
+    else:
+        pr = gh.pr(pr_number)
+        base_sha = main_sha(gh, cfg)
     branch = pr.get("headRefName")
     match = _BRANCH.fullmatch(branch) if isinstance(branch, str) else None
     if not match or _LINK.findall(pr.get("body") or "") != [match.group(1)]:
@@ -48,7 +145,7 @@ def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, l
                                 number=pr_number, state="OPEN")
     except GitHubError as exc:
         raise WorkflowError("PR identity changed") from exc
-    if pr.get("baseRefOid") != main_sha(gh, cfg):
+    if pr.get("baseRefOid") != base_sha:
         raise WorkflowError("PR base is stale")
     files = pr.get("files")
     if (not isinstance(files, list) or not files or len(files) > 100
@@ -59,12 +156,26 @@ def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, l
     paths = sorted(row["path"] for row in files)
     if len(paths) != len(set(paths)):
         raise WorkflowError("duplicate PR path")
-    issue = gh.issue(issue_number)
+    if isinstance(gh, _PacketGitHub):
+        issue, comments = _parallel_reads(gh, lambda: gh.issue(issue_number),
+                                          lambda: gh.comments(issue_number))
+    else:
+        issue = gh.issue(issue_number)
+        comments = None
     labels = {row["name"] for row in issue.get("labels", [])}
     if not {"queue:worker", "state:in-progress"}.issubset(labels):
         raise WorkflowError("issue queue state changed")
     spec = parse_issue(issue.get("body") or "")
-    if not _approved_on_github(gh, cfg, issue_number, spec):
+    if comments is not None:
+        class _CommentsSnapshot:
+            def comments(self, number: int) -> list[dict]:
+                if number != issue_number:
+                    raise WorkflowError("unexpected admission issue")
+                return comments
+        admission_gh = _CommentsSnapshot()
+    else:
+        admission_gh = gh
+    if not _approved_on_github(admission_gh, cfg, issue_number, spec, issue):
         raise WorkflowError("issue admission changed")
     validate_changed_paths(paths, spec.allowed_paths)
     return pr, issue_number, spec, paths

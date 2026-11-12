@@ -4,13 +4,16 @@ import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
-from ermik.evidence_export import export_manifest, verify_manifest, _scope_sha256
+from ermik.evidence_export import (export_manifest, verify_manifest, _live,
+                                   _PacketGitHub, _parallel_reads, _scope_sha256)
 from ermik.evidence import loads_manifest, make_manifest
 from ermik.evidence_store import read_evidence, write_evidence
+from ermik.github import GitHubError
 from ermik.policy import parse_issue
 from ermik.runtime import _admission_marker, WorkflowError
 from ermik.runtime import _profile_sha
@@ -98,6 +101,84 @@ class EvidenceExportTests(unittest.TestCase):
                 patch("ermik.evidence_export._resolve_image_id", return_value=IMAGE),
                 patch("ermik.evidence_export._portable_image_digest",
                       return_value=CONFIG_DIGEST))
+
+    def test_failed_live_read_stops_before_later_requests(self):
+        with (patch.object(self.gh, "pr", side_effect=GitHubError("timeout")),
+              patch.object(self.gh, "api") as base_read):
+            with self.assertRaises(GitHubError):
+                _live(self.cfg, self.gh, 12)
+        base_read.assert_not_called()
+        with (patch.object(self.gh, "issue", side_effect=GitHubError("timeout")),
+              patch.object(self.gh, "comments") as comments_read):
+            with self.assertRaises(GitHubError):
+                _live(self.cfg, self.gh, 12)
+        comments_read.assert_not_called()
+
+    def test_failed_parallel_read_kills_and_joins_sibling_cli(self):
+        started = Event()
+        killed = Event()
+
+        class Process:
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+                killed.set()
+
+            def communicate(self, timeout=None):
+                started.set()
+                if not killed.wait(2):
+                    raise AssertionError("CLI read was not cancelled")
+                return "", ""
+
+        gh = _PacketGitHub(self.cfg)
+        process = Process()
+        def failed():
+            self.assertTrue(started.wait(2))
+            raise GitHubError("first read failed")
+
+        with patch("ermik.evidence_export.subprocess.Popen", return_value=process):
+            with self.assertRaises(GitHubError):
+                _parallel_reads(gh, failed,
+                                lambda: gh.command(["api", "repos/owner/project/pulls/12"]))
+        self.assertTrue(killed.is_set())
+        self.assertFalse(gh._active)
+
+    def test_parallel_deadline_kills_and_joins_cli_reads(self):
+        killed = []
+
+        class Process:
+            returncode = None
+
+            def __init__(self):
+                self.stopped = Event()
+                killed.append(self.stopped)
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+                self.stopped.set()
+
+            def communicate(self, timeout=None):
+                if not self.stopped.wait(2):
+                    raise AssertionError("CLI read was not cancelled")
+                return "", ""
+
+        gh = _PacketGitHub(self.cfg)
+        with (patch("ermik.evidence_export.subprocess.Popen", side_effect=lambda *_a, **_k: Process()),
+              patch("ermik.evidence_export._PAIR_TIMEOUT", 0.02)):
+            with self.assertRaises(GitHubError):
+                _parallel_reads(gh,
+                                lambda: gh.command(["api", "repos/owner/project/pulls/12"]),
+                                lambda: gh.command(["api", "repos/owner/project/issues/7"]))
+        self.assertEqual(len(killed), 2)
+        self.assertTrue(all(stopped.is_set() for stopped in killed))
+        self.assertFalse(gh._active)
 
     def test_export_and_verify_without_controller_state(self):
         gh_patch, image_patch, digest_patch = self._patches()

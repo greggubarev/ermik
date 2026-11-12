@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
-from .evidence_export import _github, _live
+from .evidence_export import _live, _packet_github
 from .evidence_transport import fetch_manifest
 from .github import GitHub, GitHubError
 from .review import _checks_sha256, _load, _review_policy
@@ -66,7 +67,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     if type(pr_number) is not int or pr_number <= 0:
         return {"status": "incomplete", "reason": "invalid_pr_number"}
     try:
-        live = _live(cfg, _github(cfg), pr_number)
+        live = _live(cfg, _packet_github(cfg), pr_number)
         pr, issue, spec, paths = live
         image = published_image_id(pr.get("body") or "")
         image_config_digest = published_image_config_digest(pr.get("body") or "")
@@ -96,16 +97,23 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         "published_image_id": image,
         "image_config_digest": image_config_digest,
     }
-    packet["review"] = _review_summary(cfg, pr_number, expected)
-    old_head = packet["review"].get("head")
-    if old_head and old_head != packet["head"]:
-        packet["previous_head"] = old_head
+    # The local review record and remote evidence are independent reads.
+    review_reads = ThreadPoolExecutor(max_workers=1)
+    review_read = review_reads.submit(_review_summary, cfg, pr_number, expected)
 
     def finish() -> dict:
         """Confirm the PR identity again before presenting its HEAD as verified."""
         try:
+            packet["review"] = review_read.result()
+        finally:
+            review_reads.shutdown(wait=True)
+        old_head = packet["review"].get("head")
+        if (packet["previous_head"] is None and old_head
+                and old_head != packet["head"]):
+            packet["previous_head"] = old_head
+        try:
             final_pr, final_issue, final_spec, final_paths = _live(
-                cfg, _github(cfg), pr_number)
+                cfg, _packet_github(cfg), pr_number)
             final_image = published_image_id(final_pr.get("body") or "")
             final_config = published_image_config_digest(final_pr.get("body") or "")
             unchanged = (
