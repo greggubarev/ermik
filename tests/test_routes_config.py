@@ -48,6 +48,19 @@ class RouteConfigTests(unittest.TestCase):
                           for tier in ("easy", "medium", "hard")],
                          ["low", "medium", "high"])
 
+    def test_go_max_is_valid_only_when_declared(self):
+        self.raw["models"] = [{"provider_id": "opencode-go", "model_id": "kimi-k3",
+                               "credential_env": "OPENCODE_GO_API_KEY",
+                               "supported_efforts": ["max"]}]
+        ref = "opencode-go/kimi-k3"
+        self.raw["complexity_profiles"] = {
+            tier: [{"model_ref": ref, "effort": "max"}]
+            for tier in ("easy", "medium", "hard")}
+        self.assertEqual(self.load().complexity_profiles["hard"][0].effort, "max")
+        self.raw["complexity_profiles"]["hard"][0]["effort"] = "high"
+        with self.assertRaisesRegex(ValueError, "not declared"):
+            self.load()
+
     def test_invalid_complexity_profiles_rejected(self):
         ref = "kimi-code/k3-256k"
         valid = {tier: [{"model_ref": ref, "effort": "low"}]

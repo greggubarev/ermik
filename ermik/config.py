@@ -169,7 +169,7 @@ def load_config(path: Path) -> Config:
         for entry in entries:
             if (not isinstance(entry, dict) or set(entry) != {"model_ref", "effort"}
                     or type(entry["model_ref"]) is not str
-                    or entry["effort"] not in ("low", "medium", "high")):
+                    or entry["effort"] not in ("low", "medium", "high", "max")):
                 raise ValueError("invalid complexity profile entry")
             base = next((model for model in models if model.ref == entry["model_ref"]), None)
             if base is None:

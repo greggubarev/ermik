@@ -15,7 +15,7 @@ from ermik.providers import ModelCandidate, opencode_command
 KIMI = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY",
                       supported_efforts=("low", "medium", "high"))
 GO = ModelCandidate("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY",
-                    supported_efforts=("low", "medium", "high"))
+                    supported_efforts=("low", "medium", "high", "max"))
 BODY = "## Goal\nChange a file.\n\n## Allowed paths\nfile.txt\n\n## Acceptance\nChanged.\n"
 SPEC = parse_issue(BODY)
 IMAGE = "sha256:" + "a" * 64
@@ -136,7 +136,7 @@ class ComplexityProfileTests(unittest.TestCase):
                           complexity_profiles={
                               "easy": (replace(KIMI, effort="low"),),
                               "medium": (replace(GO, effort="medium"),),
-                              "hard": (replace(GO, effort="high"),)})
+                              "hard": (replace(GO, effort="max"),)})
         state.initialize(self.cfg.state_dir)
         Hub.route = "route:auto"
         Hub.complexity = "complexity:easy"
@@ -187,6 +187,13 @@ class ComplexityProfileTests(unittest.TestCase):
             row = conn.execute("SELECT model,effort,complexity FROM events "
                                "WHERE issue=1 AND kind='route_decision'").fetchone()
         self.assertEqual(tuple(row), (KIMI.ref, "low", "easy"))
+
+    def test_go_max_variant_is_bound_to_hard_profile(self):
+        from ermik.providers import model_spec
+        import json
+        chosen = self.cfg.complexity_profiles["hard"][0]
+        self.assertEqual(json.loads(model_spec(chosen))["effort"], "max")
+        self.assertIn("--variant", opencode_command(chosen, BODY))
 
     def test_admit_requires_explicit_tier_and_binds_route_and_profile(self):
         AdmitHub.names = {"queue:worker", "state:proposed", "route:auto"}

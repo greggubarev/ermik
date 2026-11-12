@@ -441,7 +441,7 @@ def event(conn: sqlite3.Connection, issue: int, kind: str, *,
             raise ValueError("invalid route decision")
     elif any(value is not None for value in (policy_version, eligible, decision_reason)):
         raise ValueError("route metadata requires route_decision")
-    if effort not in (None, "low", "medium", "high"):
+    if effort not in (None, "low", "medium", "high", "max"):
         raise ValueError("invalid event effort")
     if complexity not in (None, "easy", "medium", "hard"):
         raise ValueError("invalid event complexity")

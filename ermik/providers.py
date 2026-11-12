@@ -82,12 +82,12 @@ class ModelCandidate:
                 raise ValueError("custom provider package is not allowed")
         if type(self.max_parallel) is not int or not 1 <= self.max_parallel <= 8:
             raise ValueError("max_parallel must be 1..8")
-        if self.effort not in (None, "low", "medium", "high"):
+        if self.effort not in (None, "low", "medium", "high", "max"):
             raise ValueError("invalid reasoning effort")
         if (type(self.supported_efforts) is not tuple
                 or any(type(value) is not str for value in self.supported_efforts)
                 or len(set(self.supported_efforts)) != len(self.supported_efforts)
-                or any(value not in ("low", "medium", "high")
+                or any(value not in ("low", "medium", "high", "max")
                        for value in self.supported_efforts)):
             raise ValueError("invalid supported reasoning efforts")
         if self.effort is not None and self.effort not in self.supported_efforts:

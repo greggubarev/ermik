@@ -114,7 +114,7 @@ def validate_manifest(record: dict) -> dict:
         _require(type(record["profile_sha256"]) is str and
                  bool(_DIGEST.fullmatch(record["profile_sha256"])),
                  "invalid complexity profile digest")
-        _require((record["effort"] in ("low", "medium", "high")
+        _require((record["effort"] in ("low", "medium", "high", "max")
                   and "effort" not in unknowns and model is not None)
                  or (record["effort"] is None and "effort" in unknowns
                      and model is None), "invalid effort observation")

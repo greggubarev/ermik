@@ -45,6 +45,9 @@ class EvidenceProtocolTests(unittest.TestCase):
                                profile_sha256="e" * 64, effort="low")
         self.assertEqual(record["version"], 3)
         self.assertEqual(loads_manifest(dumps_manifest(record)), record)
+        max_record = make_manifest(**fields, complexity="hard",
+                                   profile_sha256="e" * 64, effort="max")
+        self.assertEqual(loads_manifest(dumps_manifest(max_record)), max_record)
         with self.assertRaisesRegex(ValueError, "invalid effort observation"):
             changed = dict(fields)
             changed["model"] = None
