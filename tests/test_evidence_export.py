@@ -4,13 +4,15 @@ import json
 from dataclasses import replace
 from pathlib import Path
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
-from ermik.evidence_export import export_manifest, verify_manifest, _scope_sha256
+from ermik.evidence_export import export_manifest, verify_manifest, _live, _scope_sha256
 from ermik.evidence import loads_manifest, make_manifest
 from ermik.evidence_store import read_evidence, write_evidence
+from ermik.github import GitHubError
 from ermik.policy import parse_issue
 from ermik.runtime import _admission_marker, WorkflowError
 from ermik.runtime import _profile_sha
@@ -98,6 +100,48 @@ class EvidenceExportTests(unittest.TestCase):
                 patch("ermik.evidence_export._resolve_image_id", return_value=IMAGE),
                 patch("ermik.evidence_export._portable_image_digest",
                       return_value=CONFIG_DIGEST))
+
+    def test_live_overlaps_independent_remote_reads(self):
+        base_started = Event()
+        comments_started = Event()
+        original_pr = self.gh.pr
+        original_issue = self.gh.issue
+
+        def pr(number):
+            if not base_started.wait(2):
+                raise AssertionError("base read did not overlap PR read")
+            return original_pr(number)
+
+        def base(_gh, _cfg):
+            base_started.set()
+            return BASE
+
+        def issue(number):
+            if not comments_started.wait(2):
+                raise AssertionError("comments did not overlap Issue read")
+            return original_issue(number)
+
+        def comments(number):
+            comments_started.set()
+            return [{"body": _admission_marker(7, self.spec),
+                     "user": {"login": self.cfg.maintainer}}]
+
+        with (patch.object(self.gh, "pr", side_effect=pr),
+              patch.object(self.gh, "issue", side_effect=issue),
+              patch.object(self.gh, "comments", side_effect=comments),
+              patch("ermik.evidence_export.main_sha", side_effect=base)):
+            result = _live(self.cfg, self.gh, 12)
+        self.assertEqual(result[0]["headRefOid"], HEAD)
+        self.assertEqual(result[1], 7)
+
+    def test_live_timeout_and_partial_admission_cannot_validate(self):
+        with patch.object(self.gh, "comments",
+                          side_effect=GitHubError("remote timeout")):
+            with self.assertRaises(GitHubError):
+                _live(self.cfg, self.gh, 12)
+        with patch.object(self.gh, "comments", return_value=None):
+            with self.assertRaises(TypeError):
+                _live(self.cfg, self.gh, 12)
 
     def test_export_and_verify_without_controller_state(self):
         gh_patch, image_patch, digest_patch = self._patches()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 from . import state
 from .config import Config
@@ -37,7 +38,13 @@ def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, l
     """Check remote identity and admission without reading controller state."""
     if type(pr_number) is not int or pr_number <= 0:
         raise WorkflowError("invalid PR number")
-    pr = gh.pr(pr_number)
+    # These reads do not depend on one another. The packet repeats _live after
+    # evidence retrieval, so each pass must still validate complete live data.
+    with ThreadPoolExecutor(max_workers=2) as reads:
+        pr_read = reads.submit(gh.pr, pr_number)
+        base_read = reads.submit(main_sha, gh, cfg)
+        pr = pr_read.result()
+        base_sha = base_read.result()
     branch = pr.get("headRefName")
     match = _BRANCH.fullmatch(branch) if isinstance(branch, str) else None
     if not match or _LINK.findall(pr.get("body") or "") != [match.group(1)]:
@@ -48,7 +55,7 @@ def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, l
                                 number=pr_number, state="OPEN")
     except GitHubError as exc:
         raise WorkflowError("PR identity changed") from exc
-    if pr.get("baseRefOid") != main_sha(gh, cfg):
+    if pr.get("baseRefOid") != base_sha:
         raise WorkflowError("PR base is stale")
     files = pr.get("files")
     if (not isinstance(files, list) or not files or len(files) > 100
@@ -59,12 +66,22 @@ def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, l
     paths = sorted(row["path"] for row in files)
     if len(paths) != len(set(paths)):
         raise WorkflowError("duplicate PR path")
-    issue = gh.issue(issue_number)
+    with ThreadPoolExecutor(max_workers=2) as reads:
+        issue_read = reads.submit(gh.issue, issue_number)
+        comments_read = reads.submit(gh.comments, issue_number)
+        issue = issue_read.result()
+        comments = comments_read.result()
     labels = {row["name"] for row in issue.get("labels", [])}
     if not {"queue:worker", "state:in-progress"}.issubset(labels):
         raise WorkflowError("issue queue state changed")
     spec = parse_issue(issue.get("body") or "")
-    if not _approved_on_github(gh, cfg, issue_number, spec):
+    class _CommentsSnapshot:
+        def comments(self, number: int) -> list[dict]:
+            if number != issue_number:
+                raise WorkflowError("unexpected admission issue")
+            return comments
+
+    if not _approved_on_github(_CommentsSnapshot(), cfg, issue_number, spec, issue):
         raise WorkflowError("issue admission changed")
     validate_changed_paths(paths, spec.allowed_paths)
     return pr, issue_number, spec, paths
