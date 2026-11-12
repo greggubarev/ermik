@@ -17,6 +17,10 @@ _MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER,
             3: "Ermik evidence v3\n\n```json\n"}
 _SUFFIX = "```"
 MAX_COMMENTS = 1000
+LOOKUP_TIMEOUT = 10
+_POINTER = re.compile(r"<!-- Ermik evidence comment head=([0-9a-f]{40}) "
+                      r"id=([1-9][0-9]*) sha256=([0-9a-f]{64}) -->")
+_POINTER_PREFIX = "<!-- Ermik evidence comment "
 
 
 class EvidenceRecordError(GitHubError):
@@ -59,24 +63,32 @@ def _record(body: str) -> dict:
     return record
 
 
-def _comments(gh: GitHub, pr_number: int) -> list[dict]:
+def _comments(gh: GitHub, pr_number: int, *, allow_limit: bool = False) -> list[dict]:
     rows: list[dict] = []
     for page in range(1, MAX_COMMENTS // 100 + 1):
-        batch = gh.api(f"issues/{pr_number}/comments?per_page=100&page={page}")
+        batch = gh.api(f"issues/{pr_number}/comments?per_page=100&page={page}",
+                       timeout=LOOKUP_TIMEOUT)
         if not isinstance(batch, list):
             raise GitHubError("evidence comment listing is invalid")
         if len(batch) > 100 or any(not isinstance(item, dict) for item in batch):
             raise GitHubError("evidence comment listing is invalid")
         rows.extend(batch)
         if len(batch) < 100:
+            tail = gh.api(f"issues/{pr_number}/comments?per_page=100&page={page + 1}",
+                          timeout=LOOKUP_TIMEOUT)
+            if tail != []:
+                raise GitHubError("evidence comment pagination is incomplete")
             return rows
+    if allow_limit:
+        return rows
     raise GitHubError("evidence comment listing exceeds limit")
 
 
-def _published_records(cfg: Config, gh: GitHub, pr_number: int) -> list[tuple[dict, dict]]:
+def _published_records(cfg: Config, gh: GitHub, pr_number: int,
+                       *, rows: list[dict] | None = None) -> list[tuple[dict, dict]]:
     publisher_id = _publisher_id(cfg)
     found: list[tuple[dict, dict]] = []
-    for row in _comments(gh, pr_number):
+    for row in rows if rows is not None else _comments(gh, pr_number):
         body = row.get("body")
         if not isinstance(body, str):
             continue
@@ -114,6 +126,98 @@ def _published_records(cfg: Config, gh: GitHub, pr_number: int) -> list[tuple[di
     return found
 
 
+def _pointer(body: str) -> tuple[str, int, str] | None:
+    if not isinstance(body, str):
+        raise EvidenceRecordError("PR body is unavailable")
+    lines = [line for line in body.splitlines() if _POINTER_PREFIX in line]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        raise EvidenceRecordError("duplicate evidence pointer")
+    match = _POINTER.fullmatch(lines[0])
+    if match is None:
+        raise EvidenceRecordError("invalid evidence pointer")
+    return match.group(1), int(match.group(2)), match.group(3)
+
+
+def _pointed_record(cfg: Config, gh: GitHub, pr_number: int,
+                    pr: dict, *, row: dict | None = None) -> tuple[dict, dict] | None:
+    pointer = _pointer(pr.get("body"))
+    if pointer is None:
+        return None
+    head, comment_id, digest = pointer
+    if head != pr.get("headRefOid"):
+        raise EvidenceRecordError("evidence pointer is stale")
+    if row is None:
+        row = gh.api(f"issues/comments/{comment_id}", timeout=LOOKUP_TIMEOUT)
+    if (not isinstance(row, dict) or type(row.get("id")) is not int
+            or row["id"] != comment_id
+            or row.get("issue_url") !=
+            f"https://api.github.com/repos/{cfg.repo}/issues/{pr_number}"):
+        raise EvidenceRecordError("evidence pointer has wrong PR identity")
+    user = row.get("user")
+    if (not isinstance(user, dict) or type(user.get("id")) is not int
+            or user["id"] != _publisher_id(cfg)):
+        raise EvidenceRecordError("evidence pointer has wrong author")
+    try:
+        record = _record(row.get("body"))
+    except (ValueError, UnicodeError, UnsupportedManifestVersion) as exc:
+        raise EvidenceRecordError("evidence pointer has invalid record") from exc
+    if (record["repo"].casefold() != cfg.repo.casefold()
+            or record["pr"] != pr_number or record["head"] != head
+            or record["sha256"] != digest):
+        raise EvidenceRecordError("evidence pointer has conflicting record")
+    return row, record
+
+
+def _publish_pointer(cfg: Config, gh: GitHub, pr_number: int,
+                     record: dict, comment_id: int) -> None:
+    pr = gh.pr(pr_number)
+    if pr.get("headRefOid") != record["head"]:
+        raise EvidenceRecordError("evidence became stale before pointer publication")
+    body = pr.get("body")
+    prior = _pointer(body)
+    if prior is not None:
+        if prior == (record["head"], comment_id, record["sha256"]):
+            return
+        if prior[0] == record["head"]:
+            raise EvidenceRecordError("conflicting evidence pointer for PR HEAD")
+        body = "\n".join(line for line in body.splitlines()
+                         if _POINTER_PREFIX not in line)
+    pointer = (f"<!-- Ermik evidence comment head={record['head']} "
+               f"id={comment_id} sha256={record['sha256']} -->")
+    updated = body.rstrip() + "\n\n" + pointer
+    try:
+        response = json.loads(gh.command(["api", "--method", "PATCH",
+                                          f"repos/{cfg.repo}/pulls/{pr_number}",
+                                          "-f", f"body={updated}"]))
+        if (not isinstance(response, dict) or response.get("body") != updated
+                or (response.get("head") or {}).get("sha") != record["head"]):
+            raise GitHubError("evidence pointer response is incomplete")
+    except (GitHubError, ValueError, TypeError) as exc:
+        observed = gh.pr(pr_number)
+        if observed.get("headRefOid") != record["head"]:
+            raise EvidenceRecordError("evidence became stale before pointer publication") from exc
+        if (observed.get("headRefOid") == record["head"]
+                and _pointer(observed.get("body")) ==
+                (record["head"], comment_id, record["sha256"])):
+            return
+        raise GitHubError("evidence pointer publication is uncertain") from exc
+
+
+def _ensure_pointer(cfg: Config, gh: GitHub, pr_number: int,
+                    record: dict, comment_id: int) -> str:
+    try:
+        _publish_pointer(cfg, gh, pr_number, record, comment_id)
+    except EvidenceRecordError:
+        raise
+    except GitHubError:
+        # A publisher with Issues write but no Pull requests write retains the
+        # original comment transport. The receiver must not infer a pointer.
+        return "unavailable"
+    return "confirmed"
+
+
 def _sanitized_export(cfg: Config, pr_number: int) -> dict:
     exported = export_manifest(cfg, pr_number)
     fields = {key: value for key, value in exported.items()
@@ -137,7 +241,16 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
         raise GitHubError("evidence publisher identity mismatch")
 
     def existing() -> dict | None:
-        matches = [(row, saved) for row, saved in _published_records(cfg, gh, pr_number)
+        pr = gh.pr(pr_number)
+        rows = _comments(gh, pr_number, allow_limit=True)
+        found = _published_records(cfg, gh, pr_number, rows=rows)
+        if len(rows) == MAX_COMMENTS:
+            pointed = _pointed_record(cfg, gh, pr_number, pr)
+            if pointed is None:
+                raise GitHubError("evidence comment listing exceeds limit")
+            if not any(row["id"] == pointed[0]["id"] for row, _ in found):
+                found.append(pointed)
+        matches = [(row, saved) for row, saved in found
                    if saved["head"] == record["head"]]
         if len(matches) > 1:
             raise GitHubError("duplicate evidence for PR HEAD")
@@ -146,8 +259,10 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
         row, saved = matches[0]
         if saved != record:
             raise GitHubError("conflicting evidence for PR HEAD")
+        pointer_status = _ensure_pointer(cfg, gh, pr_number, record, row["id"])
         return {"status": "existing", "comment_id": row["id"],
-                "head": record["head"], "sha256": record["sha256"]}
+                "head": record["head"], "sha256": record["sha256"],
+                "pointer_status": pointer_status}
 
     prior = existing()
     if prior is not None:
@@ -171,8 +286,10 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
         if recovered is not None:
             return recovered
         raise GitHubError("evidence publication result is uncertain") from exc
+    pointer_status = _ensure_pointer(cfg, gh, pr_number, record, posted["id"])
     return {"status": "published", "comment_id": posted["id"],
-            "head": record["head"], "sha256": record["sha256"]}
+            "head": record["head"], "sha256": record["sha256"],
+            "pointer_status": pointer_status}
 
 
 def fetch_manifest(cfg: Config, pr_number: int, *, _live_result=None,
@@ -183,8 +300,27 @@ def fetch_manifest(cfg: Config, pr_number: int, *, _live_result=None,
     it must recheck remote identity before presenting a current result.
     """
     gh = GitHub(cfg.repo)
+    pr = _live_result[0] if _live_result is not None else gh.pr(pr_number)
     try:
-        found = _published_records(cfg, gh, pr_number)
+        pointer = _pointer(pr.get("body"))
+        if pointer is not None and pointer[0] != pr.get("headRefOid"):
+            return {"status": "stale", "reason": "head_changed",
+                    "head": pointer[0], "current_head": pr.get("headRefOid")}, None
+        rows = _comments(gh, pr_number, allow_limit=True)
+        found = _published_records(cfg, gh, pr_number, rows=rows)
+        if len(rows) == MAX_COMMENTS:
+            pointed = _pointed_record(cfg, gh, pr_number, pr)
+            if pointed is None:
+                raise GitHubError("evidence comment listing exceeds limit")
+            if not any(row["id"] == pointed[0]["id"] for row, _ in found):
+                found.append(pointed)
+        else:
+            if pointer is not None:
+                pointed_row = next((row for row in rows if row.get("id") == pointer[1]),
+                                   None)
+                if pointed_row is None:
+                    raise EvidenceRecordError("evidence pointer is outside complete listing")
+                _pointed_record(cfg, gh, pr_number, pr, row=pointed_row)
     except UnsupportedEvidenceVersion:
         return {"status": "unsupported_version"}, None
     except EvidenceRecordError:
@@ -193,7 +329,6 @@ def fetch_manifest(cfg: Config, pr_number: int, *, _live_result=None,
         _records_out.extend(found)
     if not found:
         return {"status": "missing"}, None
-    pr = _live_result[0] if _live_result is not None else gh.pr(pr_number)
     head = pr.get("headRefOid")
     counts: dict[str, int] = {}
     for _, record in found:

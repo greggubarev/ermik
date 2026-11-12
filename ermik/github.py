@@ -499,8 +499,9 @@ class GitHub:
             return result.stdout
         raise GitHubError("GitHub command unavailable or timed out")
 
-    def api(self, endpoint: str) -> Any:
-        return json.loads(self.command(["api", f"repos/{self.repo}/{endpoint}"]))
+    def api(self, endpoint: str, *, timeout: int = 90) -> Any:
+        return json.loads(self.command(["api", f"repos/{self.repo}/{endpoint}"],
+                                       timeout=timeout))
 
     def _pages(self, endpoint: str) -> list[dict]:
         """Read bounded REST pages without version-specific gh pagination flags."""
