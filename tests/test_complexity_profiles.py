@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -267,6 +268,30 @@ class ComplexityProfileTests(unittest.TestCase):
                          "VALUES(?,?,?)", (1, SPEC.body_sha256, '["file.txt"]'))
         return cfg, hub
 
+    def disposable_git(self, cfg):
+        root = cfg.workspace.parent
+        source = cfg.workspace / "source"
+        remote = root / "remote.git"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "init", "-b", "main", str(source)], check=True,
+                       capture_output=True)
+        def git(*args):
+            return subprocess.run(["git", "-C", str(source), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.invalid")
+        (source / "file.txt").write_text("base\n", encoding="utf-8")
+        git("add", "file.txt")
+        git("commit", "-m", "base")
+        git("remote", "add", "origin", str(remote))
+        git("push", "origin", "main")
+        base = git("rev-parse", "HEAD")
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET base_sha=? WHERE issue=1", (base,))
+        return source, base, git
+
     def test_blocked_pr_readmission_requires_new_exact_head_request(self):
         cfg, hub = self.readmission_hub()
         with patch.object(runtime, "GitHub", return_value=hub), patch.object(
@@ -373,10 +398,86 @@ class ComplexityProfileTests(unittest.TestCase):
                 self.assertEqual((row["status"], row["complexity"], row["route_key"]),
                                  ("blocked", "easy", "route:auto"))
 
-    def test_blocked_prepublication_job_cannot_readmit_as_pr(self):
+    def test_blocked_prepublication_readmission_resumes_after_restart(self):
         cfg, hub = self.readmission_hub()
         hub.find_branch_pr = lambda branch: None
+        source, base, _git = self.disposable_git(cfg)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
+                         ("work/issue-1-delivery",))
         with patch.object(runtime, "GitHub", return_value=hub):
-            with self.assertRaisesRegex(runtime.WorkflowError,
-                                        "pre-publication job requires separate recovery"):
-                runtime.admit(cfg, 1, "medium")
+            runtime.admit(cfg, 1, "medium")
+        # A new connection stands for a controller restart after approval.
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"], row["route_key"]),
+                             ("retry_wait", "medium", "route:go"))
+            from ermik.recovery import activate_claim, claim_due
+            claim = claim_due(conn)[0]
+            self.assertTrue(activate_claim(conn, claim))
+            self.assertEqual(state.job(conn, 1)["status"], "running")
+
+    def test_changed_prepublication_branch_blocks_without_rebinding(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        source, base, git = self.disposable_git(cfg)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
+                         ("work/issue-1-delivery",))
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        git("branch", "work/issue-1-delivery")
+        git("switch", "work/issue-1-delivery")
+        (source / "file.txt").write_text("changed\n", encoding="utf-8")
+        git("commit", "-am", "changed")
+        git("push", "origin", "work/issue-1-delivery")
+        git("switch", "main")
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"], row["route_key"]),
+                             ("blocked", "easy", "route:auto"))
+            self.assertIn("local branch changed", row["error"])
+
+    def test_started_prepublication_attempt_cannot_replay(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=?,attempts_count=1 "
+                         "WHERE issue=1", ("work/issue-1-delivery",))
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        with patch.object(runtime, "mirror") as mirror:
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+            mirror.assert_not_called()
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"]), ("blocked", "easy"))
+            self.assertIn("unstarted execution", row["error"])
+
+    def test_unacknowledged_remote_branch_keeps_policy_bound(self):
+        cfg, hub = self.readmission_hub()
+        hub.find_branch_pr = lambda branch: None
+        source, base, git = self.disposable_git(cfg)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET pr=NULL,head_sha=NULL,branch=? WHERE issue=1",
+                         ("work/issue-1-delivery",))
+        with patch.object(runtime, "GitHub", return_value=hub):
+            runtime.admit(cfg, 1, "medium")
+        git("push", "origin", "main:refs/heads/work/issue-1-delivery")
+        with patch.object(runtime, "mirror", return_value=source), \
+                patch.object(runtime, "main_sha", return_value=base):
+            with state.connect(cfg.state_dir) as conn:
+                runtime._readmit_prepublication(hub, cfg, conn)
+        with state.connect(cfg.state_dir) as conn:
+            row = state.job(conn, 1)
+            self.assertEqual((row["status"], row["complexity"]), ("blocked", "easy"))
+            self.assertIn("remote branch or push is uncertain", row["error"])
