@@ -19,6 +19,8 @@ class EvidenceProtocolTests(unittest.TestCase):
         fields = self.v1()
         fields.pop("version")
         fields.pop("sha256")
+        fields["model"] = "provider/model"
+        fields["unknowns"] = ["usage"]
         return make_manifest(**fields, image_config_digest=CONFIG_DIGEST)
 
     def test_v1_fixture_remains_exactly_readable_and_writable(self):
@@ -34,6 +36,24 @@ class EvidenceProtocolTests(unittest.TestCase):
         self.assertEqual(record["image_config_digest"], CONFIG_DIGEST)
         self.assertEqual(record["image"], self.v1()["image"])
         self.assertEqual(loads_manifest(dumps_manifest(record)), record)
+
+    def test_v3_records_approved_tier_and_actual_effort(self):
+        fields = self.v2()
+        fields.pop("version")
+        fields.pop("sha256")
+        record = make_manifest(**fields, complexity="easy",
+                               profile_sha256="e" * 64, effort="low")
+        self.assertEqual(record["version"], 3)
+        self.assertEqual(loads_manifest(dumps_manifest(record)), record)
+        max_record = make_manifest(**fields, complexity="hard",
+                                   profile_sha256="e" * 64, effort="max")
+        self.assertEqual(loads_manifest(dumps_manifest(max_record)), max_record)
+        with self.assertRaisesRegex(ValueError, "invalid effort observation"):
+            changed = dict(fields)
+            changed["model"] = None
+            changed["unknowns"] = ["model", "usage"]
+            make_manifest(**changed, complexity="easy",
+                          profile_sha256="e" * 64, effort="high")
 
     def test_v2_requires_valid_config_digest(self):
         fields = self.v1()
@@ -58,7 +78,7 @@ class EvidenceProtocolTests(unittest.TestCase):
             validate_manifest(missing)
         with self.assertRaisesRegex(ValueError, "manifest digest mismatch"):
             validate_manifest({**new, "image_config_digest": "sha256:" + "e" * 64})
-        for version in (0, 3, "2", 2.0, True):
+        for version in (0, 4, "2", 2.0, True):
             with self.subTest(version=version), self.assertRaises(
                     UnsupportedManifestVersion):
                 validate_manifest({**new, "version": version})

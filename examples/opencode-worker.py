@@ -45,8 +45,16 @@ def _selected() -> ModelCandidate:
 
 def _config(candidate: ModelCandidate) -> dict:
     api_key = os.environ[candidate.credential_env]
+    model = {"name": candidate.model_id}
+    if candidate.effort:
+        # Define the selected V1 variant explicitly so an absent catalog
+        # variant cannot silently fall back to the model default.
+        model["variants"] = {candidate.effort: {
+            "reasoningEffort": candidate.effort}}
     if candidate.provider_id == "opencode-go":
         provider = {"options": {"apiKey": api_key}}
+        if candidate.effort:
+            provider["models"] = {candidate.model_id: model}
     else:
         provider = {
             "npm": candidate.runtime_package,
@@ -55,7 +63,7 @@ def _config(candidate: ModelCandidate) -> dict:
                 "baseURL": candidate.endpoint,
                 "apiKey": api_key,
             },
-            "models": {candidate.model_id: {"name": candidate.model_id}},
+            "models": {candidate.model_id: model},
         }
     return {
         "$schema": "https://opencode.ai/config.json",

@@ -2,6 +2,28 @@
 
 The controller selects a model for each attempt. It passes `ERMIK_MODEL_REF`, the public `ERMIK_MODEL_SPEC`, and only the selected provider's key variable to the container. Key values are not stored in controller JSON, SQLite, command arguments, or logs. Inside the disposable container, the key temporarily resides in a private `0600` OpenCode configuration file, removed after the attempt. The container prints one outcome code: `WORKER_OK`, `WORKER_QUOTA_EXHAUSTED`, `WORKER_AUTH_FAILURE`, `WORKER_EXECUTION_ERROR`, or `WORKER_CONFIGURATION_ERROR`. A `WORKER_USAGE` line contains aggregate token data, without session text or keys. If session export is unavailable, `complete=false` and all numeric values are `null`.
 
+## Optional approved complexity profiles
+
+The maintainer can assign an explicit easy, medium, or hard tier at admission. This policy is optional and lives in trusted local configuration. Each model used by a profile declares the reasoning efforts checked for that provider and model:
+
+```json
+{
+  "models": [
+    {"provider_id": "kimi-code", "model_id": "k3-256k", "credential_env": "KIMI_CODE_API_KEY", "supported_efforts": ["low", "high"]},
+    {"provider_id": "opencode-go", "model_id": "kimi-k3", "credential_env": "OPENCODE_GO_API_KEY", "supported_efforts": ["max"]}
+  ],
+  "complexity_profiles": {
+    "easy": [{"model_ref": "kimi-code/k3-256k", "effort": "low"}],
+    "medium": [{"model_ref": "kimi-code/k3-256k", "effort": "high"}],
+    "hard": [{"model_ref": "opencode-go/kimi-k3", "effort": "max"}]
+  }
+}
+```
+
+The example shows the format. In pinned OpenCode 1.18.35, the catalog for `opencode-go/kimi-k3` advertises `max`, but not `high`; a bounded subscription request with `--variant max` completed with HTTP 200. That confirms request acceptance, not how much internal reasoning the provider performed or a hard cost limit. Confirm each selected model and variant against the pinned worker and provider before using another combination. The worker defines the selected variant in its temporary configuration and passes it using `--variant`; syntax validation alone does not prove effective reasoning effort. The provider budget guard remains an estimate.
+
+Create the `complexity:easy`, `complexity:medium`, and `complexity:hard` labels in the target repository before enabling this policy. With profiles enabled, run `admit NUMBER --complexity easy|medium|hard`. Approval binds the issue body and scope hashes, current route label, tier, and effective profile digest. The controller checks those values at claim, correction, and before publication. For a blocked draft PR, a changed route or profile requires a new admission followed by a fresh exact-HEAD `request-changes` comment; the PR and HEAD remain unchanged until that correction runs. Re-admission requires the same allowed paths. A blocked pre-publication job has no reviewed PR boundary and requires separate operator recovery. Issue text and worker output cannot choose the tier. Quota fallback stays inside the approved profile; exhausted candidates leave the job waiting or blocked. Installations without `complexity_profiles` retain the prior routing and admission format.
+
 ## Image and command
 
 Build the image pinned to OpenCode 1.18.35:

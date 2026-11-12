@@ -19,7 +19,8 @@ class RouteConfigTests(unittest.TestCase):
             "image": "worker:test", "worker_command": ["python3", "worker.py"],
             "checks": [["true"]], "max_parallel": 1, "poll_seconds": 60,
             "models": [{"provider_id": "kimi-code", "model_id": "k3-256k",
-                        "credential_env": "KIMI_CODE_API_KEY"}],
+                        "credential_env": "KIMI_CODE_API_KEY",
+                        "supported_efforts": ["low", "medium", "high"]}],
         }
 
     def tearDown(self):
@@ -34,6 +35,49 @@ class RouteConfigTests(unittest.TestCase):
 
     def test_optional_routes_default_to_empty_map(self):
         self.assertEqual(self.load().routes, {})
+        self.assertEqual(self.load().complexity_profiles, {})
+
+    def test_complexity_profiles_select_configured_model_and_effort(self):
+        ref = "kimi-code/k3-256k"
+        self.raw["complexity_profiles"] = {
+            tier: [{"model_ref": ref, "effort": effort}]
+            for tier, effort in (("easy", "low"), ("medium", "medium"),
+                                 ("hard", "high"))}
+        cfg = self.load()
+        self.assertEqual([cfg.complexity_profiles[tier][0].effort
+                          for tier in ("easy", "medium", "hard")],
+                         ["low", "medium", "high"])
+
+    def test_go_max_is_valid_only_when_declared(self):
+        self.raw["models"] = [{"provider_id": "opencode-go", "model_id": "kimi-k3",
+                               "credential_env": "OPENCODE_GO_API_KEY",
+                               "supported_efforts": ["max"]}]
+        ref = "opencode-go/kimi-k3"
+        self.raw["complexity_profiles"] = {
+            tier: [{"model_ref": ref, "effort": "max"}]
+            for tier in ("easy", "medium", "hard")}
+        self.assertEqual(self.load().complexity_profiles["hard"][0].effort, "max")
+        self.raw["complexity_profiles"]["hard"][0]["effort"] = "high"
+        with self.assertRaisesRegex(ValueError, "not declared"):
+            self.load()
+
+    def test_invalid_complexity_profiles_rejected(self):
+        ref = "kimi-code/k3-256k"
+        valid = {tier: [{"model_ref": ref, "effort": "low"}]
+                 for tier in ("easy", "medium", "hard")}
+        for profiles in ({"easy": valid["easy"]},
+                         {**valid, "easy": []},
+                         {**valid, "easy": [{"model_ref": ref, "effort": "max"}]},
+                         {**valid, "easy": [{"model_ref": "missing/model", "effort": "low"}]},
+                         {**valid, "easy": [{"model_ref": ref, "effort": "low",
+                                              "extra": "unsafe"}]}):
+            with self.subTest(profiles=profiles), self.assertRaises(ValueError):
+                self.raw["complexity_profiles"] = profiles
+                self.load()
+        self.raw["complexity_profiles"] = valid
+        self.raw["models"][0]["supported_efforts"] = ["medium"]
+        with self.assertRaisesRegex(ValueError, "not declared"):
+            self.load()
 
     def test_route_resolves_configured_provider(self):
         self.assertEqual(self.load({"route:priority": "kimi-code"}).routes,

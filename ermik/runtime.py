@@ -149,17 +149,80 @@ def _draft_pr(cfg: Config, gh: GitHub, *, issue: int, branch: str,
         raise PublicationUnconfirmed("draft PR broker response is unconfirmed") from exc
 
 
-def _admission_marker(issue: int, spec: IssueSpec) -> str:
+def _profile_candidates(cfg: Config, tier: str, route: str = "route:auto"):
+    entries = cfg.complexity_profiles[tier]
+    if route != "route:auto":
+        provider = cfg.routes.get(route)
+        if provider is None:
+            raise ValueError("approved provider route is no longer configured")
+        entries = tuple(model for model in entries if model.provider_id == provider)
+    if not entries:
+        raise ValueError("approved profile has no models for route")
+    return entries
+
+
+def _profile_sha(cfg: Config, tier: str, route: str = "route:auto") -> str:
+    entries = _profile_candidates(cfg, tier, route)
+    data = json.dumps([route, [json.loads(model_spec(model)) for model in entries]],
+                      separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _complexity_key(issue: dict) -> str | None:
+    values = {name for name in labels(issue) if name.startswith("complexity:")}
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _admission_marker(issue: int, spec: IssueSpec, cfg: Config | None = None,
+                      current: dict | None = None) -> str:
     scope = hashlib.sha256(json.dumps(spec.allowed_paths, separators=(",", ":"),
                                      ensure_ascii=False).encode("utf-8")).hexdigest()
-    return f"SEMI_ADMIT issue={issue} body={spec.body_sha256} scope={scope}"
+    marker = f"SEMI_ADMIT issue={issue} body={spec.body_sha256} scope={scope}"
+    if cfg is not None and cfg.complexity_profiles:
+        if current is None:
+            raise ValueError("issue labels are required for complexity admission")
+        key = _complexity_key(current)
+        tier = key.removeprefix("complexity:") if key else ""
+        route = _route_key(current)
+        if tier not in cfg.complexity_profiles or route is None:
+            raise ValueError("invalid complexity or route labels")
+        marker += f" tier={tier} route={route} profile={_profile_sha(cfg, tier, route)}"
+    return marker
 
 
-def _approved_on_github(gh: GitHub, cfg: Config, issue: int, spec: IssueSpec) -> bool:
-    marker = _admission_marker(issue, spec)
+def _approved_on_github(gh: GitHub, cfg: Config, issue: int, spec: IssueSpec,
+                        current: dict | None = None) -> bool:
+    try:
+        if cfg.complexity_profiles and current is None:
+            current = gh.issue(issue)
+        marker = _admission_marker(issue, spec, cfg, current)
+    except ValueError:
+        return False
     return any((comment.get("body") or "").splitlines()[0:1] == [marker]
                and comment.get("user", {}).get("login") == cfg.maintainer
                for comment in gh.comments(issue))
+
+
+def _row_complexity(row) -> str | None:
+    try:
+        return row["complexity"]
+    except (KeyError, IndexError):
+        return None
+
+
+def _job_complexity_matches(cfg: Config, current: dict, row) -> bool:
+    if not cfg.complexity_profiles:
+        return _row_complexity(row) is None
+    key = _complexity_key(current)
+    tier = key.removeprefix("complexity:") if key else None
+    route = _route_key(current)
+    if (tier != row["complexity"] or tier not in cfg.complexity_profiles
+            or route != row["route_key"]):
+        return False
+    try:
+        return row["profile_sha"] == _profile_sha(cfg, tier, route)
+    except ValueError:
+        return False
 
 
 class WorkflowError(RuntimeError):
@@ -375,12 +438,20 @@ def _routed_models(cfg: Config, issue: dict):
     if len(routes) > 1:
         raise WorkflowError("conflicting provider route labels")
     route = next(iter(routes), "route:auto")
+    if cfg.complexity_profiles:
+        key = _complexity_key(issue)
+        tier = key.removeprefix("complexity:") if key else ""
+        if tier not in cfg.complexity_profiles:
+            raise WorkflowError("approved complexity label is missing or conflicting")
+        candidates = cfg.complexity_profiles[tier]
+    else:
+        candidates = cfg.models
     if route == "route:auto":
-        return cfg.models
+        return candidates
     provider_id = cfg.routes.get(route)
     if provider_id is None:
         raise WorkflowError(f"provider route {route} is not configured")
-    candidates = tuple(model for model in cfg.models
+    candidates = tuple(model for model in candidates
                        if model.provider_id == provider_id)
     if not candidates:
         raise WorkflowError(f"requested provider {provider_id} is not configured")
@@ -719,32 +790,104 @@ def _task_file(cfg: Config, issue: int, body: str, correction_note: str | None) 
     return path
 
 
-def admit(cfg: Config, number: int) -> dict:
+def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
     gh = GitHub(cfg.repo)
     if gh.identity() != cfg.maintainer:
         raise WorkflowError("only the configured maintainer can admit an issue")
     issue = gh.issue(number)
     names = labels(issue)
-    if "queue:worker" not in names or not ({"state:proposed", "state:ready"} & names):
-        raise WorkflowError("issue must be open, queue:worker and state:proposed or state:ready")
+    blocked_readmission = bool(cfg.complexity_profiles and "state:blocked" in names)
+    if blocked_readmission and ({"state:proposed", "state:ready",
+                                 "state:in-progress"} & names):
+        raise WorkflowError("blocked issue has conflicting state labels")
+    if ("queue:worker" not in names or
+            not ({"state:proposed", "state:ready"} & names) and not blocked_readmission):
+        raise WorkflowError("issue must be open and in the scoped worker queue")
     spec = parse_issue(issue.get("body") or "")
+    reviewed_pr = None
+    if blocked_readmission:
+        branch = f"work/issue-{number}-delivery"
+        pr_number = gh.find_branch_pr(branch)
+        if pr_number is None:
+            raise WorkflowError("blocked pre-publication job requires separate recovery")
+        reviewed_pr = gh.pr(pr_number)
+        _require_pr(gh, reviewed_pr, cfg, branch=branch, number=pr_number,
+                    state_name="OPEN")
+        if (not reviewed_pr.get("isDraft")
+                or re.findall(r"(?im)\bCloses\s+#(\d+)\b",
+                              reviewed_pr.get("body") or "") != [str(number)]
+                or not re.fullmatch(r"[0-9a-f]{40}",
+                                    reviewed_pr.get("headRefOid") or "")):
+            raise WorkflowError("blocked PR lacks an exact draft HEAD")
+        scope = hashlib.sha256(json.dumps(
+            spec.allowed_paths, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        prior_scopes = []
+        for comment in gh.comments(number):
+            if comment.get("user", {}).get("login") != cfg.maintainer:
+                continue
+            first = (comment.get("body") or "").splitlines()[0:1]
+            match = re.fullmatch(
+                rf"SEMI_ADMIT issue={number} body=[0-9a-f]{{64}} "
+                r"scope=([0-9a-f]{64})(?: tier=(?:easy|medium|hard) "
+                r"route=route:[a-z][a-z0-9_-]{0,39} profile=[0-9a-f]{64})?",
+                first[0]) if first else None
+            if match:
+                prior_scopes.append(match.group(1))
+        if not prior_scopes or any(previous != scope for previous in prior_scopes):
+            raise WorkflowError("blocked PR allowed paths changed")
+    with state.connect(cfg.state_dir) as conn:
+        existing = state.job(conn, number)
+        if existing and not (blocked_readmission and existing["status"] == "blocked"
+                             and existing["pr"] == reviewed_pr["number"]
+                             and existing["head_sha"] == reviewed_pr["headRefOid"]):
+            raise WorkflowError("issue already has a job")
+        if (existing and blocked_readmission
+                and tuple(json.loads(existing["allowed_json"])) != spec.allowed_paths):
+            raise WorkflowError("blocked PR allowed paths changed")
+    if cfg.complexity_profiles:
+        if complexity not in cfg.complexity_profiles:
+            raise WorkflowError("admit requires a configured --complexity tier")
+        try:
+            _profile_sha(cfg, complexity, _route_key(issue))
+        except ValueError as exc:
+            raise WorkflowError("configured complexity has no eligible route") from exc
+        old = _complexity_key(issue)
+        if old is not None and old != f"complexity:{complexity}":
+            gh.label(number, add=f"complexity:{complexity}", remove=old)
+            issue = gh.issue(number)
+        elif old is None:
+            if any(name.startswith("complexity:") for name in labels(issue)):
+                raise WorkflowError("conflicting complexity labels")
+            gh.label(number, add=f"complexity:{complexity}", remove="")
+            issue = gh.issue(number)
+    elif complexity is not None:
+        raise WorkflowError("--complexity requires complexity_profiles")
+    names = labels(issue)
+    marker = _admission_marker(number, spec, cfg, issue)
     already_ready = "state:ready" in names
-    if already_ready and not _approved_on_github(gh, cfg, number, spec):
+    if already_ready and not cfg.complexity_profiles and not _approved_on_github(gh, cfg, number, spec):
         raise WorkflowError("ready issue lacks the matching maintainer approval")
     with state.connect(cfg.state_dir) as conn:
-        if state.job(conn, number):
+        existing = state.job(conn, number)
+        if existing and not (blocked_readmission and existing["status"] == "blocked"
+                             and existing["pr"] == reviewed_pr["number"]
+                             and existing["head_sha"] == reviewed_pr["headRefOid"]):
             raise WorkflowError("issue already has a job")
-        conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
-                     "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha, "
-                     "allowed_json=excluded.allowed_json",
-                     (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
-        state.event(conn, number, "admitted")
-    if not _approved_on_github(gh, cfg, number, spec):
-        gh.comment(number, _admission_marker(number, spec) +
+        if not blocked_readmission:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
+                         "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha, "
+                         "allowed_json=excluded.allowed_json",
+                         (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
+            state.event(conn, number, "admitted")
+    if blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
+        gh.comment(number, marker +
                    "\n\nApproved for the scoped worker queue.")
-    if not already_ready:
+    if not already_ready and not blocked_readmission:
         gh.label(number, add="state:ready", remove="state:proposed")
-    return {"issue": number, "allowed_paths": spec.allowed_paths, "body_sha256": spec.body_sha256}
+    return {"issue": number, "allowed_paths": spec.allowed_paths,
+            "body_sha256": spec.body_sha256,
+            **({"complexity": complexity} if complexity is not None else {})}
 
 
 def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
@@ -803,15 +946,24 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
             spec = None
         try:
             approved_on_github = (spec is not None and
-                                  _approved_on_github(gh, cfg, row["issue"], spec))
+                                  _approved_on_github(gh, cfg, row["issue"], spec,
+                                                      issue))
         except GitHubError:
             conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                          (now + 60, row["issue"]))
             continue
         expected_state = "state:blocked" if row["status"] == "blocked" else "state:in-progress"
-        if (spec is None or approved is None or approved["body_sha"] != spec.body_sha256
-                or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+        needs_readmission = (spec is not None and
+                             (approved is None or approved["body_sha"] != spec.body_sha256
+                              or not _job_complexity_matches(cfg, issue, row)
+                              or cfg.complexity_profiles and row["status"] == "blocked"))
+        if (spec is None or
+                tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+                or (approved is not None and
+                    tuple(json.loads(approved["allowed_json"])) != spec.allowed_paths)
                 or not approved_on_github
+                or needs_readmission and not
+                (cfg.complexity_profiles and row["status"] == "blocked")
                 or not {"queue:worker", expected_state}.issubset(labels(issue))):
             conn.execute("UPDATE jobs SET status='blocked',error='Issue approval changed',reason_code=NULL "
                          "WHERE issue=?", (row["issue"],))
@@ -849,6 +1001,59 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                              (now + 60, row["issue"]))
                 break
+            if needs_readmission:
+                marker = _admission_marker(row["issue"], spec, cfg, issue)
+                created = pr.get("createdAt")
+                approval_ids = [
+                    item.get("id") for item in gh.comments(row["issue"])
+                    if (item.get("body") or "").splitlines()[0:1] == [marker]
+                    and item.get("user", {}).get("login") == cfg.maintainer
+                    and type(item.get("id")) is int
+                    and type(created) is str and
+                    re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", created)
+                    and type(item.get("created_at")) is str
+                    and item["created_at"] > created
+                    and item["id"] > row["last_request"]]
+                if not approval_ids or comment["id"] <= max(approval_ids):
+                    continue
+                key = _complexity_key(issue)
+                tier = key.removeprefix("complexity:") if key else None
+                route = _route_key(issue)
+                if tier not in cfg.complexity_profiles or route is None:
+                    continue
+                digest = _profile_sha(cfg, tier, route)
+                fresh_issue = gh.issue(row["issue"])
+                fresh_pr = gh.pr(row["pr"])
+                if (parse_issue(fresh_issue.get("body") or "").body_sha256
+                        != spec.body_sha256
+                        or not {"queue:worker", "state:blocked"}.issubset(
+                            labels(fresh_issue))
+                        or _route_key(fresh_issue) != route
+                        or _complexity_key(fresh_issue) != key
+                        or not _approved_on_github(
+                            gh, cfg, row["issue"], spec, fresh_issue)):
+                    continue
+                _require_pr(gh, fresh_pr, cfg, branch=row["branch"],
+                            number=row["pr"], head_sha=row["head_sha"])
+                if (fresh_pr["state"] != "OPEN"
+                        or fresh_pr["headRefOid"] != row["head_sha"]
+                        or fresh_pr.get("isDraft") is not True):
+                    continue
+                conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) "
+                             "VALUES(?,?,?) ON CONFLICT(issue) DO UPDATE SET "
+                             "body_sha=excluded.body_sha,allowed_json=excluded.allowed_json",
+                             (row["issue"], spec.body_sha256,
+                              json.dumps(spec.allowed_paths)))
+                updated = conn.execute(
+                    "UPDATE jobs SET route_key=?,complexity=?,profile_sha=?,"
+                    "updated_at=CURRENT_TIMESTAMP WHERE issue=? AND "
+                    "status='blocked' AND pr=? AND head_sha=?",
+                    (route, tier, digest, row["issue"], row["pr"],
+                     row["head_sha"]))
+                if updated.rowcount != 1:
+                    raise WorkflowError("blocked PR identity changed during readmission")
+                state.event(conn, row["issue"], "readmitted",
+                            complexity=tier, head_sha=row["head_sha"])
             rebase_only = bool(REBASE_ONLY.search(comment.get("body") or ""))
             provider = None if rebase_only else _route_provider(conn, cfg, issue, reserved or {})
             if provider is None and not rebase_only:
@@ -921,10 +1126,13 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                      (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
         base = main_sha(gh, cfg)
         branch = f"work/issue-{number}-delivery"
-        conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,route_key) "
-                     "VALUES(?,?,?,?,?,?)",
+        tier_key = _complexity_key(issue) if cfg.complexity_profiles else None
+        tier = tier_key.removeprefix("complexity:") if tier_key else None
+        conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,route_key,"
+                     "complexity,profile_sha) VALUES(?,?,?,?,?,?,?,?)",
                      (number, branch, base, "running", json.dumps(spec.allowed_paths),
-                      _route_key(issue)))
+                      _route_key(issue), tier,
+                      _profile_sha(cfg, tier, _route_key(issue)) if tier else None))
         state.event(conn, number, "claimed")
         conn.commit()  # The local intent must exist before the external label write.
         gh.label(number, add="state:in-progress", remove="state:ready")
@@ -936,7 +1144,18 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
     return None
 
 
-def _rebuild_published_evidence(cfg: Config, row, pr: dict) -> dict:
+def _last_selected_effort(conn: sqlite3.Connection | None, row) -> str | None:
+    if conn is None or _row_complexity(row) is None:
+        return None
+    selected = conn.execute(
+        "SELECT effort FROM events WHERE issue=? AND kind='model_selected' "
+        "AND model=? ORDER BY id DESC LIMIT 1",
+        (row["issue"], row["last_model"])).fetchone()
+    return selected["effort"] if selected else None
+
+
+def _rebuild_published_evidence(cfg: Config, row, pr: dict,
+                                *, conn: sqlite3.Connection | None = None) -> dict:
     """Rerun checks on an exact local commit after an acknowledged PR write was lost."""
     if not row["image_id"] or published_image_id(pr.get("body") or "") != row["image_id"]:
         raise WorkflowError("published PR image differs from recorded execution image")
@@ -974,10 +1193,12 @@ def _rebuild_published_evidence(cfg: Config, row, pr: dict) -> dict:
             _remove_checkout(cfg, checkout)
     return {"issue": row["issue"], "pr": pr["number"], "branch": row["branch"],
             "head": local_head, "base": base, "paths": paths, "ci": proof,
-            "model": row["last_model"]}
+            "model": row["last_model"],
+            "effort": _last_selected_effort(conn, row),
+            "complexity": _row_complexity(row)}
 
 
-def _published_evidence_matches(proof: dict, row, pr: dict,
+def _published_evidence_matches(conn: sqlite3.Connection, proof: dict, row, pr: dict,
                                 spec: IssueSpec, *, rebuilt: bool = False) -> bool:
     """Bind a saved record to the current admission and complete live PR."""
     if (pr.get("changedFiles") != len(pr.get("files", []))
@@ -994,6 +1215,9 @@ def _published_evidence_matches(proof: dict, row, pr: dict,
             and proof.get("body_sha256") == spec.body_sha256
             and (proof.get("model") in (None, row["last_model"])
                  or rebuilt and isinstance(proof.get("model"), str))
+            and (_row_complexity(row) is None or
+                 (proof.get("complexity") == _row_complexity(row)
+                  and proof.get("effort") == _last_selected_effort(conn, row)))
             and isinstance(proof.get("ci"), dict)
             and proof["ci"].get("result") == "passed"
             and row["image_id"] is not None
@@ -1003,7 +1227,8 @@ def _published_evidence_matches(proof: dict, row, pr: dict,
 
 
 def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
-                                 issue: dict, spec: IssueSpec, remote: str) -> dict:
+                                 issue: dict, spec: IssueSpec, remote: str,
+                                 *, conn: sqlite3.Connection | None = None) -> dict:
     """Publish a checked local commit when push succeeded but its reply was lost."""
     match = re.fullmatch(r"([0-9a-f]{40})\s+refs/heads/" + re.escape(row["branch"]),
                          remote.strip())
@@ -1037,8 +1262,10 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
     finally:
         if checkout.exists():
             _remove_checkout(cfg, checkout)
-    if (parse_issue(gh.issue(row["issue"]).get("body") or "").body_sha256 != spec.body_sha256
-            or not _approved_on_github(gh, cfg, row["issue"], spec)
+    fresh_issue = gh.issue(row["issue"])
+    if (parse_issue(fresh_issue.get("body") or "").body_sha256 != spec.body_sha256
+            or not _approved_on_github(gh, cfg, row["issue"], spec, fresh_issue)
+            or not _job_complexity_matches(cfg, fresh_issue, row)
             or main_sha(gh, cfg) != row["base_sha"]):
         raise WorkflowError("orphan branch approval or base changed")
     if cfg.publish_repo:
@@ -1074,6 +1301,8 @@ def _recover_unacknowledged_push(gh: GitHub, cfg: Config, row,
     return {"issue": row["issue"], "pr": number, "branch": row["branch"],
             "head": head, "base": row["base_sha"], "paths": paths,
             "ci": proof, "model": row["last_model"],
+            "effort": _last_selected_effort(conn, row),
+            "complexity": _row_complexity(row),
             "body_sha256": spec.body_sha256}
 
 
@@ -1111,6 +1340,7 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
             if (approved is None or approved["body_sha"] != spec.body_sha256
                     or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
                     or not _approved_on_github(gh, cfg, row["issue"], spec)
+                    or not _job_complexity_matches(cfg, issue, row)
                     or "queue:worker" not in labels(issue)
                     or not ({"state:ready", "state:in-progress"} & labels(issue))):
                 raise WorkflowError("interrupted job identity changed")
@@ -1188,10 +1418,10 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 if evidence.is_file():
                     proof = read_evidence(evidence)
                 if not evidence.is_file() or not _published_evidence_matches(
-                        proof, row, pr, spec):
-                    proof = _rebuild_published_evidence(cfg, row, pr)
+                        conn, proof, row, pr, spec):
+                    proof = _rebuild_published_evidence(cfg, row, pr, conn=conn)
                     proof["body_sha256"] = spec.body_sha256
-                    if not _published_evidence_matches(proof, row, pr, spec,
+                    if not _published_evidence_matches(conn, proof, row, pr, spec,
                                                        rebuilt=True):
                         raise WorkflowError("published branch lacks matching evidence")
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1217,13 +1447,15 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                 if leftover is not None:
                     _remove_checkout(cfg, leftover)
                 conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,"
-                             "error=NULL,reason_code=NULL,result_model=?,updated_at=CURRENT_TIMESTAMP "
+                             "error=NULL,reason_code=NULL,result_model=?,result_effort=?,updated_at=CURRENT_TIMESTAMP "
                              "WHERE issue=?",
                              (pr["headRefOid"], proof.get("base", row["base_sha"]),
-                              pr_number, proof.get("model"), row["issue"]))
+                              pr_number, proof.get("model"), proof.get("effort"),
+                              row["issue"]))
                 conn.execute("DELETE FROM retry_state WHERE issue=?", (row["issue"],))
                 state.event(conn, row["issue"], "awaiting_review",
-                            model=proof.get("model"), head_sha=pr["headRefOid"])
+                            model=proof.get("model"), effort=proof.get("effort"),
+                            head_sha=pr["headRefOid"])
                 continue
             elif row["status"] == "correcting":
                 raise WorkflowError("correction PR disappeared")
@@ -1257,7 +1489,8 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     if match is None:
                         raise WorkflowError("orphan branch requires inspection")
                     leftover = _verify_leftover_checkout(cfg, row, match.group(1))
-                    proof = _recover_unacknowledged_push(gh, cfg, row, issue, spec, remote)
+                    proof = _recover_unacknowledged_push(
+                        gh, cfg, row, issue, spec, remote, conn=conn)
                     evidence = (cfg.state_dir / "evidence" / str(row["issue"])
                                 / f"{proof['head']}.json")
                     evidence.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1265,13 +1498,14 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
                     if leftover is not None:
                         _remove_checkout(cfg, leftover)
                     conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,"
-                                 "pr=?,error=NULL,reason_code=NULL,result_model=?,updated_at=CURRENT_TIMESTAMP "
+                                 "pr=?,error=NULL,reason_code=NULL,result_model=?,result_effort=?,updated_at=CURRENT_TIMESTAMP "
                                  "WHERE issue=?",
                                  (proof["head"], proof["base"], proof["pr"],
-                                  proof["model"], row["issue"]))
+                                  proof["model"], proof.get("effort"), row["issue"]))
                     conn.execute("DELETE FROM retry_state WHERE issue=?", (row["issue"],))
                     state.event(conn, row["issue"], "awaiting_review",
-                                model=proof["model"], head_sha=proof["head"])
+                                model=proof["model"], effort=proof.get("effort"),
+                                head_sha=proof["head"])
                     continue
                 if row["status"] == "retry_wait":
                     checkout = cfg.workspace / "jobs" / f"issue-{row['issue']}"
@@ -1319,7 +1553,14 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
     if spec.body_sha256 != parse_issue(current.get("body") or "").body_sha256:
         raise WorkflowError("issue changed after admission")
     with state.connect(cfg.state_dir) as conn:
-        cohort = state.job(conn, issue)["route_key"]
+        job_row = state.job(conn, issue)
+        cohort = job_row["route_key"]
+    if cfg.complexity_profiles:
+        if (not _job_complexity_matches(cfg, current, job_row)
+                or not _approved_on_github(gh, cfg, issue, spec)):
+            raise WorkflowError("approved complexity changed after claim")
+    elif job_row["complexity"] is not None:
+        raise WorkflowError("complexity profile unavailable for existing job")
     if cohort is not None and _route_key(current) != cohort:
         raise WorkflowError("provider route changed after claim")
     routed_models = _routed_models(cfg, current)
@@ -1399,6 +1640,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                                   else "no_eligible")
                         state.event(conn, issue, "route_decision",
                                     model=candidate.ref if candidate else None,
+                                    effort=candidate.effort if candidate else None,
+                                    complexity=job_row["complexity"],
                                     policy_version=1, eligible=decision["eligible"],
                                     decision_reason=reason)
                     if candidate is None:
@@ -1407,7 +1650,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                     begun = False
                     try:
                         with state.connect(cfg.state_dir) as conn:
-                            state.event(conn, issue, "model_selected", model=candidate.ref)
+                            state.event(conn, issue, "model_selected", model=candidate.ref,
+                                        effort=candidate.effort)
                             conn.execute("UPDATE jobs SET last_model=?,attempts_count=attempts_count+1 "
                                          "WHERE issue=?", (candidate.ref, issue))
                             state.begin_attempt(conn, lease_id, issue,
@@ -1505,6 +1749,7 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         if (parse_issue(latest.get("body") or "").body_sha256 != spec.body_sha256
                 or not {"queue:worker", "state:in-progress"}.issubset(labels(latest))
                 or not _approved_on_github(gh, cfg, issue, spec)
+                or not _job_complexity_matches(cfg, latest, job_row)
                 or _routed_models(cfg, latest) != routed_models
                 or (cohort is not None and _route_key(latest) != cohort)):
             raise WorkflowError("issue approval or provider route changed during execution")
@@ -1570,6 +1815,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                   "base": base,
                   "paths": paths, "ci": proof,
                   "model": used_model.ref if used_model else None,
+                  "effort": used_model.effort if used_model else None,
+                  "complexity": job_row["complexity"],
                   "body_sha256": spec.body_sha256}
         evidence = cfg.state_dir / "evidence" / str(issue)
         evidence.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1633,6 +1880,7 @@ def run_once(cfg: Config) -> list[dict]:
                             if (approved is None or approved["body_sha"] != spec.body_sha256
                                     or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
                                     or not _approved_on_github(gh, cfg, claim.issue, spec)
+                                    or not _job_complexity_matches(cfg, issue, row)
                                     or not {"queue:worker", "state:in-progress"}.issubset(labels(issue))):
                                 raise WorkflowError("retry identity changed")
                             note = None
@@ -1718,16 +1966,21 @@ def run_once(cfg: Config) -> list[dict]:
                 result_model = (current_job["result_model"]
                                 if pr is not None and note and REBASE_ONLY.search(note)
                                 else result.get("model"))
+                result_effort = (current_job["result_effort"]
+                                 if pr is not None and note and REBASE_ONLY.search(note)
+                                 else result.get("effort"))
                 result["model"] = result_model
+                result["effort"] = result_effort
                 with state.connect(cfg.state_dir) as conn:
-                    conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,error=NULL,reason_code=NULL,result_model=?,"
+                    conn.execute("UPDATE jobs SET status='awaiting_review',head_sha=?,base_sha=?,pr=?,error=NULL,reason_code=NULL,result_model=?,result_effort=?,"
                                  "updated_at=CURRENT_TIMESTAMP WHERE issue=?",
                                  (result["head"], result.get("base", expected_base),
-                                  result["pr"], result_model, number))
+                                  result["pr"], result_model, result_effort, number))
                     if retry_claim:
                         complete_claim(conn, retry_claim)
                     state.event(conn, number, "awaiting_review",
-                                model=result_model, head_sha=result["head"])
+                                model=result_model, effort=result_effort,
+                                head_sha=result["head"])
                 return result
             except Exception as exc:
                 with state.connect(cfg.state_dir) as conn:

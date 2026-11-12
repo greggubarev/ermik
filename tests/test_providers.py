@@ -60,6 +60,16 @@ class ProviderTests(unittest.TestCase):
         record_exhaustion(self.conn, accounts[0], 1100, now=1000)
         self.assertEqual(choose_model(self.conn, accounts, now=1001), accounts[1])
 
+    def test_legacy_spec_omits_new_options_for_pinned_worker(self):
+        legacy = json.loads(model_spec(KIMI))
+        self.assertEqual(set(legacy), {"provider_id", "model_id", "credential_env",
+                                       "base_url", "package", "max_parallel"})
+        selected = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY",
+                                  effort="low", supported_efforts=("low",))
+        profiled = json.loads(model_spec(selected))
+        self.assertEqual((profiled["effort"], profiled["supported_efforts"]),
+                         ("low", ["low"]))
+
     def test_custom_account_rejects_unsafe_specs(self):
         for url in ("http://api.example.net/v1", "https://user:pass@api.example.net/v1",
                     "https://api.example.net/v1?key=x", "https://localhost/v1",
@@ -225,6 +235,20 @@ class ProviderTests(unittest.TestCase):
                          {"options": {"apiKey": "go-test-secret"}})
         self.assertEqual(kimi["permission"]["bash"], "deny")
         self.assertEqual(go["permission"]["external_directory"], "deny")
+
+    def test_worker_defines_selected_effort_variant(self):
+        worker = runpy.run_path(str(Path(__file__).resolve().parents[1] /
+                                    "examples" / "opencode-worker.py"))
+        for provider, model, env in (("kimi-code", "k3-256k", "KIMI_CODE_API_KEY"),
+                                     ("opencode-go", "kimi-k3", "OPENCODE_GO_API_KEY")):
+            candidate = ModelCandidate(provider, model, env, effort="low",
+                                       supported_efforts=("low",))
+            with self.subTest(provider=provider), patch.dict(os.environ, {env: "test-key"}):
+                configured = worker["_config"](candidate)["provider"][provider]
+                self.assertEqual(configured["models"][model]["variants"]["low"],
+                                 {"reasoningEffort": "low"})
+                self.assertEqual(opencode_command(candidate, "Task")[4:6],
+                                 ("--variant", "low"))
 
     def test_worker_requires_valid_custom_spec_and_ref_match(self):
         worker = runpy.run_path(str(Path(__file__).resolve().parents[1] /

@@ -110,6 +110,21 @@ class EvidenceTransportTests(unittest.TestCase):
         self.assertTrue(self.gh.rows[0]["body"].startswith(MARKER))
         self.assertEqual(record["image_config_digest"], CONFIG_DIGEST)
 
+    def test_v3_delivery_keeps_tier_and_redacts_model_and_effort(self):
+        fields = {key: value for key, value in manifest().items()
+                  if key not in ("version", "sha256")}
+        self.exported = make_manifest(**fields, complexity="easy",
+                                      profile_sha256="a" * 64, effort="low")
+        with patch("ermik.evidence_transport.export_manifest",
+                   return_value=self.exported):
+            self.assertEqual(publish_manifest(self.cfg, 12)["status"], "published")
+        record = _record(self.gh.rows[0]["body"])
+        self.assertEqual(record["version"], 3)
+        self.assertEqual(record["complexity"], "easy")
+        self.assertIsNone(record["model"])
+        self.assertIsNone(record["effort"])
+        self.assertEqual(record["unknowns"], ["effort", "model", "usage"])
+
     def test_v1_comment_remains_parseable_as_history(self):
         legacy = legacy_manifest()
         body = _body(legacy)
@@ -177,7 +192,7 @@ class EvidenceTransportTests(unittest.TestCase):
             fetch_manifest(self.cfg, 12)
 
     def test_future_marker_from_pinned_publisher_is_unsupported(self):
-        body = "Ermik evidence v3\n\n```json\n{}\n```"
+        body = "Ermik evidence v4\n\n```json\n{}\n```"
         self.gh.rows.append({"id": 1, "body": body,
                              "user": {"login": "publisher", "id": 99}})
         self.assertEqual(fetch_manifest(self.cfg, 12), ({"status": "missing"}, None))
@@ -186,7 +201,7 @@ class EvidenceTransportTests(unittest.TestCase):
             _published_records(self.cfg, self.gh, 12)
         self.assertEqual(fetch_manifest(self.cfg, 12),
                          ({"status": "unsupported_version"}, None))
-        for marker in ("Ermik evidence v3", "Ermik evidence v01"):
+        for marker in ("Ermik evidence v4", "Ermik evidence v01"):
             with self.subTest(marker=marker):
                 self.gh.rows[0]["body"] = marker
                 self.assertEqual(fetch_manifest(self.cfg, 12),

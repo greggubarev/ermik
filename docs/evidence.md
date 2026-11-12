@@ -16,6 +16,8 @@ Export checks the controller's private exact-HEAD check record before creating t
 
 Version 2 is canonical UTF-8 JSON with sorted keys, compact separators, ASCII escapes, and one trailing newline. `sha256` hashes the canonical object without its own `sha256` field. The file is limited to 16 KiB. Required fields are `version`, `repo`, `head_repository`, `issue`, `pr`, `branch`, `base`, `head`, `body_sha256`, `scope_sha256`, `checks_sha256`, `paths`, `checks`, `image`, `image_config_digest`, `model`, `attempts`, `usage`, `unknowns`, and `sha256`. `image` retains the publisher's local execution ID; `image_config_digest` is the SHA-256 of the raw image config bytes. Each check contains its index, pass result, and private-log digest; the ordered commands are represented by `checks_sha256`. Missing usage is marked `unknown`, never zero. The file excludes the issue body, credentials, raw logs, task output, and local file paths. Its digest detects accidental or unsophisticated changes, but anyone who can edit the file can recompute the digest. The controller that produced it remains trusted.
 
+With approved complexity profiles, export uses version 3 and additionally records `complexity`, `profile_sha256`, and the actual selected `effort` alongside `model`. Verification checks the current approved tier, effective profile, and model/effort pair. Version 2 remains the format for installations without profiles.
+
 Historical version 1 records remain parseable, but current verification returns `stale` with `image_identity_missing` because they lack the config digest. The checked-in synthetic [H1](../tests/fixtures/evidence/h1.v1.json) and [corrected H2](../tests/fixtures/evidence/h2.v1.json) records preserve version 1 bytes for compatibility checks; neither can establish current image identity. Unknown versions fail explicitly with `unsupported manifest version`. Validation also rejects duplicate keys, changed digests, oversized records, and local private paths.
 
 ## GitHub delivery
@@ -32,7 +34,7 @@ python3 -m ermik --config config.json fetch-evidence PR_NUMBER --output /private
 
 Comment scanning stops after 1,000 timeline comments and reports an error rather than silently overlooking an older record. For a PR beyond that limit, use the manual file export and verification commands above.
 
-The comment carries a canonical version 2 record with the execution-model identifier withheld; the corresponding field is `null` and listed in `unknowns`. The controller keeps the full local record. The comment contains no raw logs, issue text, credentials, or local paths. Manual `export-evidence` and `verify-evidence` remain available when comment delivery is not configured.
+The comment carries a canonical version 2 or 3 record. It withholds the execution model; version 3 also withholds effort. These fields are `null` and listed in `unknowns`, while the approved tier and profile digest remain visible. The controller keeps the full local record. The comment contains no raw logs, issue text, credentials, or local paths. Manual `export-evidence` and `verify-evidence` remain available when comment delivery is not configured.
 
 ## Review packet
 

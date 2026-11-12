@@ -556,6 +556,7 @@ class GitHub:
         return {"number": raw["number"],
                 "state": "MERGED" if raw.get("merged_at") else raw["state"].upper(),
                 "isDraft": raw["draft"],
+                "createdAt": raw.get("created_at"),
                 "baseRefName": base["ref"], "baseRefOid": base["sha"],
                 "headRefName": head["ref"], "headRefOid": head["sha"],
                 "headRepository": {"nameWithOwner": head_repo.get("full_name")},

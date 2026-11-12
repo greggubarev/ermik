@@ -160,7 +160,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     evidence = {"status": status}
     if status == "current" and record is not None:
         manifest_identity = {
-            "version": 2,
+            "version": 3 if cfg.complexity_profiles else 2,
             "repo": cfg.repo, "issue": issue, "pr": pr_number,
             "head_repository": cfg.publish_repo or cfg.repo,
             "branch": pr["headRefName"], "base": pr["baseRefOid"],
@@ -190,7 +190,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
         reason = fetched.get("reason")
         if reason in {"head_changed", "identity_changed", "remote_identity",
                       "image_unavailable", "image_changed", "image_identity_missing",
-                      "invalid_record"}:
+                      "invalid_record", "complexity_changed"}:
             evidence["reason"] = reason
         prior = fetched.get("head")
         if (packet["previous_head"] is None and isinstance(prior, str)

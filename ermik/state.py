@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   review_next_check_at INTEGER NOT NULL DEFAULT 0,
   image_id TEXT,
   reason_code TEXT CHECK(reason_code IN ('provider_auth','provider_quota','local_check_failed','broker_unavailable','publication_unconfirmed','publish_credential_unavailable')),
-  route_key TEXT
+  route_key TEXT,
+  complexity TEXT,
+  profile_sha TEXT,
+  result_effort TEXT
 );
 CREATE TABLE IF NOT EXISTS retry_state (
   issue INTEGER PRIMARY KEY REFERENCES jobs(issue),
@@ -49,7 +52,9 @@ CREATE TABLE IF NOT EXISTS events (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   policy_version INTEGER,
   eligible_json TEXT,
-  decision_reason TEXT
+  decision_reason TEXT,
+  effort TEXT,
+  complexity TEXT
 );
 CREATE INDEX IF NOT EXISTS events_issue_id ON events(issue,id);
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -74,18 +79,19 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _TABLE_COLUMNS = {
     "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
     "jobs": {"issue", "branch", "base_sha", "head_sha", "pr", "status",
              "allowed_json", "last_request", "error", "updated_at", "last_model",
              "result_model", "attempts_count", "review_next_check_at", "image_id",
-             "reason_code", "route_key"},
+             "reason_code", "route_key", "complexity", "profile_sha", "result_effort"},
     "retry_state": {"issue", "attempts", "category", "resume_status",
                     "next_retry_at", "lease_token", "lease_expires_at", "failure_id"},
     "events": {"id", "issue", "kind", "model", "head_sha", "created_at",
-               "policy_version", "eligible_json", "decision_reason"},
+               "policy_version", "eligible_json", "decision_reason", "effort",
+               "complexity"},
     "usage_events": {"attempt_id", "issue", "provider_id", "model_id", "complete",
                      "input_tokens", "output_tokens", "reasoning_tokens",
                      "cache_read_tokens", "cache_write_tokens", "total_tokens",
@@ -114,7 +120,8 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
 
 def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
                      v1: bool = False, v2: bool = False,
-                     v3: bool = False, v4: bool = False) -> None:
+                     v3: bool = False, v4: bool = False,
+                     v5: bool = False) -> None:
     tables, indexes = _schema_objects(conn)
     if (not set(_TABLE_COLUMNS).issubset(tables)
             or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
@@ -126,16 +133,21 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
         if table in reference:
             expected = reference[table]
             if table == "jobs":
-                if preview and len(actual) in (len(expected) - 3, len(expected) - 2):
+                if preview and len(actual) in (len(expected) - 6, len(expected) - 5):
                     expected = expected[:len(actual)]
                 elif v1:
-                    expected = expected[:-2]
+                    expected = expected[:-5]
                 elif v2 or v3:
-                    expected = expected[:-1]
+                    expected = expected[:-4]
+                elif v4 or v5:
+                    expected = expected[:-3]
             elif table == "usage_events" and (preview or v1 or v2 or v3):
                 expected = expected[:-3]
-            elif table == "events" and (preview or v1 or v2 or v3 or v4):
-                expected = expected[:-3]
+            elif table == "events":
+                if preview or v1 or v2 or v3 or v4:
+                    expected = expected[:-5]
+                elif v5:
+                    expected = expected[:-2]
             if actual != expected:
                 raise ValueError("unknown or incomplete SQLite state schema")
         elif table == "provider_leases":
@@ -233,6 +245,8 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
     jobs_ddl = next(statement.strip() for statement in SCHEMA.split(";")
                     if statement.lstrip().startswith("CREATE TABLE IF NOT EXISTS jobs ("))
     jobs_ddl = jobs_ddl.replace(",\n  route_key TEXT", "")
+    jobs_ddl = jobs_ddl.replace(",\n  complexity TEXT", "").replace(
+        ",\n  profile_sha TEXT", "").replace(",\n  result_effort TEXT", "")
     conn.execute(jobs_ddl.replace("CREATE TABLE IF NOT EXISTS jobs (",
                                   "CREATE TABLE jobs_v3 (", 1))
     names = ",".join(columns)
@@ -265,6 +279,17 @@ def _migrate_v4(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE provider_leases ADD COLUMN reserved_cost REAL NOT NULL DEFAULT 0")
 
 
+def _migrate_v5(conn: sqlite3.Connection) -> None:
+    # The v5 event columns are already present; v6 only adds profile fields.
+    for statement in (
+            "ALTER TABLE jobs ADD COLUMN complexity TEXT",
+            "ALTER TABLE jobs ADD COLUMN profile_sha TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_effort TEXT",
+            "ALTER TABLE events ADD COLUMN effort TEXT",
+            "ALTER TABLE events ADD COLUMN complexity TEXT"):
+        conn.execute(statement)
+
+
 def initialize(root: Path) -> Path:
     if root.is_symlink():
         raise ValueError("state_dir cannot be a symlink")
@@ -291,7 +316,7 @@ def initialize(root: Path) -> Path:
         elif version == 1:
             _validate_schema(conn, v1=True)
             _migrate_v1(conn)
-        elif version in (2, 3, 4):
+        elif version in (2, 3, 4, 5):
             pass
         elif version != SCHEMA_VERSION:
             raise ValueError(f"unsupported SQLite state schema version: {version}")
@@ -304,6 +329,9 @@ def initialize(root: Path) -> Path:
         if version in (0, 1, 2, 3, 4) and not fresh:
             _validate_schema(conn, v4=True)
             _migrate_v4(conn)
+        if version in (0, 1, 2, 3, 4, 5) and not fresh:
+            _validate_schema(conn, v5=True)
+            _migrate_v5(conn)
         _validate_schema(conn)
         if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -387,11 +415,13 @@ def jobs(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 def event(conn: sqlite3.Connection, issue: int, kind: str, *,
           model: str | None = None, head_sha: str | None = None,
+          effort: str | None = None,
+          complexity: str | None = None,
           policy_version: int | None = None,
           eligible: tuple[str, ...] | list[str] | None = None,
           decision_reason: str | None = None) -> None:
     if type(issue) is not int or issue <= 0 or kind not in {
-            "admitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
+            "admitted", "readmitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
             "quota_paused", "checks_passed", "pr_published", "awaiting_review", "blocked",
             "correction_started", "merged", "evidence_delivered",
             "route_decision"}:
@@ -411,11 +441,15 @@ def event(conn: sqlite3.Connection, issue: int, kind: str, *,
             raise ValueError("invalid route decision")
     elif any(value is not None for value in (policy_version, eligible, decision_reason)):
         raise ValueError("route metadata requires route_decision")
+    if effort not in (None, "low", "medium", "high", "max"):
+        raise ValueError("invalid event effort")
+    if complexity not in (None, "easy", "medium", "hard"):
+        raise ValueError("invalid event complexity")
     conn.execute("INSERT INTO events(issue,kind,model,head_sha,policy_version,"
-                 "eligible_json,decision_reason) VALUES(?,?,?,?,?,?,?)",
+                 "eligible_json,decision_reason,effort,complexity) VALUES(?,?,?,?,?,?,?,?,?)",
                  (issue, kind, model, head_sha, policy_version,
                   json.dumps(eligible, separators=(",", ":")) if eligible is not None else None,
-                  decision_reason))
+                  decision_reason, effort, complexity))
 
 
 def record_usage(conn: sqlite3.Connection, attempt_id: str, issue: int,
