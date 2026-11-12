@@ -2,7 +2,7 @@
 
 Ermik is a preview. Its immediate goal is a verifiable handoff: an admitted, path-scoped issue becomes one draft PR; a maintainer can request a correction on that PR, review its current HEAD, and explicitly merge it. The controller runs configured local checks without requiring GitHub Actions. The [release status](readiness.md) separates completed trials from open validation work, and the [security model](security.md) describes the trusted host and credential boundaries.
 
-Phases below are ordered by evidence needed, not by release date. The v0.2 milestone has no open Issues, but preview limitations remain. Portable evidence reached a separate read-scoped installation in v0.3, and a cross-store image review completed its documented trial. v0.4 and v0.5 describe planned work. Completion requires the stated observations in a disposable repository and relevant automated tests. A passing test or check establishes only the behavior it exercises.
+Phases below are ordered by evidence needed, not by release date. The v0.2 through v0.5 previews are published, but preview limitations remain. Portable evidence reached a separate read-scoped installation in v0.3, a cross-store image review completed its documented trial, and two non-demo project stacks completed the v0.5 handoff. Completion requires the stated observations in a disposable repository and relevant automated tests. A passing test or check establishes only the behavior it exercises.
 
 The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks recovery, credential isolation, image identity, upgrades and release gates. [v0.3.0](https://github.com/greggubarev/ermik/milestone/2) tracks portable evidence, review handoff, and actionable recovery; [v0.4.0](https://github.com/greggubarev/ermik/milestone/3) tracks measured routing; [v0.5.0](https://github.com/greggubarev/ermik/milestone/4) tracks optional operator experience and adoption trials. Closed Issues remain in their milestone as evidence of completed steps. Listing work here does not mark it complete.
 
@@ -48,7 +48,7 @@ The [v0.2.0 milestone](https://github.com/greggubarev/ermik/milestone/1) tracks 
 
 [#37](https://github.com/greggubarev/ermik/issues/37) adds distinct guidance in the CLI, read-only local status page, and maintainer review packet for a lost publication response, unavailable publication credential, stale review, failed check, provider authentication failure, and quota cooldown. An ambiguous write requires remote reconciliation, never an unverified retry. The optional full maintainer queue view remains separate [#18](https://github.com/greggubarev/ermik/issues/18) work for v0.5.
 
-## 5. v0.4: Measured routing and cost per accepted PR (planned)
+## 5. v0.4: Measured routing and cost per accepted PR (preview released)
 
 **Goal:** Compare configured routes using observed outcomes and resource use over complete PR cycles.
 
@@ -58,7 +58,7 @@ The [provider failure matrix](https://github.com/greggubarev/ermik/issues/6) cov
 
 **Acceptance:** Record attempts, retries, rate limits, elapsed time, usage observations, and accepted PR outcomes against issue and PR identities without mixing separate tasks. Report cost per accepted PR for a stated period and route, including failed and retried attempts in the numerator; report the measure as unavailable when no PR was accepted. Separate estimated usage or cost from billed amounts and show missing data explicitly. Compare at least two configured routes on the same documented task set, including a failure and a retry, before using the results to change routing defaults. A routing choice must not bypass admission, scope, checks, or maintainer review.
 
-## 6. v0.5: Optional user experience (planned)
+## 6. v0.5: Optional user experience (preview released)
 
 **Goal:** Make queue state and review evidence easier to inspect while retaining the existing command workflow.
 
@@ -76,6 +76,10 @@ This milestone binds an explicit approval to the auditable Issue-to-PR handoff a
 
 **Acceptance:** Verify allowed and exhausted profile routing, changed-approval rejection, and legacy behavior. For recovery, verify one safely resumed disposable job and one changed-branch rejection after restart, with no duplicate PR, replayed execution, or discarded work. Do not infer automatic classification or cost/quality calibration from manually approved tiers.
 
+## After v0.6: Candidate adoption work
+
+The next decision is whether new projects fail because their task instructions or local checks are incomplete. Review the two v0.5 integration records and one new installation before opening a milestone. If this is a repeated cause, extend the existing `doctor` command with a small, read-only check of the configured task image, check commands, and reviewer instructions. Keep those checks project-owned; do not add a second policy engine or a general agent workspace. Measure whether the preflight prevents an otherwise blocked Issue-to-PR run before treating it as a product feature.
+
 ## Outside the current claim
 
-Multiple controller hosts sharing one queue or state database are unsupported. Project correctness beyond configured checks and maintainer review is unverified. Provider authentication, quota, and timeout behavior has not been exercised for every compatible endpoint. Automated policy choices, official quota observations, and the optional maintainer view remain open work. The cross-store image trial covers the tested Docker versions and image, not every image format. These are explicit limits of the preview, not implied promises in the phases above.
+Multiple controller hosts sharing one queue or state database are unsupported. Project correctness beyond configured checks and maintainer review is unverified. Provider authentication, quota, and timeout behavior has not been exercised for every compatible endpoint. Automated policy choices and official quota observations remain open work. The optional maintainer view is available, but a live one-PR read currently takes about 20–26 seconds. The cross-store image trial covers the tested Docker versions and image, not every image format. These are explicit limits of the preview, not implied promises in the phases above.
