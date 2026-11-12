@@ -42,12 +42,14 @@ class InstallationSnapshotTests(unittest.TestCase):
         snapshot.backup(self.config, self.backup)
         with sqlite3.connect(self.state / "state.sqlite3") as db:
             db.execute("DELETE FROM jobs")
+        (self.state / "state.sqlite3-journal").write_text("stale journal")
         (self.state / "review.json").write_text("changed")
         (self.workspace / "checkout.txt").write_text("changed")
         snapshot.restore(self.config, self.backup)
         with sqlite3.connect(self.state / "state.sqlite3") as db:
             self.assertEqual(db.execute("SELECT * FROM jobs").fetchall(), [(7, 8)])
         self.assertEqual((self.state / "review.json").read_text(), "review-head")
+        self.assertFalse((self.state / "state.sqlite3-journal").exists())
         self.assertEqual((self.workspace / "checkout.txt").read_text(), "pending-work")
         preserved = self.workspace.with_name("workspace.post-upgrade-backup")
         self.assertEqual((preserved / "checkout.txt").read_text(), "changed")

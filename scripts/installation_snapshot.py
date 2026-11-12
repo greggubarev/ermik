@@ -12,7 +12,8 @@ from pathlib import Path
 
 
 MAX_SCHEMA = 6
-EXCLUDED_DB = {"state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm"}
+EXCLUDED_DB = {"state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm",
+               "state.sqlite3-journal"}
 
 
 def _digest(path):
