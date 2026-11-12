@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import socket
 import stat
 import subprocess
@@ -796,29 +797,42 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
         raise WorkflowError("only the configured maintainer can admit an issue")
     issue = gh.issue(number)
     names = labels(issue)
-    blocked_readmission = bool(cfg.complexity_profiles and "state:blocked" in names)
-    if blocked_readmission and ({"state:proposed", "state:ready",
-                                 "state:in-progress"} & names):
+    uncertain_prepublication = bool(
+        cfg.complexity_profiles and "state:in-progress" in names
+        and "state:blocked" not in names
+        and gh.find_branch_pr(f"work/issue-{number}-delivery") is None
+        and any(comment.get("user", {}).get("login") == cfg.maintainer
+                and len((comment.get("body") or "").splitlines()) > 1
+                and (comment.get("body") or "").splitlines()[1].startswith(
+                    f"ERMIK_READMIT issue={number} ")
+                for comment in gh.comments(number)))
+    blocked_readmission = bool(cfg.complexity_profiles and
+                               ("state:blocked" in names or uncertain_prepublication))
+    if blocked_readmission and ({"state:proposed", "state:ready"} & names
+                                or "state:blocked" in names
+                                and "state:in-progress" in names):
         raise WorkflowError("blocked issue has conflicting state labels")
     if ("queue:worker" not in names or
             not ({"state:proposed", "state:ready"} & names) and not blocked_readmission):
         raise WorkflowError("issue must be open and in the scoped worker queue")
     spec = parse_issue(issue.get("body") or "")
     reviewed_pr = None
+    prepublication = False
     if blocked_readmission:
         branch = f"work/issue-{number}-delivery"
         pr_number = gh.find_branch_pr(branch)
         if pr_number is None:
-            raise WorkflowError("blocked pre-publication job requires separate recovery")
-        reviewed_pr = gh.pr(pr_number)
-        _require_pr(gh, reviewed_pr, cfg, branch=branch, number=pr_number,
-                    state_name="OPEN")
-        if (not reviewed_pr.get("isDraft")
-                or re.findall(r"(?im)\bCloses\s+#(\d+)\b",
-                              reviewed_pr.get("body") or "") != [str(number)]
-                or not re.fullmatch(r"[0-9a-f]{40}",
-                                    reviewed_pr.get("headRefOid") or "")):
-            raise WorkflowError("blocked PR lacks an exact draft HEAD")
+            prepublication = True
+        else:
+            reviewed_pr = gh.pr(pr_number)
+            _require_pr(gh, reviewed_pr, cfg, branch=branch, number=pr_number,
+                        state_name="OPEN")
+            if (not reviewed_pr.get("isDraft")
+                    or re.findall(r"(?im)\bCloses\s+#(\d+)\b",
+                                  reviewed_pr.get("body") or "") != [str(number)]
+                    or not re.fullmatch(r"[0-9a-f]{40}",
+                                        reviewed_pr.get("headRefOid") or "")):
+                raise WorkflowError("blocked PR lacks an exact draft HEAD")
         scope = hashlib.sha256(json.dumps(
             spec.allowed_paths, separators=(",", ":"), ensure_ascii=False
         ).encode("utf-8")).hexdigest()
@@ -835,16 +849,19 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
             if match:
                 prior_scopes.append(match.group(1))
         if not prior_scopes or any(previous != scope for previous in prior_scopes):
-            raise WorkflowError("blocked PR allowed paths changed")
+            raise WorkflowError("blocked job allowed paths changed")
     with state.connect(cfg.state_dir) as conn:
         existing = state.job(conn, number)
         if existing and not (blocked_readmission and existing["status"] == "blocked"
-                             and existing["pr"] == reviewed_pr["number"]
-                             and existing["head_sha"] == reviewed_pr["headRefOid"]):
+                             and ((prepublication and existing["pr"] is None
+                                   and existing["branch"] == branch)
+                                  or (reviewed_pr is not None
+                                      and existing["pr"] == reviewed_pr["number"]
+                                      and existing["head_sha"] == reviewed_pr["headRefOid"]))):
             raise WorkflowError("issue already has a job")
         if (existing and blocked_readmission
                 and tuple(json.loads(existing["allowed_json"])) != spec.allowed_paths):
-            raise WorkflowError("blocked PR allowed paths changed")
+            raise WorkflowError("blocked job allowed paths changed")
     if cfg.complexity_profiles:
         if complexity not in cfg.complexity_profiles:
             raise WorkflowError("admit requires a configured --complexity tier")
@@ -871,8 +888,11 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
     with state.connect(cfg.state_dir) as conn:
         existing = state.job(conn, number)
         if existing and not (blocked_readmission and existing["status"] == "blocked"
-                             and existing["pr"] == reviewed_pr["number"]
-                             and existing["head_sha"] == reviewed_pr["headRefOid"]):
+                             and ((prepublication and existing["pr"] is None
+                                   and existing["branch"] == branch)
+                                  or (reviewed_pr is not None
+                                      and existing["pr"] == reviewed_pr["number"]
+                                      and existing["head_sha"] == reviewed_pr["headRefOid"]))):
             raise WorkflowError("issue already has a job")
         if not blocked_readmission:
             conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
@@ -880,7 +900,13 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
                          "allowed_json=excluded.allowed_json",
                          (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
             state.event(conn, number, "admitted")
-    if blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
+    if prepublication:
+        # A historical matching admission is not a fresh decision to resume a
+        # blocked job. Keep a distinct, one-use marker in this approval comment.
+        gh.comment(number, marker + "\n" +
+                   marker.replace("SEMI_ADMIT", "ERMIK_READMIT", 1) +
+                   "\n\nApproved to retry the blocked pre-publication job.")
+    elif blocked_readmission or not _approved_on_github(gh, cfg, number, spec):
         gh.comment(number, marker +
                    "\n\nApproved for the scoped worker queue.")
     if not already_ready and not blocked_readmission:
@@ -1326,6 +1352,158 @@ def _verify_leftover_checkout(cfg: Config, row, remote_head: str) -> Path | None
                    "--ignored=matching")):
         raise WorkflowError("interrupted checkout requires inspection")
     return checkout
+
+
+def _restore_blocked_prepublication_label(gh: GitHub, issue: int) -> bool:
+    """Compensate a possibly applied label write without overriding other states."""
+    try:
+        current = labels(gh.issue(issue))
+        if "state:blocked" in current and "state:in-progress" not in current:
+            return True
+        if not {"queue:worker", "state:in-progress"}.issubset(current) or (
+                {"state:proposed", "state:ready", "state:blocked"} & current):
+            return False
+        gh.label(issue, add="state:blocked", remove="state:in-progress")
+        observed = labels(gh.issue(issue))
+        return "state:blocked" in observed and "state:in-progress" not in observed
+    except GitHubError:
+        return False
+
+
+def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -> None:
+    """Resume only a blocked job for which execution provably never began."""
+    if not cfg.complexity_profiles:
+        return
+    for row in state.jobs(conn):
+        if row["status"] != "blocked" or row["pr"] is not None:
+            continue
+        label_attempted = False
+        readmit_id = None
+        try:
+            issue = gh.issue(row["issue"])
+            spec = parse_issue(issue.get("body") or "")
+            names = labels(issue)
+            if not {"queue:worker"}.issubset(names) or not (
+                    {"state:blocked", "state:in-progress"} & names):
+                continue
+            if not _approved_on_github(gh, cfg, row["issue"], spec, issue):
+                continue
+            tier_key = _complexity_key(issue)
+            tier = tier_key.removeprefix("complexity:") if tier_key else None
+            route = _route_key(issue)
+            if tier not in cfg.complexity_profiles or route is None:
+                continue
+            digest = _profile_sha(cfg, tier, route)
+            if (row["complexity"], row["route_key"], row["profile_sha"]) == (
+                    tier, route, digest):
+                continue
+            marker = _admission_marker(row["issue"], spec, cfg, issue)
+            readmit_marker = marker.replace("SEMI_ADMIT", "ERMIK_READMIT", 1)
+            readmit_ids = [note.get("id") for note in gh.comments(row["issue"])
+                           if note.get("user", {}).get("login") == cfg.maintainer
+                           and (note.get("body") or "").splitlines()[:2]
+                           == [marker, readmit_marker]
+                           and type(note.get("id")) is int
+                           and note["id"] > row["last_request"]]
+            if not readmit_ids:
+                raise WorkflowError("fresh blocked-job approval is missing; run admit again")
+            readmit_id = max(readmit_ids)
+            admission = state.admission(conn, row["issue"])
+            if (admission is None or row["branch"] != f"work/issue-{row['issue']}-delivery"
+                    or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+                    or tuple(json.loads(admission["allowed_json"])) != spec.allowed_paths):
+                raise WorkflowError("re-admission scope or job identity changed; inspect the job")
+            if row["attempts_count"] != 0 or row["head_sha"] is not None:
+                raise WorkflowError("re-admission lacks proof of unstarted execution; inspect work and evidence")
+            retry = conn.execute("SELECT lease_token FROM retry_state WHERE issue=?",
+                                 (row["issue"],)).fetchone()
+            if retry is not None and retry["lease_token"] is not None:
+                raise WorkflowError("re-admission has an uncertain retry lease; inspect the job")
+            checkout = cfg.workspace / "jobs" / f"issue-{row['issue']}"
+            if checkout.exists() or checkout.is_symlink():
+                raise WorkflowError("re-admission checkout requires inspection; preserve its work")
+            evidence = cfg.state_dir / "evidence" / str(row["issue"])
+            if evidence.exists() or evidence.is_symlink():
+                raise WorkflowError("re-admission evidence requires inspection; preserve it")
+            source = mirror(cfg)
+            local = git(source, "branch", "--list", row["branch"])
+            if local and git(source, "rev-parse", f"refs/heads/{row['branch']}") != row["base_sha"]:
+                raise WorkflowError("re-admission local branch changed; inspect its commit")
+            remote = (_publish_git(cfg, source, "ls-remote", "--heads", row["branch"], timeout=60)
+                      if cfg.publish_repo else
+                      git(source, "ls-remote", "--heads", "origin", row["branch"], timeout=60))
+            if remote:
+                raise WorkflowError("re-admission remote branch or push is uncertain; inspect its ref and PR")
+            if gh.find_branch_pr(row["branch"]) is not None:
+                raise WorkflowError("re-admission branch has a PR; inspect publication")
+            if main_sha(gh, cfg) != row["base_sha"]:
+                raise WorkflowError("re-admission base changed; inspect before retry")
+            if "state:blocked" in names:
+                label_attempted = True
+                gh.label(row["issue"], add="state:in-progress", remove="state:blocked")
+            fresh = gh.issue(row["issue"])
+            if (parse_issue(fresh.get("body") or "").body_sha256 != spec.body_sha256
+                    or not {"queue:worker", "state:in-progress"}.issubset(labels(fresh))
+                    or not _approved_on_github(gh, cfg, row["issue"], spec, fresh)
+                    or _route_key(fresh) != route or _complexity_key(fresh) != tier_key
+                    or gh.find_branch_pr(row["branch"]) is not None):
+                raise WorkflowError("re-admission approval changed during reconciliation")
+            if not any(note.get("id") == readmit_id
+                       and note.get("user", {}).get("login") == cfg.maintainer
+                       and (note.get("body") or "").splitlines()[:2]
+                       == [marker, readmit_marker]
+                       for note in gh.comments(row["issue"])):
+                raise WorkflowError("fresh blocked-job approval changed during reconciliation")
+            remote = (_publish_git(cfg, source, "ls-remote", "--heads", row["branch"], timeout=60)
+                      if cfg.publish_repo else
+                      git(source, "ls-remote", "--heads", "origin", row["branch"], timeout=60))
+            if remote or main_sha(gh, cfg) != row["base_sha"]:
+                raise WorkflowError("re-admission ref changed during reconciliation")
+            conn.execute("SAVEPOINT prepublication_readmit")
+            try:
+                conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
+                             "ON CONFLICT(issue) DO UPDATE SET body_sha=excluded.body_sha,"
+                             "allowed_json=excluded.allowed_json",
+                             (row["issue"], spec.body_sha256, json.dumps(spec.allowed_paths)))
+                conn.execute("DELETE FROM retry_state WHERE issue=?", (row["issue"],))
+                conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
+                             "next_retry_at,failure_id) VALUES(?,1,'interrupted','running',?,?)",
+                             (row["issue"], int(time.time()), f"readmitted-{row['issue']}"))
+                conn.execute("UPDATE jobs SET status='retry_wait',route_key=?,complexity=?,"
+                             "profile_sha=?,error=NULL,reason_code=NULL,updated_at=CURRENT_TIMESTAMP "
+                             "WHERE issue=? AND status='blocked' AND pr IS NULL",
+                             (route, tier, digest, row["issue"]))
+                conn.execute("UPDATE jobs SET last_request=? WHERE issue=?",
+                             (readmit_id, row["issue"]))
+                state.event(conn, row["issue"], "readmitted", complexity=tier)
+                conn.execute("RELEASE prepublication_readmit")
+            except BaseException:
+                conn.execute("ROLLBACK TO prepublication_readmit")
+                conn.execute("RELEASE prepublication_readmit")
+                raise
+        except (GitHubError, TransientFailure):
+            if label_attempted:
+                restored = _restore_blocked_prepublication_label(gh, row["issue"])
+                if readmit_id is not None:
+                    conn.execute("UPDATE jobs SET last_request=? WHERE issue=? AND status='blocked'",
+                                 (readmit_id, row["issue"]))
+                conn.execute("UPDATE jobs SET error=? WHERE issue=? AND status='blocked'",
+                             ("re-admission label write was unconfirmed; "
+                              + ("run admit again" if restored else
+                                 "inspect Issue labels, then run admit again"),
+                              row["issue"]))
+            continue
+        except (WorkflowError, ValueError, TypeError, KeyError, OSError,
+                sqlite3.Error) as exc:
+            restored = (not label_attempted or
+                        _restore_blocked_prepublication_label(gh, row["issue"]))
+            if label_attempted and readmit_id is not None:
+                conn.execute("UPDATE jobs SET last_request=? WHERE issue=? AND status='blocked'",
+                             (readmit_id, row["issue"]))
+            conn.execute("UPDATE jobs SET error=? WHERE issue=? AND status='blocked'",
+                         (("re-admission state write failed" if isinstance(exc, sqlite3.Error)
+                           else str(exc)) + ("; inspect Issue labels, then run admit again"
+                                             if not restored else ""), row["issue"]))
 
 
 def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
@@ -1848,6 +2026,7 @@ def run_once(cfg: Config) -> list[dict]:
         selected_providers: dict[int, str] = {}
         review_budget = [min(10, max(1, cfg.poll_seconds // 5))]
         with state.connect(cfg.state_dir) as conn:
+            _readmit_prepublication(gh, cfg, conn)
             _reconcile_interrupted(gh, cfg, conn)
             recovered = recover_stale_worktrees(cfg.workspace, conn)
             # Reconcile merged PRs before reserving new paths.
