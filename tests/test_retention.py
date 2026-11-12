@@ -78,6 +78,16 @@ class RetentionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
+        if os.name == "nt":
+            # A Windows temp directory can inherit write grants for unrelated
+            # users. Give the disposable fixture its own private ACL.
+            identity = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"],
+                                      check=True, capture_output=True,
+                                      text=True).stdout
+            sid = re.search(r"S-1-[0-9-]+", identity).group()
+            subprocess.run(["icacls", str(self.root), "/inheritance:r",
+                            "/grant:r", f"*{sid}:(OI)(CI)F"],
+                           check=True, capture_output=True)
         self.workspace = self.root / "project-a" / "workspace"
         self.state_dir = self.root / "project-a" / "state"
         self.source = self.workspace / "source"
@@ -502,6 +512,16 @@ class RetentionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
         self.assertTrue(paths["evidence"].exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows ACL only")
+    def test_windows_ambiguous_write_grant_refuses_cleanup(self):
+        paths = self.job(1, pr=101, evidence=True)
+        evidence = paths["evidence"]
+        subprocess.run(["icacls", str(evidence), "/grant", "*S-1-1-0:(W)"],
+                       check=True, capture_output=True)
+        with self.assertRaisesRegex(ValueError, "ownership"):
+            cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
+        self.assertTrue(evidence.exists())
 
     def test_second_project_sibling_is_untouched(self):
         self.job(1, pr=101, log=True, evidence=True)
