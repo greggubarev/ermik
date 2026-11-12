@@ -5,13 +5,12 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 from threading import Event
-from time import monotonic
 import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
 from ermik.evidence_export import (export_manifest, verify_manifest, _live,
-                                   _read_pair, _scope_sha256)
+                                   _PacketGitHub, _parallel_reads, _scope_sha256)
 from ermik.evidence import loads_manifest, make_manifest
 from ermik.evidence_store import read_evidence, write_evidence
 from ermik.github import GitHubError
@@ -103,88 +102,83 @@ class EvidenceExportTests(unittest.TestCase):
                 patch("ermik.evidence_export._portable_image_digest",
                       return_value=CONFIG_DIGEST))
 
-    def test_live_overlaps_independent_remote_reads(self):
-        base_started = Event()
-        comments_started = Event()
-        original_pr = self.gh.pr
-        original_issue = self.gh.issue
-
-        def pr(number):
-            if not base_started.wait(2):
-                raise AssertionError("base read did not overlap PR read")
-            return original_pr(number)
-
-        def base(_gh, _cfg):
-            base_started.set()
-            return BASE
-
-        def issue(number):
-            if not comments_started.wait(2):
-                raise AssertionError("comments did not overlap Issue read")
-            return original_issue(number)
-
-        def comments(number):
-            comments_started.set()
-            return [{"body": _admission_marker(7, self.spec),
-                     "user": {"login": self.cfg.maintainer}}]
-
-        with (patch.object(self.gh, "pr", side_effect=pr),
-              patch.object(self.gh, "issue", side_effect=issue),
-              patch.object(self.gh, "comments", side_effect=comments),
-              patch("ermik.evidence_export.main_sha", side_effect=base)):
-            result = _live(self.cfg, self.gh, 12)
-        self.assertEqual(result[0]["headRefOid"], HEAD)
-        self.assertEqual(result[1], 7)
-
-    def test_live_timeout_and_partial_admission_cannot_validate(self):
-        with patch.object(self.gh, "comments",
-                          side_effect=GitHubError("remote timeout")):
+    def test_failed_live_read_stops_before_later_requests(self):
+        with (patch.object(self.gh, "pr", side_effect=GitHubError("timeout")),
+              patch.object(self.gh, "api") as base_read):
             with self.assertRaises(GitHubError):
                 _live(self.cfg, self.gh, 12)
-        with patch.object(self.gh, "comments", return_value=None):
-            with self.assertRaises(TypeError):
+        base_read.assert_not_called()
+        with (patch.object(self.gh, "issue", side_effect=GitHubError("timeout")),
+              patch.object(self.gh, "comments") as comments_read):
+            with self.assertRaises(GitHubError):
                 _live(self.cfg, self.gh, 12)
+        comments_read.assert_not_called()
 
-    def test_live_rejects_first_failure_without_waiting_for_sibling(self):
-        for failing_read in ("pr", "issue"):
-            with self.subTest(failing_read=failing_read):
-                sibling_started = Event()
-                release_sibling = Event()
+    def test_failed_parallel_read_kills_and_joins_sibling_cli(self):
+        started = Event()
+        killed = Event()
 
-                def slow(*_args):
-                    sibling_started.set()
-                    release_sibling.wait(5)
-                    return BASE if failing_read == "pr" else []
+        class Process:
+            returncode = None
 
-                def fail(*_args):
-                    self.assertTrue(sibling_started.wait(2))
-                    raise GitHubError("read failed")
+            def poll(self):
+                return self.returncode
 
-                try:
-                    with (patch.object(self.gh, failing_read, side_effect=fail),
-                          patch("ermik.evidence_export.main_sha", side_effect=slow)
-                          if failing_read == "pr" else
-                          patch.object(self.gh, "comments", side_effect=slow)):
-                        started = monotonic()
-                        with self.assertRaises(GitHubError):
-                            _live(self.cfg, self.gh, 12)
-                        self.assertLess(monotonic() - started, 1)
-                finally:
-                    release_sibling.set()
+            def kill(self):
+                self.returncode = -9
+                killed.set()
 
-    def test_parallel_remote_read_deadline_is_unavailable(self):
-        release = Event()
-        def slow():
-            release.wait(5)
-            return None
-        try:
-            with patch("ermik.evidence_export._REMOTE_PAIR_TIMEOUT", 0.02):
-                started = monotonic()
-                with self.assertRaises(GitHubError):
-                    _read_pair(slow, slow)
-                self.assertLess(monotonic() - started, 1)
-        finally:
-            release.set()
+            def communicate(self, timeout=None):
+                started.set()
+                if not killed.wait(2):
+                    raise AssertionError("CLI read was not cancelled")
+                return "", ""
+
+        gh = _PacketGitHub(self.cfg)
+        process = Process()
+        def failed():
+            self.assertTrue(started.wait(2))
+            raise GitHubError("first read failed")
+
+        with patch("ermik.evidence_export.subprocess.Popen", return_value=process):
+            with self.assertRaises(GitHubError):
+                _parallel_reads(gh, failed,
+                                lambda: gh.command(["api", "repos/owner/project/pulls/12"]))
+        self.assertTrue(killed.is_set())
+        self.assertFalse(gh._active)
+
+    def test_parallel_deadline_kills_and_joins_cli_reads(self):
+        killed = []
+
+        class Process:
+            returncode = None
+
+            def __init__(self):
+                self.stopped = Event()
+                killed.append(self.stopped)
+
+            def poll(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+                self.stopped.set()
+
+            def communicate(self, timeout=None):
+                if not self.stopped.wait(2):
+                    raise AssertionError("CLI read was not cancelled")
+                return "", ""
+
+        gh = _PacketGitHub(self.cfg)
+        with (patch("ermik.evidence_export.subprocess.Popen", side_effect=lambda *_a, **_k: Process()),
+              patch("ermik.evidence_export._PAIR_TIMEOUT", 0.02)):
+            with self.assertRaises(GitHubError):
+                _parallel_reads(gh,
+                                lambda: gh.command(["api", "repos/owner/project/pulls/12"]),
+                                lambda: gh.command(["api", "repos/owner/project/issues/7"]))
+        self.assertEqual(len(killed), 2)
+        self.assertTrue(all(stopped.is_set() for stopped in killed))
+        self.assertFalse(gh._active)
 
     def test_export_and_verify_without_controller_state(self):
         gh_patch, image_patch, digest_patch = self._patches()

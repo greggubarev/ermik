@@ -6,7 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
-from .evidence_export import _github, _live
+from .evidence_export import _live, _packet_github
 from .evidence_transport import fetch_manifest
 from .github import GitHub, GitHubError
 from .review import _checks_sha256, _load, _review_policy
@@ -67,7 +67,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
     if type(pr_number) is not int or pr_number <= 0:
         return {"status": "incomplete", "reason": "invalid_pr_number"}
     try:
-        live = _live(cfg, _github(cfg), pr_number)
+        live = _live(cfg, _packet_github(cfg), pr_number)
         pr, issue, spec, paths = live
         image = published_image_id(pr.get("body") or "")
         image_config_digest = published_image_config_digest(pr.get("body") or "")
@@ -113,7 +113,7 @@ def build_review_packet(cfg: Config, pr_number: int) -> dict:
             packet["previous_head"] = old_head
         try:
             final_pr, final_issue, final_spec, final_paths = _live(
-                cfg, _github(cfg), pr_number)
+                cfg, _packet_github(cfg), pr_number)
             final_image = published_image_id(final_pr.get("body") or "")
             final_config = published_image_config_digest(final_pr.get("body") or "")
             unchanged = (
