@@ -5,11 +5,13 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 from threading import Event
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
 from ermik.config import Config
-from ermik.evidence_export import export_manifest, verify_manifest, _live, _scope_sha256
+from ermik.evidence_export import (export_manifest, verify_manifest, _live,
+                                   _read_pair, _scope_sha256)
 from ermik.evidence import loads_manifest, make_manifest
 from ermik.evidence_store import read_evidence, write_evidence
 from ermik.github import GitHubError
@@ -142,6 +144,47 @@ class EvidenceExportTests(unittest.TestCase):
         with patch.object(self.gh, "comments", return_value=None):
             with self.assertRaises(TypeError):
                 _live(self.cfg, self.gh, 12)
+
+    def test_live_rejects_first_failure_without_waiting_for_sibling(self):
+        for failing_read in ("pr", "issue"):
+            with self.subTest(failing_read=failing_read):
+                sibling_started = Event()
+                release_sibling = Event()
+
+                def slow(*_args):
+                    sibling_started.set()
+                    release_sibling.wait(5)
+                    return BASE if failing_read == "pr" else []
+
+                def fail(*_args):
+                    self.assertTrue(sibling_started.wait(2))
+                    raise GitHubError("read failed")
+
+                try:
+                    with (patch.object(self.gh, failing_read, side_effect=fail),
+                          patch("ermik.evidence_export.main_sha", side_effect=slow)
+                          if failing_read == "pr" else
+                          patch.object(self.gh, "comments", side_effect=slow)):
+                        started = monotonic()
+                        with self.assertRaises(GitHubError):
+                            _live(self.cfg, self.gh, 12)
+                        self.assertLess(monotonic() - started, 1)
+                finally:
+                    release_sibling.set()
+
+    def test_parallel_remote_read_deadline_is_unavailable(self):
+        release = Event()
+        def slow():
+            release.wait(5)
+            return None
+        try:
+            with patch("ermik.evidence_export._REMOTE_PAIR_TIMEOUT", 0.02):
+                started = monotonic()
+                with self.assertRaises(GitHubError):
+                    _read_pair(slow, slow)
+                self.assertLess(monotonic() - started, 1)
+        finally:
+            release.set()
 
     def test_export_and_verify_without_controller_state(self):
         gh_patch, image_patch, digest_patch = self._patches()

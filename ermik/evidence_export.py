@@ -5,7 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor
+from queue import Empty, Queue
+from threading import Thread
+from time import monotonic
 
 from . import state
 from .config import Config
@@ -22,6 +24,7 @@ from .runtime import (_approved_on_github, _complexity_key, _route_key,
 
 _BRANCH = re.compile(r"work/issue-(\d+)-[a-z0-9-]+\Z")
 _LINK = re.compile(r"(?im)\bCloses\s+#(\d+)\b")
+_REMOTE_PAIR_TIMEOUT = 30
 
 
 def _scope_sha256(paths: tuple[str, ...]) -> str:
@@ -34,17 +37,43 @@ def _github(cfg: Config) -> GitHub:
             if cfg.publish_repo else GitHub(cfg.repo))
 
 
+def _read_pair(first, second):
+    """Return two independent reads, rejecting on the first failure or deadline.
+
+    The reads are read-only. Daemon threads let a failed packet return without
+    waiting for the other CLI request's retry window or pagination to finish.
+    """
+    completed = Queue()
+
+    def read(index, operation):
+        try:
+            completed.put((index, operation(), None))
+        except Exception as exc:
+            completed.put((index, None, exc))
+
+    for index, operation in enumerate((first, second)):
+        Thread(target=read, args=(index, operation), daemon=True).start()
+    result = [None, None]
+    deadline = monotonic() + _REMOTE_PAIR_TIMEOUT
+    for _ in range(2):
+        try:
+            index, value, error = completed.get(timeout=max(0, deadline - monotonic()))
+        except Empty as exc:
+            raise GitHubError("remote read timed out") from exc
+        if error is not None:
+            raise error
+        result[index] = value
+    return result[0], result[1]
+
+
 def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, list[str]]:
     """Check remote identity and admission without reading controller state."""
     if type(pr_number) is not int or pr_number <= 0:
         raise WorkflowError("invalid PR number")
     # These reads do not depend on one another. The packet repeats _live after
     # evidence retrieval, so each pass must still validate complete live data.
-    with ThreadPoolExecutor(max_workers=2) as reads:
-        pr_read = reads.submit(gh.pr, pr_number)
-        base_read = reads.submit(main_sha, gh, cfg)
-        pr = pr_read.result()
-        base_sha = base_read.result()
+    pr, base_sha = _read_pair(lambda: gh.pr(pr_number),
+                              lambda: main_sha(gh, cfg))
     branch = pr.get("headRefName")
     match = _BRANCH.fullmatch(branch) if isinstance(branch, str) else None
     if not match or _LINK.findall(pr.get("body") or "") != [match.group(1)]:
@@ -66,11 +95,8 @@ def _live(cfg: Config, gh: GitHub, pr_number: int) -> tuple[dict, int, object, l
     paths = sorted(row["path"] for row in files)
     if len(paths) != len(set(paths)):
         raise WorkflowError("duplicate PR path")
-    with ThreadPoolExecutor(max_workers=2) as reads:
-        issue_read = reads.submit(gh.issue, issue_number)
-        comments_read = reads.submit(gh.comments, issue_number)
-        issue = issue_read.result()
-        comments = comments_read.result()
+    issue, comments = _read_pair(lambda: gh.issue(issue_number),
+                                 lambda: gh.comments(issue_number))
     labels = {row["name"] for row in issue.get("labels", [])}
     if not {"queue:worker", "state:in-progress"}.issubset(labels):
         raise WorkflowError("issue queue state changed")
