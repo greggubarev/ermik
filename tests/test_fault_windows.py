@@ -434,6 +434,83 @@ class FaultWindowTests(unittest.TestCase):
                 runtime._reconcile_interrupted(self.gh, self.cfg, conn)
                 self.assertEqual(state.job(conn, 1)["status"], "blocked")
 
+    def test_unreadable_pr_with_durable_broker_intent_blocks_without_second_post(self):
+        self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
+        self._approved()
+        self.gh.names = {"queue:worker", "state:in-progress"}
+        self.gh.remote_head = HEAD
+        self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
+                         (1, self.spec.body_sha256, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                         "image_id,attempts_count) VALUES(?,?,?,'running',?,?,1)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
+            state.event(conn, 1, "checks_passed", head_sha=HEAD)
+        intent = self.cfg.state_dir / "evidence" / "1" / f"{HEAD}.json"
+        intent.parent.mkdir(parents=True)
+        runtime.write_evidence(intent, runtime._prepublication_record(
+            issue=1, branch=BRANCH, head=HEAD, base=BASE,
+            paths=["src/example.py"], proof={"result": "passed"},
+            model=None, body_sha256=self.spec.body_sha256))
+        with patch.object(self.gh, "pr", side_effect=runtime.GitHubError(
+                "PR GET unavailable")):
+            with state.connect(self.cfg.state_dir) as conn:
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                row = state.job(conn, 1)
+                self.assertEqual((row["status"], row["reason_code"], row["pr"]),
+                                 ("blocked", "publication_unconfirmed", None))
+        self.assertEqual(self.gh.open_calls, 1)
+        self.assertIn("state:blocked", self.gh.names)
+
+    def test_unreadable_pr_before_broker_intent_remains_pending(self):
+        self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
+        self._approved()
+        self.gh.names = {"queue:worker", "state:in-progress"}
+        self.gh.remote_head = HEAD
+        self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
+                         (1, self.spec.body_sha256, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                         "image_id,attempts_count) VALUES(?,?,?,'running',?,?,1)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
+            state.event(conn, 1, "checks_passed", head_sha=HEAD)
+            with patch.object(self.gh, "pr", side_effect=runtime.GitHubError(
+                    "PR GET unavailable")):
+                runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+            self.assertEqual(state.job(conn, 1)["status"], "running")
+        self.assertEqual(self.gh.open_calls, 1)
+        self.assertIn("state:in-progress", self.gh.names)
+
+    def test_early_read_failures_with_broker_evidence_remain_retryable(self):
+        self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
+        self._approved()
+        self.gh.names = {"queue:worker", "state:in-progress"}
+        self.gh.remote_head = HEAD
+        self.gh.open_pr(BRANCH, PR_BODY, "Example", "main")
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
+                         (1, self.spec.body_sha256, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                         "image_id,attempts_count) VALUES(?,?,?,'running',?,?,1)",
+                         (1, BRANCH, BASE, '["src/example.py"]', IMAGE))
+            state.event(conn, 1, "checks_passed", head_sha=HEAD)
+        intent = self.cfg.state_dir / "evidence" / "1" / f"{HEAD}.json"
+        intent.parent.mkdir(parents=True)
+        runtime.write_evidence(intent, runtime._prepublication_record(
+            issue=1, branch=BRANCH, head=HEAD, base=BASE,
+            paths=["src/example.py"], proof={"result": "passed"},
+            model=None, body_sha256=self.spec.body_sha256))
+        for read in ("issue", "find_branch_pr"):
+            with self.subTest(read=read), patch.object(
+                    self.gh, read, side_effect=runtime.GitHubError("read unavailable")):
+                with state.connect(self.cfg.state_dir) as conn:
+                    runtime._reconcile_interrupted(self.gh, self.cfg, conn)
+                    self.assertEqual(state.job(conn, 1)["status"], "running")
+        self.assertEqual(self.gh.open_calls, 1)
+        self.assertIn("state:in-progress", self.gh.names)
+
     def test_lost_pr_response_adopts_only_matching_broker_pr(self):
         self.cfg = replace(self.cfg, draft_pr_socket=Path(self.temp.name) / "broker.sock")
         self._approved()
