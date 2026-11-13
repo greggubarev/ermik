@@ -48,6 +48,8 @@ The read-only command checks the current Issue admission, PR base and HEAD, chan
 
 The packet reads the live PR identity again before setting `head_verified: true`; that means both reads agreed during this command, not that the remote HEAD is locked afterward. If the second read fails or changes, `head` and `diff_url` are withheld and any earlier local review is marked unavailable or stale. When publisher evidence is current but the local review is stale, `review.reason_code: stale_local_review` and `review.next_action: review_current_head` direct the maintainer to repeat the local review. A GitHub read failure is reported as unavailable, not as proof that the PR changed.
 
+For a current local review, `review` also includes the reviewed HEAD, ordered check-policy digest, maintainer image ID, published image ID, image config digest, and each local check's one-based index, `passed` result, and log SHA-256. These fields come from the private review record after validating its exact identity, image, configured commands, and check results. The packet omits local paths, commands, and raw logs. Publisher checks remain separately labeled `publisher_claim`. Missing, malformed, failed, or stale local checks expose no local per-check results and require a new review before merge.
+
 ## Decision history
 
 The maintainer installation keeps a bounded private record of reviewed HEADs, requested corrections, and explicit merge decisions. Each entry contains repository, Issue, PR, base, HEAD, a digest of the local check evidence, decision, and UTC timestamp. The digest binds the local image ID, image config digest, check results, and log digests, excluding timestamps and log paths. It is not a signature and does not replace a current review.

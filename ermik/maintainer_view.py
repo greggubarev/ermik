@@ -95,6 +95,7 @@ def queue_snapshot(cfg) -> dict:
             route = _route(labels)
         evidence = packet.get("evidence") or {}
         review = packet.get("review") or {}
+        local_review = review if verified and review.get("status") == "current" else None
         rows.append({"issue": issue if verified else None, "pr": number,
                      "head": packet.get("head") if verified and _SHA.fullmatch(
                          packet.get("head") or "") else None,
@@ -117,6 +118,7 @@ def queue_snapshot(cfg) -> dict:
                      "review": review.get("status") if verified and
                      review.get("status") in {"current", "missing", "stale", "invalid"}
                      else "unknown",
+                     "local_review": local_review,
                      "next_action": _action(packet) if verified else
                      "reconcile_remote_identity_manually"})
     queued = [(issue, "ready") for issue in ready]
@@ -136,6 +138,7 @@ def queue_snapshot(cfg) -> dict:
                          else "unknown", "evidence": "missing",
                          "publisher_model_claim": None,
                          "checks": "unverified", "review": "missing",
+                         "local_review": None,
                          "next_action": "wait_for_controller_or_reconcile_manually"
                          if verified_state == "ready" else
                          "reconcile_issue_branch_and_pr_manually"})
@@ -146,10 +149,15 @@ def queue_snapshot(cfg) -> dict:
 def render_html(snapshot: dict) -> bytes:
     def cell(value: object) -> str:
         return escape(str(value if value is not None else "—"), quote=True)
+    def row_cell(row: dict, key: str) -> str:
+        value = row[key]
+        if key == "local_review" and value is not None:
+            value = json.dumps(value, sort_keys=True)
+        return f"<td>{cell(value)}</td>"
     columns = ("issue", "pr", "head", "remote_label_state", "controller_runtime",
                "model_route_label", "publisher_model_claim", "evidence", "checks",
-               "review", "next_action")
-    rows = "".join("<tr>" + "".join(f"<td>{cell(row[key])}</td>" for key in columns)
+               "review", "local_review", "next_action")
+    rows = "".join("<tr>" + "".join(row_cell(row, key) for key in columns)
                    + "</tr>" for row in snapshot["items"])
     heads = "".join(f"<th>{cell(key.replace('_', ' ').title())}</th>" for key in columns)
     data = ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"

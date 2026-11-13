@@ -6,6 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import Config
+from .decision_trail import review_digest
 from .evidence_export import _live, _packet_github
 from .evidence_transport import fetch_manifest
 from .github import GitHub, GitHubError
@@ -53,9 +54,20 @@ def _review_summary(cfg: Config, number: int, expected: dict) -> dict:
         return summary
     try:
         _review_policy(cfg, record, check_reference=True)
-    except WorkflowError:
+        review_digest(cfg, record)
+    except (WorkflowError, ValueError):
         return summary
-    return {"status": "current", "head": expected["head"]}
+    ci = record["ci"]
+    return {
+        "status": "current", "head": expected["head"],
+        "checks_sha256": record["checks_sha256"],
+        "image_id": record["image_id"],
+        "published_image_id": record["published_image_id"],
+        "image_config_digest": record["image_config_digest"],
+        "checks": [{"index": index, "result": "passed",
+                    "log_sha256": check["log_sha256"]}
+                   for index, check in enumerate(ci["checks"], 1)],
+    }
 
 
 def build_review_packet(cfg: Config, pr_number: int) -> dict:
