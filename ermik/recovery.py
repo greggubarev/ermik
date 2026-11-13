@@ -121,10 +121,9 @@ def record_failure(conn: sqlite3.Connection, issue: int, category: str, *,
                      and lease_token is not None)):
         raise ValueError("job is not executing")
     attempts = prior[0] if prior is not None else 1
-    # A provider-wide quota pause does not mean the task itself failed. Keep
-    # it eligible after the provider cooldown, without consuming the bounded
-    # execution-error retry allowance.
-    retry = category == "provider" or (category in RETRYABLE and attempts < policy.max_attempts)
+    # A quota pause remains retryable, but each leased retry is an execution
+    # opportunity. Repeated provider refusals must honor the same ceiling.
+    retry = category in RETRYABLE and attempts < policy.max_attempts
     status = "retry_wait" if retry else "blocked"
     due = instant + _delay(attempts, policy) if retry else None
     conn.execute("INSERT INTO retry_state(issue,attempts,category,resume_status,"
@@ -175,7 +174,7 @@ def claim_due(conn: sqlite3.Connection, *, now: datetime | int | float | None = 
         rows = conn.execute("SELECT r.issue,r.attempts,r.resume_status FROM retry_state r "
                             "JOIN jobs j ON j.issue=r.issue WHERE j.status='retry_wait' "
                             "AND r.lease_token IS NULL AND r.next_retry_at<=? "
-                            "AND (r.attempts<? OR r.category='provider') "
+                            "AND r.attempts<? "
                             "ORDER BY r.next_retry_at,r.issue LIMIT ?",
                             (instant, policy.max_attempts, limit)).fetchall()
         claims = []
