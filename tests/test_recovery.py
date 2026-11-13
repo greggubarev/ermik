@@ -94,12 +94,14 @@ class RecoveryTests(unittest.TestCase):
                                     now=decision.next_retry_at, policy=self.policy)
             self.assertIsNone(state.job(conn, 1)["reason_code"])
 
-    def test_provider_quota_wait_does_not_terminally_exhaust_job(self):
+    def test_provider_quota_retry_ceiling_survives_restart(self):
         with state.connect(self.root) as conn:
             decision = recovery.record_failure(conn, 1, "provider", failure_id="quota-1",
                                                resume_status="running", now=100,
                                                policy=self.policy)
-            for index in range(2, 6):
+            self.assertEqual((decision.status, decision.attempts), ("retry_wait", 1))
+        for index in range(2, 4):
+            with state.connect(self.root) as conn:  # Restart between cooldown cycles.
                 claim = recovery.claim_due(conn, now=decision.next_retry_at,
                                            policy=self.policy)[0]
                 self.assertTrue(recovery.activate_claim(conn, claim,
@@ -110,8 +112,11 @@ class RecoveryTests(unittest.TestCase):
                                                    lease_token=claim.token,
                                                    now=decision.next_retry_at,
                                                    policy=self.policy)
-            self.assertEqual(decision.status, "retry_wait")
-            self.assertGreater(decision.attempts, self.policy.max_attempts)
+        with state.connect(self.root) as conn:
+            self.assertEqual((decision.status, decision.attempts,
+                              decision.next_retry_at), ("blocked", 3, None))
+            self.assertEqual(recovery.claim_due(conn, now=1000,
+                                                policy=self.policy), [])
 
     def test_crash_after_activation_fails_closed(self):
         with state.connect(self.root) as conn:
