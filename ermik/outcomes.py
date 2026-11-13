@@ -69,7 +69,7 @@ def _read_controller(cfg: Config) -> tuple[list[sqlite3.Row], list[sqlite3.Row],
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise ValueError(f"outcome export requires controller state schema v{SCHEMA_VERSION}")
         jobs = conn.execute(
-            "SELECT issue,pr,head_sha,status,route_key,task_set,attempts_count "
+            "SELECT issue,pr,head_sha,status,route_key,task_set,complexity,profile_sha,attempts_count "
             "FROM jobs ORDER BY issue LIMIT ?",
             (MAX_JOBS + 1,)).fetchall()
         attempts = conn.execute(
@@ -169,7 +169,9 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
         providers = [row["provider_id"] for row in rows if row["provider_id"]]
         results.append({
             "issue": issue, "pr": pr, "head": job["head_sha"],
+            "job_status": job["status"],
             "period": admission_month, "route": route, "task_set": job["task_set"],
+            "complexity": job["complexity"], "profile_sha256": job["profile_sha"],
             "accepted": accepted, "decision_state": decision_state,
             "accepted_at": accepted_at.isoformat() if accepted_at else None,
             "elapsed_ms": elapsed_ms,

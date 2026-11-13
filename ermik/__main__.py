@@ -28,6 +28,7 @@ from .review_packet import build_review_packet
 from .maintainer_view import queue_snapshot, create_server as create_maintainer_server
 from .decision_trail import read_decisions
 from .outcomes import audit_cohort, build_outcome_report, build_quality_snapshot
+from .effort_advice import recommend_effort
 from .routing_policy import audit_route_order
 from .event_digest import deliver_once
 
@@ -173,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
     outcomes_parser = commands.add_parser("outcomes")
     outcomes_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     outcomes_parser.add_argument("--period", help="UTC admission month, YYYY-MM")
+    effort_parser = commands.add_parser("recommend-effort")
+    effort_parser.add_argument("issue", type=int)
+    effort_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     metrics_parser = commands.add_parser("route-metrics")
     metrics_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     metrics_parser.add_argument("--output", type=Path, required=True)
@@ -282,6 +286,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "outcomes":
             result = build_outcome_report(cfg, args.maintainer_state_dir,
                                           period=args.period)
+        elif args.command == "recommend-effort":
+            result = recommend_effort(cfg, GitHub(cfg.repo).issue(args.issue),
+                                      args.maintainer_state_dir)
         elif args.command == "route-metrics":
             if args.audit_output and (args.audit_output.resolve() == args.output.resolve()
                                       or args.audit_output.exists()
