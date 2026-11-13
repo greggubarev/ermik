@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from contextlib import closing
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -156,6 +157,84 @@ class RetentionTests(unittest.TestCase):
             artifacts["evidence"] = path
         self.age(checkout, age)
         return artifacts
+
+    def postmerge_log(self, *, digest_valid=True):
+        paths = self.job(1, pr=101, evidence=True)
+        reviewed_head = self.hub.rows[101]["headRefOid"]
+        merge_commit = "b" * 40
+        self.hub.rows[101]["mergeCommit"] = {"oid": merge_commit}
+        log = self.state_dir / "ci-logs" / merge_commit / "check-1.log"
+        log.parent.mkdir(parents=True)
+        log.write_bytes(b"post-merge check passed\n")
+        self.age(log)
+        self.age(log.parent)
+        record_path = self.state_dir / "reviews" / "pr-101.json"
+        record_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        digest = hashlib.sha256(log.read_bytes()).hexdigest()
+        record = {"repo": self.cfg.repo, "pr": 101, "issue": 1,
+                  "head": reviewed_head, "base": "a" * 40,
+                  "branch": "work/issue-1-delivery",
+                  "merge_commit": merge_commit,
+                  "merged": {"status": "complete", "pr": 101, "issue": 1,
+                             "merge_commit": merge_commit, "issue_closed": True,
+                             "main_ci": {"head": merge_commit, "result": "passed",
+                                         "checks": [{"exit_code": 0,
+                                                     "log": str(log),
+                                                     "log_sha256": digest if digest_valid
+                                                     else "0" * 64}]}}}
+        write_evidence(record_path, record)
+        return paths, log, record_path, record
+
+    def test_completed_postmerge_log_is_retained_by_exact_review_record(self):
+        _, log, _, _ = self.postmerge_log()
+        self.assertNotIn("b" * 40, self.hub.rows[101]["commits"])
+        preview = cleanup(self.cfg, gh=self.hub, dry_run=True, now=NOW)
+        self.assertTrue(any(item["kind"] == "logs" and item["head"] == "b" * 40
+                            for item in preview["selected"]))
+        applied = cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
+        self.assertTrue(any(item["kind"] == "logs" and item["head"] == "b" * 40
+                            for item in applied["removed"]))
+        self.assertFalse(log.exists())
+
+    def test_postmerge_log_refuses_bad_hash_and_shared_active_head(self):
+        _, log, record_path, record = self.postmerge_log(digest_valid=False)
+        result = cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
+        self.assertFalse(any(item["kind"] == "logs" and item["head"] == "b" * 40
+                             for item in result["removed"]))
+        self.assertTrue(log.exists())
+        record["merged"]["main_ci"]["checks"][0]["log_sha256"] = hashlib.sha256(
+            log.read_bytes()).hexdigest()
+        write_evidence(record_path, record)
+        self.hub.rows[101]["mergeCommit"] = {"oid": "c" * 40}
+        wrong_remote = cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
+        self.assertFalse(any(item["kind"] == "logs" and item["head"] == "b" * 40
+                             for item in wrong_remote["removed"]))
+        self.assertTrue(log.exists())
+        self.hub.rows[101]["mergeCommit"] = {"oid": "b" * 40}
+        self.conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                          "head_sha,pr) VALUES(?,?,?,?,?,?,?)",
+                          (2, "work/issue-2-delivery", "a" * 40, "running",
+                           "[]", "b" * 40, 102))
+        self.conn.commit()
+        self.hub.add(2, 102, "work/issue-2-delivery", "b" * 40,
+                     state="OPEN", issue_state="open")
+        shared = cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
+        self.assertFalse(any(item["kind"] == "logs" and item["head"] == "b" * 40
+                             for item in shared["removed"]))
+        self.assertTrue(log.exists())
+
+    def test_oversized_postmerge_log_stays_even_with_matching_hash(self):
+        _, log, record_path, record = self.postmerge_log()
+        payload = b"x" * (1024 * 1024 + 1)
+        log.write_bytes(payload)
+        self.age(log)
+        record["merged"]["main_ci"]["checks"][0]["log_sha256"] = hashlib.sha256(
+            payload).hexdigest()
+        write_evidence(record_path, record)
+        result = cleanup(self.cfg, gh=self.hub, dry_run=False, now=NOW)
+        self.assertFalse(any(item["kind"] == "logs" and item["head"] == "b" * 40
+                             for item in result["removed"]))
+        self.assertTrue(log.exists())
 
     def test_inventory_reports_owned_bytes_and_age_without_mutating(self):
         paths = self.job(1, pr=101, log=True, evidence=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timezone
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -24,6 +25,7 @@ _HEAD = re.compile(r"[0-9a-f]{40}\Z")
 _LOG = re.compile(r"check-[1-9][0-9]*\.log\Z")
 _EVIDENCE = re.compile(r"([0-9a-f]{40})\.json\Z")
 _MAX_SCAN = 100_000
+_MAX_CHECK_LOG_BYTES = 1024 * 1024
 
 
 def _epoch(now: datetime | int | float | None) -> float:
@@ -221,6 +223,14 @@ def _remote_pr_heads(gh: GitHub, pr: int) -> set[str] | None:
     return None
 
 
+def _remote_merge_commit(gh: GitHub, pr: int, commit: str) -> bool:
+    try:
+        merged = gh.pr(pr).get("mergeCommit")
+        return isinstance(merged, dict) and merged.get("oid") == commit
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return False
+
+
 def _prune_empty(parent: Path, root: Path) -> None:
     if parent != root:
         try:
@@ -270,6 +280,48 @@ def _review_allows_cleanup(cfg, row) -> bool:
     return attempt is None or attempt == {
         "head": record["head"], "base": record.get("base"),
         "branch": record["branch"]}
+
+
+def _postmerge_log_ref(cfg, row, item: dict) -> bool:
+    """Bind one log to the completed check of an exact reviewed squash merge."""
+    if (row["status"] != "merged" or item["kind"] != "logs"
+            or item["bytes"] > _MAX_CHECK_LOG_BYTES):
+        return False
+    match = _LOG.fullmatch(item["path"].name)
+    if match is None or not _review_allows_cleanup(cfg, row):
+        return False
+    path = Path(cfg.state_dir) / "reviews" / f"pr-{row['pr']}.json"
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        record = read_evidence(path)
+        merged = record["merged"]
+        ci = merged["main_ci"]
+        index = int(item["path"].stem.removeprefix("check-"))
+        checks = ci["checks"]
+        check = checks[index - 1]
+        digest = check["log_sha256"]
+        if (merged.get("issue_closed") is not True
+                or merged.get("merge_commit") != item["head"]
+                or ci.get("head") != item["head"]
+                or ci.get("result") != "passed"
+                or not isinstance(checks, list) or index > len(checks)
+                or check.get("exit_code") != 0
+                or check.get("log") != str(item["path"])
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+            return False
+        observed = hashlib.sha256()
+        size = 0
+        with item["path"].open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                size += len(chunk)
+                if size > _MAX_CHECK_LOG_BYTES:
+                    return False
+                observed.update(chunk)
+        return size == item["bytes"] and observed.hexdigest() == digest
+    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return False
 
 
 def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
@@ -351,6 +403,9 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
                     continue
                 refs = [row for row in rows.values() if row["head_sha"] == item["head"]]
                 refs.extend(old_proofs.get(item["head"], []))
+                postmerge_refs = [row for row in rows.values()
+                                  if _postmerge_log_ref(cfg, row, item)]
+                refs.extend(row for row in postmerge_refs if row not in refs)
                 if not refs:
                     result["skipped"] += 1
                     continue
@@ -371,13 +426,20 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
                    or not _review_allows_cleanup(cfg, row) for row in refs):
                 result["skipped"] += 1
                 continue
+            if (item["kind"] == "logs" and any(
+                    not _remote_merge_commit(client, row["pr"], item["head"])
+                    for row in postmerge_refs)):
+                result["skipped"] += 1
+                continue
             if item["kind"] in ("logs", "evidence"):
                 for row in refs:
-                    if item["head"] == row["head_sha"]:
+                    if (item["head"] == row["head_sha"]
+                            or item["kind"] == "logs" and row in postmerge_refs):
                         continue
                     if row["pr"] not in old_head_cache:
                         old_head_cache[row["pr"]] = _remote_pr_heads(client, row["pr"])
                 if any(item["head"] != row["head_sha"]
+                       and not (item["kind"] == "logs" and row in postmerge_refs)
                        and (old_head_cache[row["pr"]] is None
                             or item["head"] not in old_head_cache[row["pr"]])
                        for row in refs):
@@ -425,6 +487,10 @@ def cleanup(cfg, *, gh: GitHub | None = None, dry_run: bool = True,
                     if item["kind"] == "evidence" and not _valid_evidence(
                             item["path"], refs[0], head=item["head"]):
                         raise ValueError("evidence changed before cleanup")
+                    if item["kind"] == "logs" and any(
+                            not _postmerge_log_ref(cfg, row, item)
+                            for row in postmerge_refs):
+                        raise ValueError("post-merge check log changed before cleanup")
                     item["path"].unlink()
                     _prune_empty(item["path"].parent,
                                  Path(cfg.state_dir) / ("ci-logs" if item["kind"] == "logs"
