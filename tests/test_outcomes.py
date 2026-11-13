@@ -10,8 +10,9 @@ import unittest
 from ermik.config import Config
 from ermik import state
 from ermik.evidence_store import write_evidence
-from ermik.outcomes import build_outcome_report, build_quality_snapshot
+from ermik.outcomes import audit_cohort, build_outcome_report, build_quality_snapshot
 from ermik.providers import ModelCandidate
+from ermik.routing_policy import audit_route_order
 
 
 class OutcomeTests(unittest.TestCase):
@@ -337,6 +338,85 @@ class OutcomeTests(unittest.TestCase):
             "unused": {"samples": 0, "first_review_acceptances": 0,
                        "quality_score": None},
         })
+
+    def test_route_audit_binds_exact_cohort_and_refuses_changed_or_stale_evidence(self):
+        head = "b" * 40
+        candidates = (ModelCandidate("one", "model", "ONE_API_KEY",
+                                     base_url="https://example.com"),
+                      ModelCandidate("two", "model", "TWO_API_KEY",
+                                     base_url="https://example.com"))
+        cfg = replace(self.cfg, models=candidates, quality_min_samples=2,
+                      quality_max_age_seconds=3600)
+        for issue in range(1, 5):
+            self.add_job(issue, issue + 10, "route:auto", head)
+            self.attempt(issue, f"attempt-{issue}", 0,
+                         provider="one" if issue < 3 else "two")
+            journal = ([(head, "reviewed"), (head, "merge_intent"), (head, "merged")]
+                       if issue >= 3 else
+                       [("c" * 40, "reviewed"), ("c" * 40, "changes_requested"),
+                        (head, "reviewed"), (head, "merge_intent"), (head, "merged")])
+            self.journal(issue, issue + 10, head, journal)
+        now = datetime(2026, 11, 13, 12, tzinfo=timezone.utc)
+        report = build_outcome_report(cfg, self.maintainer)
+        quality = build_quality_snapshot(cfg, self.maintainer, observed_at=now,
+                                         source_report=report)
+        audit = {**quality, "version": 2, "cohort": audit_cohort(report),
+                 "thresholds": {"min_samples": 2, "max_age_seconds": 3600},
+                 "gates": {"admission": "required", "checks": "required",
+                           "maintainer_review": "required"}}
+        path = cfg.state_dir.parent / "audit.json"
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        result = audit_route_order(cfg, report, path, candidates, now)
+        self.assertEqual(result["decision"], "audited")
+        self.assertEqual(result["proposed_order"], [candidates[1].ref, candidates[0].ref])
+        self.assertEqual(len(result["cohort"]["accepted_prs"]), 4)
+        self.assertEqual(result["cohort"]["accepted_prs"][0]["head"], head)
+        audit["thresholds"]["min_samples"] = 20
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        sparse = audit_route_order(replace(cfg, quality_min_samples=20), report,
+                                   path, candidates, now)
+        self.assertEqual(sparse["decision"], "refused")
+        self.assertEqual(sparse["refusal_reason"],
+                         "insufficient_or_stale_measurements")
+        self.assertEqual(sparse["provider_samples"], {"one": 2, "two": 2})
+        self.assertEqual(sparse["cohort"], audit_cohort(report))
+        self.assertEqual(sparse["observed_at"], now.isoformat())
+        self.assertEqual(sparse["proposed_order"], [item.ref for item in candidates])
+        audit["thresholds"]["min_samples"] = 2
+        audit["cohort"]["accepted_prs"][0]["issue"] = 99
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        refused = audit_route_order(cfg, report, path, candidates, now)
+        self.assertEqual((refused["decision"], refused["proposed_order"]),
+                         ("refused", [item.ref for item in candidates]))
+        self.assertNotIn("cohort", refused)
+        audit["cohort"] = audit_cohort(report)
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        changed_report = json.loads(json.dumps(report))
+        changed_report["jobs"][0]["route"] = "route:changed"
+        self.assertEqual(audit_route_order(cfg, changed_report, path, candidates, now)
+                         ["decision"], "refused")
+        audit["cohort"] = audit_cohort(report)
+        audit["observed_at"] = (now - timedelta(seconds=3601)).isoformat()
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now)["decision"],
+                         "refused")
+        audit["observed_at"] = now.isoformat()
+        audit["gates"]["checks"] = "skipped"
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now)["decision"],
+                         "refused")
+        audit["gates"]["checks"] = "required"
+        audit["thresholds"]["min_samples"] = 1
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now)["decision"],
+                         "refused")
+        audit["thresholds"]["min_samples"] = 2
+        audit["gates"]["checks"] = "required"
+        audit["observed_at"] = "private invalid date"
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        refusal = audit_route_order(cfg, report, path, candidates, now)
+        self.assertEqual(refusal["refusal_reason"], "invalid_or_incomplete_evidence")
+        self.assertNotIn("private", json.dumps(refusal))
 
 
 if __name__ == "__main__":

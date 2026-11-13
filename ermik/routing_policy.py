@@ -12,6 +12,7 @@ from typing import Sequence
 
 from .config import Config
 from .providers import ModelCandidate
+from .outcomes import audit_cohort, build_quality_snapshot
 
 
 _MAX_SNAPSHOT_BYTES = 64 * 1024
@@ -123,3 +124,67 @@ def order_candidates(cfg: Config, candidates: Sequence[ModelCandidate],
     except (OSError, ValueError, UnicodeError, TypeError, OverflowError):
         return priority, "priority"
     return tuple(sorted(priority, key=lambda candidate: -scores[candidate.provider_id])), "quality"
+
+
+def audit_route_order(cfg: Config, report: dict, snapshot_path: Path,
+                      candidates: Sequence[ModelCandidate],
+                      now: datetime | None = None) -> dict:
+    """Preview a frozen cohort's order; never update routing or controller state."""
+    priority = tuple(candidates)
+    configured = [candidate.ref for candidate in priority]
+    instant = datetime.now(timezone.utc) if now is None else now
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError("now must be timezone aware")
+    current, current_policy = order_candidates(cfg, priority, instant)
+    effective = [candidate.ref for candidate in current]
+    result = {"repo": cfg.repo, "mode": "read_only", "configured_order": configured,
+              "current_order": effective, "current_policy": current_policy,
+              "proposed_order": effective, "eligible_order": effective,
+              "decision": "refused", "fallback": "current_runtime_order",
+              "gates": {"admission": "required", "checks": "required",
+                        "maintainer_review": "required"},
+              "quality_min_samples": cfg.quality_min_samples,
+              "quality_max_age_seconds": cfg.quality_max_age_seconds}
+    try:
+        snapshot = _read_snapshot(Path(snapshot_path))
+        if (set(snapshot) != {"version", "repo", "observed_at", "providers",
+                              "cohort", "gates", "thresholds"}
+                or type(snapshot["version"]) is not int or snapshot["version"] != 2
+                or snapshot["repo"] != cfg.repo
+                or snapshot["thresholds"] != {
+                    "min_samples": cfg.quality_min_samples,
+                    "max_age_seconds": cfg.quality_max_age_seconds}
+                or snapshot["gates"] != result["gates"]):
+            raise ValueError("invalid audit snapshot")
+        cohort = audit_cohort(report)
+        if cohort != snapshot["cohort"]:
+            raise ValueError("mismatched cohort")
+        expected = build_quality_snapshot(cfg, cfg.state_dir, source_report=report,
+                                          observed_at=datetime.fromisoformat(
+                                              snapshot["observed_at"]))
+        if snapshot["providers"] != expected["providers"]:
+            raise ValueError("mismatched measurements")
+        observed = datetime.fromisoformat(snapshot["observed_at"])
+        if (observed.tzinfo is None or observed.utcoffset() is None
+                or observed.utcoffset().total_seconds() != 0):
+            raise ValueError("invalid audit timestamp")
+        quality = {key: snapshot[key] for key in _SNAPSHOT_FIELDS}
+        quality["version"] = 1
+    except (OSError, ValueError, UnicodeError, TypeError, OverflowError, KeyError):
+        result["refusal_reason"] = "invalid_or_incomplete_evidence"
+        return result
+    result.update({"observed_at": observed.isoformat(), "cohort": cohort,
+                   "provider_samples": {
+                       provider: expected["providers"].get(provider, {}).get("samples")
+                       for provider in sorted({item.provider_id for item in priority})}})
+    try:
+        scores = _scores(quality, cfg, priority, instant)
+        if len({candidate.provider_id for candidate in priority}) < 2:
+            raise ValueError("fewer than two eligible providers")
+        proposed = sorted(priority, key=lambda candidate: -scores[candidate.provider_id])
+    except (OSError, ValueError, UnicodeError, TypeError, OverflowError, KeyError):
+        result["refusal_reason"] = "insufficient_or_stale_measurements"
+        return result
+    result.update({"decision": "audited",
+                   "proposed_order": [item.ref for item in proposed]})
+    return result
