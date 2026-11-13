@@ -49,6 +49,7 @@ class ContainerCleanupTests(unittest.TestCase):
         (source / "base.txt").write_text("base\n")
         run("add", "base.txt")
         run("commit", "-m", "base")
+        run("update-ref", "refs/remotes/origin/main", "HEAD")
         run("branch", "secret")
         run("switch", "secret")
         (source / "secret.txt").write_text("hidden\n")
@@ -176,6 +177,37 @@ class ContainerCleanupTests(unittest.TestCase):
                             network=False, timeout=1)
         self.assertEqual(len(inspected), 1)
         self.assertFalse(inspected[0].exists())
+
+    def test_snapshot_uses_fetched_base_when_local_main_is_stale(self):
+        checkout = self.create_checkout()
+        source = self.cfg.workspace / "source"
+        old_base = runtime.git(source, "rev-parse", "main")
+        runtime.git(source, "switch", "main")
+        (source / "base.txt").write_text("advanced base\n")
+        runtime.git(source, "add", "base.txt")
+        runtime.git(source, "commit", "-m", "advance base")
+        fetched_base = runtime.git(source, "rev-parse", "HEAD")
+        runtime.git(source, "update-ref", "refs/remotes/origin/main", fetched_base)
+        runtime.git(source, "reset", "--hard", old_base)
+        self.assertNotEqual(runtime.git(source, "rev-parse", "main"), fetched_base)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot_git, _ = runtime._check_git_snapshot(
+                self.cfg, checkout, Path(temporary))
+            snapshot = snapshot_git.parent
+            self.assertEqual(runtime.git(snapshot, "rev-parse", "main"), fetched_base)
+            self.assertEqual(runtime.git(snapshot, "rev-parse", "origin/main"), fetched_base)
+            self.assertEqual(runtime.git(snapshot, "rev-parse", "HEAD"),
+                             runtime.git(checkout, "rev-parse", "HEAD"))
+
+    def test_snapshot_refuses_missing_fetched_base(self):
+        checkout = self.create_checkout()
+        source = self.cfg.workspace / "source"
+        runtime.git(source, "update-ref", "-d", "refs/remotes/origin/main")
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(runtime.WorkflowError, "fetched base is unavailable"):
+                runtime._check_git_snapshot(self.cfg, checkout, Path(temporary))
+            self.assertFalse((Path(temporary) / "gitfile").exists())
 
     def test_two_checks_share_one_image_id_in_proof(self):
         from dataclasses import replace

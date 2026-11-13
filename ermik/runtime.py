@@ -597,14 +597,27 @@ def _check_git_snapshot(cfg: Config, checkout: Path, directory: Path) -> tuple[P
     head = git(checkout, "rev-parse", "HEAD")
     if not re.fullmatch(r"[0-9a-f]{40}", head):
         raise WorkflowError("checkout HEAD is invalid")
+    base_ref = f"refs/remotes/origin/{cfg.base_branch}"
+    try:
+        base = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+        source_base = git(source, "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+    except WorkflowError as exc:
+        raise WorkflowError("fetched base is unavailable for local checks") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", base) or source_base != base:
+        raise WorkflowError("fetched base differs from checkout")
     snapshot = directory / "snapshot"
-    checked(["git", "clone", "--no-local", "--no-checkout", "--single-branch",
-             "--no-tags", "--branch", cfg.base_branch, str(source), str(snapshot)],
-            timeout=300)
-    git(snapshot, "fetch", "--no-tags", str(source), head, timeout=300)
+    checked(["git", "init", "-b", "ci-head", str(snapshot)], timeout=300)
+    git(snapshot, "fetch", "--no-tags", "--no-write-fetch-head", str(source),
+        base, head, timeout=300)
+    git(snapshot, "update-ref", base_ref, base)
+    git(snapshot, "update-ref", f"refs/heads/{cfg.base_branch}", base)
     git(snapshot, "symbolic-ref", "HEAD", "refs/heads/ci-head")
     git(snapshot, "update-ref", "refs/heads/ci-head", head)
     git(snapshot, "reset", "--mixed", "HEAD")
+    if (git(checkout, "rev-parse", "HEAD") != head
+            or git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}") != base
+            or git(source, "rev-parse", "--verify", f"{base_ref}^{{commit}}") != base):
+        raise WorkflowError("checkout or fetched base moved during local checks")
     git_file = directory / "gitfile"
     git_file.write_text("gitdir: /ci-git\n", encoding="ascii")
     return snapshot / ".git", git_file
