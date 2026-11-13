@@ -35,6 +35,17 @@ class OutcomeTests(unittest.TestCase):
                          (issue, f"work/{issue}", "a" * 40, head, pr, "merged",
                           '["src"]', route))
 
+    def test_task_set_groups_remain_distinct_and_legacy_is_unknown(self):
+        for issue in (1, 2, 3):
+            self.add_job(issue, issue + 10, "route:fast", "b" * 40)
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET task_set='parser' WHERE issue IN (1,2)")
+        report = build_outcome_report(self.cfg, self.maintainer)
+        self.assertEqual([row["task_set"] for row in report["jobs"]],
+                         ["parser", "parser", None])
+        self.assertEqual({(row["task_set"], row["jobs"]) for row in report["cohorts"]},
+                         {("parser", 2), (None, 1)})
+
     def attempt(self, issue, name, code, *, cost=None, tokens=None, usage=None,
                 phase="initial", pending=False, provider="provider"):
         with state.connect(self.cfg.state_dir) as conn:

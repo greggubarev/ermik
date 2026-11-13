@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 
-MAX_SCHEMA = 6
+MAX_SCHEMA = 7
 EXCLUDED_DB = {"state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm",
                "state.sqlite3-journal"}
 

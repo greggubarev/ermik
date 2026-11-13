@@ -297,11 +297,27 @@ def _complexity_key(issue: dict) -> str | None:
     return next(iter(values)) if len(values) == 1 else None
 
 
+TASK_SET = re.compile(r"task-set:([a-z][a-z0-9-]{0,39})\Z")
+
+
+def _task_set(issue: dict) -> str | None:
+    values = [name for name in labels(issue) if name.startswith("task-set:")]
+    if not values:
+        return None
+    if len(values) != 1 or TASK_SET.fullmatch(values[0]) is None:
+        raise ValueError("missing or conflicting task-set label")
+    return values[0].removeprefix("task-set:")
+
+
 def _admission_marker(issue: int, spec: IssueSpec, cfg: Config | None = None,
                       current: dict | None = None) -> str:
     scope = hashlib.sha256(json.dumps(spec.allowed_paths, separators=(",", ":"),
                                      ensure_ascii=False).encode("utf-8")).hexdigest()
     marker = f"SEMI_ADMIT issue={issue} body={spec.body_sha256} scope={scope}"
+    if current is not None:
+        task_set = _task_set(current)
+        if task_set is not None:
+            marker += f" task_set={task_set}"
     if cfg is not None and cfg.complexity_profiles:
         if current is None:
             raise ValueError("issue labels are required for complexity admission")
@@ -317,7 +333,7 @@ def _admission_marker(issue: int, spec: IssueSpec, cfg: Config | None = None,
 def _approved_on_github(gh: GitHub, cfg: Config, issue: int, spec: IssueSpec,
                         current: dict | None = None) -> bool:
     try:
-        if cfg.complexity_profiles and current is None:
+        if current is None:
             current = gh.issue(issue)
         marker = _admission_marker(issue, spec, cfg, current)
     except ValueError:
@@ -334,7 +350,16 @@ def _row_complexity(row) -> str | None:
         return None
 
 
+def _job_task_set_matches(current: dict, row) -> bool:
+    try:
+        return _task_set(current) == row["task_set"]
+    except ValueError:
+        return False
+
+
 def _job_complexity_matches(cfg: Config, current: dict, row) -> bool:
+    if not _job_task_set_matches(current, row):
+        return False
     if not cfg.complexity_profiles:
         return _row_complexity(row) is None
     key = _complexity_key(current)
@@ -927,12 +952,19 @@ def _task_file(cfg: Config, issue: int, body: str, correction_note: str | None) 
     return path
 
 
-def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
+def admit(cfg: Config, number: int, complexity: str | None = None,
+          task_set: str | None = None) -> dict:
     gh = GitHub(cfg.repo)
     if gh.identity() != cfg.maintainer:
         raise WorkflowError("only the configured maintainer can admit an issue")
     issue = gh.issue(number)
     names = labels(issue)
+    if task_set is not None and (TASK_SET.fullmatch(f"task-set:{task_set}") is None):
+        raise WorkflowError("--task-set requires a bounded lowercase slug")
+    try:
+        old_task_set = _task_set(issue)
+    except ValueError as exc:
+        raise WorkflowError("conflicting task-set labels") from exc
     uncertain_prepublication = bool(
         cfg.complexity_profiles and "state:in-progress" in names
         and "state:blocked" not in names
@@ -979,7 +1011,8 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
             first = (comment.get("body") or "").splitlines()[0:1]
             match = re.fullmatch(
                 rf"SEMI_ADMIT issue={number} body=[0-9a-f]{{64}} "
-                r"scope=([0-9a-f]{64})(?: tier=(?:easy|medium|hard) "
+                r"scope=([0-9a-f]{64})(?: task_set=[a-z][a-z0-9-]{0,39})?"
+                r"(?: tier=(?:easy|medium|hard) "
                 r"route=route:[a-z][a-z0-9_-]{0,39} profile=[0-9a-f]{64})?",
                 first[0]) if first else None
             if match:
@@ -998,6 +1031,8 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
         if (existing and blocked_readmission
                 and tuple(json.loads(existing["allowed_json"])) != spec.allowed_paths):
             raise WorkflowError("blocked job allowed paths changed")
+        if existing and blocked_readmission and existing["task_set"] != task_set:
+            raise WorkflowError("blocked job task-set cannot change")
     if cfg.complexity_profiles:
         if complexity not in cfg.complexity_profiles:
             raise WorkflowError("admit requires a configured --complexity tier")
@@ -1005,6 +1040,23 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
             _profile_sha(cfg, complexity, _route_key(issue))
         except ValueError as exc:
             raise WorkflowError("configured complexity has no eligible route") from exc
+    elif complexity is not None:
+        raise WorkflowError("--complexity requires complexity_profiles")
+    if cfg.complexity_profiles and _complexity_key(issue) is None and any(
+            name.startswith("complexity:") for name in labels(issue)):
+        raise WorkflowError("conflicting complexity labels")
+    if "state:ready" in names and not cfg.complexity_profiles and not _approved_on_github(
+            gh, cfg, number, spec, issue):
+        raise WorkflowError("ready issue lacks the matching maintainer approval")
+    if task_set is not None and old_task_set != task_set:
+        gh.label(number, add=f"task-set:{task_set}",
+                 remove=f"task-set:{old_task_set}" if old_task_set else "")
+        issue = gh.issue(number)
+        if _task_set(issue) != task_set:
+            raise WorkflowError("task-set label changed during admission")
+    elif task_set is None and old_task_set is not None:
+        raise WorkflowError("existing task-set label requires --task-set")
+    if cfg.complexity_profiles:
         old = _complexity_key(issue)
         if old is not None and old != f"complexity:{complexity}":
             gh.label(number, add=f"complexity:{complexity}", remove=old)
@@ -1014,13 +1066,9 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
                 raise WorkflowError("conflicting complexity labels")
             gh.label(number, add=f"complexity:{complexity}", remove="")
             issue = gh.issue(number)
-    elif complexity is not None:
-        raise WorkflowError("--complexity requires complexity_profiles")
     names = labels(issue)
     marker = _admission_marker(number, spec, cfg, issue)
     already_ready = "state:ready" in names
-    if already_ready and not cfg.complexity_profiles and not _approved_on_github(gh, cfg, number, spec):
-        raise WorkflowError("ready issue lacks the matching maintainer approval")
     with state.connect(cfg.state_dir) as conn:
         existing = state.job(conn, number)
         if existing and not (blocked_readmission and existing["status"] == "blocked"
@@ -1049,6 +1097,7 @@ def admit(cfg: Config, number: int, complexity: str | None = None) -> dict:
         gh.label(number, add="state:ready", remove="state:proposed")
     return {"issue": number, "allowed_paths": spec.allowed_paths,
             "body_sha256": spec.body_sha256,
+            "task_set": task_set,
             **({"complexity": complexity} if complexity is not None else {})}
 
 
@@ -1121,6 +1170,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                               or cfg.complexity_profiles and row["status"] == "blocked"))
         if (spec is None or
                 tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+                or not _job_task_set_matches(issue, row)
                 or (approved is not None and
                     tuple(json.loads(approved["allowed_json"])) != spec.allowed_paths)
                 or not approved_on_github
@@ -1280,6 +1330,7 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 fresh_pr = gh.pr(row["pr"])
                 if (parse_issue(fresh_issue.get("body") or "").body_sha256
                         != spec.body_sha256
+                        or not _job_task_set_matches(fresh_issue, row)
                         or not {"queue:worker", "state:blocked"}.issubset(
                             labels(fresh_issue))
                         or _route_key(fresh_issue) != route
@@ -1413,10 +1464,11 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
         tier_key = _complexity_key(issue) if cfg.complexity_profiles else None
         tier = tier_key.removeprefix("complexity:") if tier_key else None
         conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,route_key,"
-                     "complexity,profile_sha) VALUES(?,?,?,?,?,?,?,?)",
+                     "complexity,profile_sha,task_set) VALUES(?,?,?,?,?,?,?,?,?)",
                      (number, branch, base, "running", json.dumps(spec.allowed_paths),
                       _route_key(issue), tier,
-                      _profile_sha(cfg, tier, _route_key(issue)) if tier else None))
+                      _profile_sha(cfg, tier, _route_key(issue)) if tier else None,
+                      _task_set(issue)))
         state.event(conn, number, "claimed")
         conn.commit()  # The local intent must exist before the external label write.
         gh.label(number, add="state:in-progress", remove="state:ready")
@@ -1716,6 +1768,8 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
             if tier not in cfg.complexity_profiles or route is None:
                 continue
             digest = _profile_sha(cfg, tier, route)
+            if not _job_task_set_matches(issue, row):
+                raise WorkflowError("blocked job task-set cannot change")
             if (row["complexity"], row["route_key"], row["profile_sha"]) == (
                     tier, route, digest):
                 continue
@@ -1768,6 +1822,7 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
                     or not {"queue:worker", "state:in-progress"}.issubset(labels(fresh))
                     or not _approved_on_github(gh, cfg, row["issue"], spec, fresh)
                     or _route_key(fresh) != route or _complexity_key(fresh) != tier_key
+                    or not _job_task_set_matches(fresh, row)
                     or gh.find_branch_pr(row["branch"]) is not None):
                 raise WorkflowError("re-admission approval changed during reconciliation")
             if not any(note.get("id") == readmit_id
@@ -2104,6 +2159,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
     with state.connect(cfg.state_dir) as conn:
         job_row = state.job(conn, issue)
         cohort = job_row["route_key"]
+    if not _job_task_set_matches(current, job_row):
+        raise WorkflowError("approved task-set changed after claim")
     if cfg.complexity_profiles:
         if (not _job_complexity_matches(cfg, current, job_row)
                 or not _approved_on_github(gh, cfg, issue, spec)):

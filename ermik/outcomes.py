@@ -69,7 +69,7 @@ def _read_controller(cfg: Config) -> tuple[list[sqlite3.Row], list[sqlite3.Row],
         if conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
             raise ValueError(f"outcome export requires controller state schema v{SCHEMA_VERSION}")
         jobs = conn.execute(
-            "SELECT issue,pr,head_sha,status,route_key,attempts_count "
+            "SELECT issue,pr,head_sha,status,route_key,task_set,attempts_count "
             "FROM jobs ORDER BY issue LIMIT ?",
             (MAX_JOBS + 1,)).fetchall()
         attempts = conn.execute(
@@ -169,7 +169,7 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
         providers = [row["provider_id"] for row in rows if row["provider_id"]]
         results.append({
             "issue": issue, "pr": pr, "head": job["head_sha"],
-            "period": admission_month, "route": route,
+            "period": admission_month, "route": route, "task_set": job["task_set"],
             "accepted": accepted, "decision_state": decision_state,
             "accepted_at": accepted_at.isoformat() if accepted_at else None,
             "elapsed_ms": elapsed_ms,
@@ -209,11 +209,12 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
             "unknown_cost_attempts": unknown_cost,
             "billed_cost": None,
         })
-    groups: dict[tuple[str | None, str], list[dict]] = {}
+    groups: dict[tuple[str | None, str, str | None], list[dict]] = {}
     for row in results:
-        groups.setdefault((row["period"], row["route"]), []).append(row)
+        groups.setdefault((row["period"], row["route"], row["task_set"]), []).append(row)
     cohorts = []
-    for (month, route), rows in sorted(groups.items(), key=lambda item: (item[0][0] or "", item[0][1])):
+    for (month, route, task_set), rows in sorted(
+            groups.items(), key=lambda item: (item[0][0] or "", item[0][1], item[0][2] or "")):
         accepted = sum(row["accepted"] for row in rows)
         cost = sum(row["observed_estimated_cost"] for row in rows)
         missing = sum(row["unknown_cost_attempts"] for row in rows)
@@ -224,7 +225,7 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
                   + usage_totals["observed_cache_read_tokens"])
         total = usage_totals["observed_total_tokens"]
         cohorts.append({
-            "period": month, "route": route, "jobs": len(rows),
+            "period": month, "route": route, "task_set": task_set, "jobs": len(rows),
             "accepted_prs": accepted,
             "first_review_acceptances": sum(row["first_review_accepted"] for row in rows),
             "first_review_rate_denominator": sum(row["first_review_observed"] for row in rows),

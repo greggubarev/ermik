@@ -309,6 +309,19 @@ class ComplexityProfileTests(unittest.TestCase):
                 self.assertEqual(row["profile_sha"],
                                  runtime._profile_sha(cfg, "medium", "route:go"))
 
+    def test_blocked_pr_cannot_change_frozen_task_set(self):
+        cfg, hub = self.readmission_hub()
+        hub.names.add("task-set:replacement")
+        prior_notes = list(hub.notes)
+        with patch.object(runtime, "GitHub", return_value=hub), patch.object(
+                runtime, "_require_pr"):
+            with self.assertRaisesRegex(runtime.WorkflowError,
+                                        "blocked job task-set cannot change"):
+                runtime.admit(cfg, 1, "medium", task_set="replacement")
+        self.assertEqual(hub.notes, prior_notes)
+        with state.connect(cfg.state_dir) as conn:
+            self.assertIsNone(state.job(conn, 1)["task_set"])
+
     def test_old_request_cannot_readmit_blocked_pr(self):
         cfg, hub = self.readmission_hub(request_id=19)
         with patch.object(runtime, "_require_pr"):
