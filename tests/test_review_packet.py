@@ -178,16 +178,66 @@ class ReviewPacketTests(unittest.TestCase):
                  "image_id": "sha256:" + "9" * 64,
                  "published_image_id": IMAGE,
                  "image_config_digest": IMAGE_CONFIG_DIGEST,
-                 "decision": "reviewed", "ci": {"result": "passed",
-                                                 "private_log": "/secret/log"}}
+                 "decision": "reviewed", "ci": {
+                     "result": "passed", "head": HEAD, "committed_diff_base": BASE,
+                     "image_id": "sha256:" + "9" * 64,
+                     "image_config_digest": IMAGE_CONFIG_DIGEST,
+                     "checks": [{"command": ["check"], "exit_code": 0,
+                                 "log_sha256": "2" * 64,
+                                 "log": "/secret/log"}]}}
         with (patch("ermik.review_packet._load", return_value=local),
               patch("ermik.review_packet._review_policy", return_value=IMAGE),
               patch("ermik.review_packet.fetch_manifest",
                     return_value=({"status": "current"}, self.record()))):
             packet = build_review_packet(self.cfg, 12)
         self.assertEqual(packet["status"], "current")
-        self.assertEqual(packet["review"], {"status": "current", "head": HEAD})
+        self.assertEqual(packet["review"], {
+            "status": "current", "head": HEAD,
+            "checks_sha256": _checks_sha256(self.cfg),
+            "image_id": "sha256:" + "9" * 64,
+            "published_image_id": IMAGE,
+            "image_config_digest": IMAGE_CONFIG_DIGEST,
+            "checks": [{"index": 1, "result": "passed",
+                        "log_sha256": "2" * 64}]})
         self.assertNotIn("/secret/log", str(packet))
+        self.assertNotIn("command", str(packet["review"]))
+        with (patch("ermik.review_packet._load", return_value=local),
+              patch("ermik.review_packet._review_policy",
+                    side_effect=WorkflowError("image changed")),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "current"}, self.record()))):
+            changed_image = build_review_packet(self.cfg, 12)
+        self.assertEqual(changed_image["review"]["status"], "stale")
+        self.assertNotIn("checks", changed_image["review"])
+
+    def test_failed_or_missing_local_check_cannot_appear_current(self):
+        (self.cfg.state_dir / "reviews").mkdir(parents=True)
+        (self.cfg.state_dir / "reviews" / "pr-12.json").write_text("{}")
+        local = {"repo": self.cfg.repo, "issue": 7, "pr": 12,
+                 "head_repository": self.cfg.repo,
+                 "branch": self.pr["headRefName"], "base": BASE, "head": HEAD,
+                 "body_sha256": self.spec.body_sha256, "paths": ["src/one.py"],
+                 "checks_sha256": _checks_sha256(self.cfg),
+                 "image_id": "sha256:" + "9" * 64,
+                 "published_image_id": IMAGE,
+                 "image_config_digest": IMAGE_CONFIG_DIGEST,
+                 "decision": "reviewed", "ci": {"result": "passed",
+                     "head": HEAD, "committed_diff_base": BASE,
+                     "image_id": "sha256:" + "9" * 64,
+                     "image_config_digest": IMAGE_CONFIG_DIGEST,
+                     "checks": [{"command": ["check"], "exit_code": 1,
+                                 "log_sha256": "2" * 64}]}}
+        with (patch("ermik.review_packet._load", return_value=local),
+              patch("ermik.review_packet._review_policy", return_value=IMAGE),
+              patch("ermik.review_packet.fetch_manifest",
+                    return_value=({"status": "current"}, self.record()))):
+            packet = build_review_packet(self.cfg, 12)
+            self.assertEqual(packet["review"]["status"], "stale")
+            self.assertNotIn("checks", packet["review"])
+            local["ci"]["checks"] = []
+            packet = build_review_packet(self.cfg, 12)
+            self.assertEqual(packet["review"]["status"], "stale")
+            self.assertNotIn("checks", packet["review"])
 
     def test_local_review_without_config_digest_is_stale(self):
         (self.cfg.state_dir / "reviews").mkdir(parents=True)

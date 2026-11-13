@@ -51,6 +51,24 @@ class MaintainerViewTests(unittest.TestCase):
         self.assertEqual(row["publisher_model_claim"], "provider/model")
         self.assertEqual(row["next_action"], "review_current_head")
 
+    def test_current_local_provenance_is_same_in_queue_json_and_html(self):
+        packet = self.packet(review="current")
+        packet["review"].update({
+            "head": HEAD, "checks_sha256": "b" * 64,
+            "image_id": "sha256:" + "c" * 64,
+            "published_image_id": "sha256:" + "d" * 64,
+            "image_config_digest": "sha256:" + "e" * 64,
+            "checks": [{"index": 1, "result": "passed", "log_sha256": "f" * 64}],
+        })
+        snapshot = self.snapshot(packet)[0]
+        self.assertEqual(snapshot["items"][0]["local_review"], packet["review"])
+        html = render_html(snapshot)
+        self.assertIn(b'&quot;log_sha256&quot;', html)
+        self.assertIn(b"f" * 64, html)
+        stale = self.packet(review="stale")
+        stale["review"]["checks"] = packet["review"]["checks"]
+        self.assertIsNone(self.snapshot(stale)[0]["items"][0]["local_review"])
+
     def test_stale_missing_blocked_and_correction_never_look_approved(self):
         for status in ("missing", "stale", "incomplete"):
             with self.subTest(status=status):
@@ -112,7 +130,7 @@ class MaintainerViewTests(unittest.TestCase):
         html = render_html({"items": [{key: "<script>" for key in (
             "issue", "pr", "head", "remote_label_state", "controller_runtime",
             "model_route_label", "publisher_model_claim", "evidence", "checks",
-            "review", "next_action")}]})
+            "review", "local_review", "next_action")}]})
         self.assertNotIn(b"<script>", html)
         self.assertIn(b'http-equiv="refresh" content="120"', html)
         with patch("ermik.maintainer_view.queue_snapshot", return_value={
