@@ -18,7 +18,7 @@ from .runtime import (WorkflowError, _approved_on_github, git, local_checks,
                       mirror, main_sha, _portable_image_digest,
                       _resolve_image_id, published_image_id,
                       published_image_config_digest, BLOCKED_CORRECTION,
-                      REWORK)
+                      REWORK, _scope_digest, _stale_rebase_body)
 from . import state
 
 
@@ -210,6 +210,103 @@ def _review_locked(cfg: Config, number: int) -> dict:
 def request_changes(cfg: Config, number: int, note_file: Path) -> dict:
     with state.exclusive(cfg.state_dir):
         return _request_changes_locked(cfg, number, note_file)
+
+
+def request_rebase(cfg: Config, number: int) -> dict:
+    """Request a correction of an unreviewed HEAD against an advanced base."""
+    with state.exclusive(cfg.state_dir):
+        gh = (GitHub(cfg.repo, cfg.publish_repo, cfg.publish_token_env)
+              if cfg.publish_repo else GitHub(cfg.repo))
+        pr, issue_num, issue = _identity(cfg, gh, number)
+        prior = _load(cfg, number)
+        spec = parse_issue(issue["body"])
+        if (prior.get("merge_attempt") is not None
+                or prior.get("decision") != "reviewed"
+                or prior.get("pr") != number or prior.get("issue") != issue_num
+                or prior.get("repo") != cfg.repo
+                or prior.get("head_repository") != (cfg.publish_repo or cfg.repo)
+                or prior.get("branch") != pr["headRefName"]
+                or prior.get("body_sha256") != spec.body_sha256
+                or prior.get("head") == pr["headRefOid"]
+                or prior.get("published_image_id") != published_image_id(
+                    pr.get("body") or "")
+                or prior.get("image_config_digest") != published_image_config_digest(
+                    pr.get("body") or "")):
+            raise WorkflowError("prior review does not bind this draft PR")
+        _review_policy(cfg, prior, check_reference=True)
+        review_digest(cfg, prior)
+        check_decision(cfg, prior, "changes_requested")
+        validate_changed_paths(prior["paths"], spec.allowed_paths)
+        if pr.get("isDraft") is not True:
+            raise WorkflowError("stale-base correction requires a draft PR")
+        target = main_sha(gh, cfg)
+        base, head = pr["baseRefOid"], pr["headRefOid"]
+        if (not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base)
+                or not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head)):
+            raise WorkflowError("stale-base PR commit identity is invalid")
+        if base == target:
+            raise WorkflowError("PR base is current; run review")
+        scope_sha = _scope_digest(spec.allowed_paths)
+        body = _stale_rebase_body(issue_num, head, base, target,
+                                  spec.body_sha256, scope_sha)
+        expected = {"repo": cfg.repo, "issue": issue_num, "pr": number,
+                    "branch": pr["headRefName"], "head": head, "base": base,
+                    "target": target, "body_sha256": spec.body_sha256,
+                    "scope_sha256": scope_sha, "prior_head": prior["head"],
+                    "comment_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+        path = cfg.state_dir / "rebase-intents" / f"pr-{number}.json"
+        try:
+            if path.lstat().st_size > 2048:
+                raise WorkflowError("rebase intent unexpectedly large")
+            saved = read_evidence(path)
+        except FileNotFoundError:
+            saved = None
+        comments = gh.comments(number)
+        marker = f"SEMI_REWORK issue={issue_num} head={head}"
+        matching = [row for row in comments if row.get("body") == body
+                    and row.get("user", {}).get("login") == cfg.maintainer
+                    and type(row.get("id")) is int and row["id"] > 0]
+        if saved == expected:
+            if len(matching) != 1:
+                raise WorkflowError("rebase request publication is uncertain")
+            return {"pr": number, "issue": issue_num, "head": head,
+                    "target": target, "request": "already-present"}
+        if saved is not None:
+            same_request = all(saved.get(key) == expected[key] for key in (
+                "repo", "issue", "pr", "branch", "body_sha256",
+                "scope_sha256", "prior_head"))
+            old_comments = [row for row in comments
+                            if type(row.get("id")) is int
+                            and row.get("user", {}).get("login") == cfg.maintainer
+                            and isinstance(row.get("body"), str)
+                            and hashlib.sha256(row["body"].encode(
+                                "utf-8")).hexdigest() == saved.get("comment_sha256")]
+            if not same_request or len(old_comments) != 1:
+                raise WorkflowError("prior rebase request is uncertain or changed")
+        if matching or any(row.get("user", {}).get("login") == cfg.maintainer
+                           and isinstance(row.get("body"), str)
+                           and row["body"].splitlines()[:1] == [marker]
+                           and not (saved is not None and row in old_comments)
+                           for row in comments):
+            raise WorkflowError("exact-head correction request already exists")
+        current, current_issue, current_data = _identity(cfg, gh, number)
+        if (current_issue != issue_num or current["headRefOid"] != head
+                or current["baseRefOid"] != base
+                or current["headRefName"] != pr["headRefName"]
+                or current.get("isDraft") is not True
+                or parse_issue(current_data["body"]).body_sha256 != spec.body_sha256
+                or main_sha(gh, cfg) != target):
+            raise WorkflowError("stale-base request identity changed")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_evidence(path, expected, mode=0o600, max_bytes=2048)
+        gh.comment(number, body)
+        confirmed = [row for row in gh.comments(number) if row.get("body") == body
+                     and row.get("user", {}).get("login") == cfg.maintainer
+                     and type(row.get("id")) is int and row["id"] > 0]
+        if len(confirmed) != 1:
+            raise WorkflowError("rebase request comment is not confirmed")
+        return {"pr": number, "issue": issue_num, "head": head,
+                "target": target, "request": "posted"}
 
 
 def _request_changes_locked(cfg: Config, number: int, note_file: Path) -> dict:

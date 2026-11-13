@@ -23,7 +23,10 @@ BODY = "## Goal\nChange a file.\n\n## Allowed paths\nsrc/a.py\n\n## Acceptance\n
 class Hub:
     def __init__(self):
         self.head = HEADS[0]
+        self.base = BASE
         self.target = BASE
+        self.draft = False
+        self.issue_body = BODY
         self.comments_list = []
         self.issue_comments = []
         self.blocked = False
@@ -35,15 +38,15 @@ class Hub:
         return "maintainer"
 
     def pr(self, number):
-        return {"number": number, "state": "OPEN", "isDraft": False,
-                "baseRefName": "main", "baseRefOid": BASE,
+        return {"number": number, "state": "OPEN", "isDraft": self.draft,
+                "baseRefName": "main", "baseRefOid": self.base,
                 "headRefName": "work/issue-7-delivery", "headRefOid": self.head,
                 "changedFiles": 1, "files": [{"path": "src/a.py"}],
                 "body": (f"Closes #7\n\nExecution image: `{IMAGE}`\n"
                          f"Execution image config: `{CONFIG_DIGEST}`")}
 
     def issue(self, _number):
-        return {"body": BODY, "labels": [{"name": "queue:worker"},
+        return {"body": self.issue_body, "labels": [{"name": "queue:worker"},
                                             {"name": "state:blocked" if self.blocked
                                              else "state:in-progress"}]}
 
@@ -221,6 +224,60 @@ class DecisionIntegrationTests(unittest.TestCase):
                                        "user": {"login": "maintainer"}})
         with self.assertRaisesRegex(WorkflowError, "publication is uncertain"):
             review.request_changes(self.cfg, 19, note)
+
+    def test_stale_head_rebase_request_preserves_prior_review_and_reconciles(self):
+        prior = review.review(self.cfg, 19)
+        review.request_changes(self.cfg, 19, self._note())
+        self.hub.head = HEADS[1]
+        self.hub.target = HEADS[2]
+        self.hub.draft = True
+        self.hub.lose_comment = True
+        with self.assertRaises(GitHubError):
+            review.request_rebase(self.cfg, 19)
+        self.assertEqual(review.request_rebase(self.cfg, 19)["request"],
+                         "already-present")
+        self.assertEqual(review._load(self.cfg, 19)["head"], prior["head"])
+        self.assertIn(f"SEMI_REWORK issue=7 head={HEADS[1]}",
+                      self.hub.comments_list[-1]["body"])
+        self.assertIn(f"target={HEADS[2]}", self.hub.comments_list[-1]["body"])
+        self.assertIn("SEMI_REBASE_ONLY", self.hub.comments_list[-1]["body"])
+        self.assertEqual(self.hub.writes, ["comment", "comment"])
+
+    def test_stale_head_rebase_refuses_current_base_or_changed_issue(self):
+        review.review(self.cfg, 19)
+        self.hub.head = HEADS[1]
+        self.hub.draft = True
+        with self.assertRaisesRegex(WorkflowError, "PR base is current"):
+            review.request_rebase(self.cfg, 19)
+        self.hub.target = HEADS[2]
+        self.hub.issue_body = BODY + "Additional condition.\n"
+        with self.assertRaisesRegex(WorkflowError, "prior review"):
+            review.request_rebase(self.cfg, 19)
+        self.assertEqual(self.hub.writes, [])
+
+    def test_stale_head_rebase_can_retarget_after_confirmed_request(self):
+        review.review(self.cfg, 19)
+        self.hub.head = HEADS[1]
+        self.hub.draft = True
+        self.hub.target = HEADS[2]
+        self.assertEqual(review.request_rebase(self.cfg, 19)["request"], "posted")
+        self.hub.target = HEADS[0]
+        self.assertEqual(review.request_rebase(self.cfg, 19)["request"], "posted")
+        self.assertIn(f"target={HEADS[2]}", self.hub.comments_list[0]["body"])
+        self.assertIn(f"target={HEADS[0]}", self.hub.comments_list[1]["body"])
+        self.assertEqual(review._load(self.cfg, 19)["head"], HEADS[0])
+
+    def test_stale_head_rebase_uncertain_post_never_reposts(self):
+        review.review(self.cfg, 19)
+        self.hub.head = HEADS[1]
+        self.hub.target = HEADS[2]
+        self.hub.draft = True
+        with patch.object(self.hub, "comment", side_effect=GitHubError("lost")):
+            with self.assertRaises(GitHubError):
+                review.request_rebase(self.cfg, 19)
+        with self.assertRaisesRegex(WorkflowError, "publication is uncertain"):
+            review.request_rebase(self.cfg, 19)
+        self.assertEqual(self.hub.writes, [])
 
     def test_interrupted_review_append_reconciles_from_saved_record(self):
         with patch.object(review, "append_decision", side_effect=OSError("interrupted")):

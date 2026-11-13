@@ -350,6 +350,57 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(selected[2], 102)
             self.assertEqual(state.job(conn, 1)["last_request"], 102)
 
+    def test_stale_base_rebase_request_requires_checks_and_exact_target(self):
+        spec = runtime.parse_issue(BODY)
+        FakeHub.issues[1]["names"] = {"queue:worker", "state:in-progress"}
+        FakeHub.prs[10] = {"state": "OPEN", "isDraft": True,
+                            "headRefName": "work/issue-1-delivery",
+                            "headRefOid": SHA_B, "baseRefOid": SHA_A}
+        FakeHub.notes[1] = [{"id": 1,
+                             "body": runtime._admission_marker(1, spec),
+                             "user": {"login": "owner"}}]
+        FakeHub.notes[10] = [{"id": 100,
+                              "body": runtime._stale_rebase_body(
+                                  1, SHA_B, SHA_A, "d" * 40, spec.body_sha256,
+                                  runtime._scope_digest(spec.allowed_paths)),
+                              "user": {"login": "owner"}},
+                             {"id": 101,
+                              "body": runtime._stale_rebase_body(
+                                  1, SHA_B, SHA_A, SHA_C, spec.body_sha256,
+                                  runtime._scope_digest(spec.allowed_paths)),
+                              "user": {"login": "owner"}}]
+        proof_path = self.cfg.state_dir / "evidence" / "1" / f"{SHA_B}.json"
+        proof_path.parent.mkdir(parents=True)
+        runtime.write_evidence(proof_path, {
+            "ci": {"head": SHA_B, "committed_diff_base": SHA_A,
+                   "checks": [{"command": ["true"], "exit_code": 0}]}})
+        with state.connect(self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
+                         (1, spec.body_sha256, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,head_sha,pr,status,"
+                         "allowed_json) VALUES(?,?,?,?,?,?,?)",
+                         (1, "work/issue-1-delivery", SHA_A, SHA_B, 10,
+                          "awaiting_review", '["src/example.py"]'))
+            with patch.object(runtime, "main_sha", return_value=SHA_C), patch.object(
+                    runtime, "_published_evidence_matches", return_value=True):
+                self.assertIsNone(runtime._correction(FakeHub("owner/repo"), self.cfg, conn))
+                self.assertEqual(state.job(conn, 1)["status"], "awaiting_review")
+                state.event(conn, 1, "checks_passed", head_sha=SHA_B)
+                conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+                with patch.object(runtime, "main_sha", return_value=SHA_B):
+                    self.assertIsNone(runtime._correction(FakeHub("owner/repo"),
+                                                           self.cfg, conn))
+                self.assertEqual(state.job(conn, 1)["status"], "awaiting_review")
+                conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+                FakeHub.notes[10][1]["user"]["login"] = "wrong-author"
+                self.assertIsNone(runtime._correction(FakeHub("owner/repo"),
+                                                       self.cfg, conn))
+                FakeHub.notes[10][1]["user"]["login"] = "owner"
+                conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+                selected = runtime._correction(FakeHub("owner/repo"), self.cfg, conn)
+            self.assertEqual(selected[2], 101)
+            self.assertEqual(state.job(conn, 1)["status"], "correcting")
+
     def test_ready_label_without_maintainer_admission_is_ignored(self):
         FakeHub.issues[1]["names"] = {"queue:worker", "state:ready"}
         with state.connect(self.cfg.state_dir) as conn:

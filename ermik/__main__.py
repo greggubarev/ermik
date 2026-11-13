@@ -14,7 +14,7 @@ import uuid
 
 from .config import load_config
 from .github import GitHub
-from .review import merge, request_changes, review
+from .review import merge, request_changes, request_rebase, review
 from .runtime import admit, checked, main_sha, poll, run_once
 from .observability import QUOTA_FILE, quota_status, status_snapshot
 from .quota import probe, unknown
@@ -177,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
     correction_parser = commands.add_parser("request-changes")
     correction_parser.add_argument("pr", type=int)
     correction_parser.add_argument("--note-file", type=Path, required=True)
+    rebase_parser = commands.add_parser("request-rebase")
+    rebase_parser.add_argument("pr", type=int)
     merge_parser = commands.add_parser("merge")
     merge_parser.add_argument("pr", type=int)
     export_parser = commands.add_parser("export-evidence")
@@ -280,6 +282,8 @@ def main(argv: list[str] | None = None) -> int:
                       "providers": len(snapshot["providers"]), "result": "written"}
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
+        elif args.command == "request-rebase":
+            result = request_rebase(cfg, args.pr)
         elif args.command == "merge":
             result = merge(cfg, args.pr)
         elif args.command == "export-evidence":
