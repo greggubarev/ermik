@@ -40,6 +40,14 @@ without changing data. Test both cases and describe the result.
 
 ## Compare route outcomes
 
+Before admitting a proposed issue with one `task-set:` label, `recommend-effort` can inspect comparable local history:
+
+```sh
+python -m ermik --config config.json recommend-effort ISSUE --maintainer-state-dir PATH
+```
+
+Use a consistent read-only copy of controller state in `config.json` and the matching separate maintainer decision trail at `PATH`. The command reads the open scoped GitHub issue and both local stores. It requires configured complexity profiles, at least two tiers with `quality_min_samples` confirmed current-HEAD merges each, and merges within 30 days. Every matching task-set/route job must retain its original profile digest, complete attempt usage and estimated cost, and a confirmed review and merge if it has a PR. An unresolved or stale PR refuses the cohort. Failed jobs without a PR and retries count in cost and failed-attempt rates. The result states sample counts, the observed-review denominator, first-review acceptance, failure rate, observed token totals, estimated cost basis, a digest of cohort identities, and the selected profile digest. It recommends the lowest eligible tier whose acceptance and failure rates are each within five percentage points of the best observed rate; otherwise it refuses if no tier meets both bounds. Sparse, stale, changed, or incomplete cohorts return `decision: refused` with a reason. A task-set label groups work but does not prove equal difficulty. This is observational advice only; it does not admit an issue, write policy, or bypass review.
+
 After making a consistent SQLite backup of the controller's private v5 state and transferring the matching maintainer `decision-trail` directory to one trusted analysis host, run `python -m ermik --config config.json outcomes --maintainer-state-dir PATH --period YYYY-MM`. Point `config.json` at the backed-up controller state and `PATH` at the separate maintainer state directory. The command reads both stores without changing them and emits bounded JSON. Keep the copies private; the report contains repository, Issue and PR identifiers, but no task body, credentials, or local paths.
 
 The period is the UTC month of admission, so attempts for failed jobs and later corrections remain in the original cohort. A PR counts as accepted only when the validated maintainer journal records `merged` for its current HEAD. The report separates observed tokens and estimated cost from unknown usage; billed cost and provider balance remain unknown. Cost per accepted PR is unavailable when any attempt in that route cohort lacks an estimate, when attempt history is missing, or when no PR was accepted. `retry_scheduled_events` and `quota_paused_events` come from the controller event log; correction attempts are counted separately. This report supports comparison; it does not change routing defaults or authorize a merge.

@@ -11,8 +11,10 @@ from ermik.config import Config
 from ermik import state
 from ermik.evidence_store import write_evidence
 from ermik.outcomes import audit_cohort, build_outcome_report, build_quality_snapshot
+from ermik.effort_advice import recommend_effort
 from ermik.providers import ModelCandidate
 from ermik.routing_policy import audit_route_order
+from ermik.runtime import _profile_sha
 
 
 class OutcomeTests(unittest.TestCase):
@@ -135,6 +137,76 @@ class OutcomeTests(unittest.TestCase):
                    for n, (decision_head, decision) in enumerate(decisions)]
         write_evidence(path, {"version": 1, "repo": self.cfg.repo,
                               "pr": pr, "entries": entries})
+
+    def test_effort_advice_uses_complete_frozen_jobs_and_refuses_sparse_or_changed(self):
+        base = ModelCandidate("provider", "model", "PROVIDER_API_KEY",
+                              base_url="https://example.com",
+                              supported_efforts=("low", "medium", "high"))
+        profiles = {tier: (replace(base, effort=effort),)
+                    for tier, effort in (("easy", "low"), ("medium", "medium"),
+                                         ("hard", "high"))}
+        cfg = replace(self.cfg, models=(base,), complexity_profiles=profiles,
+                      quality_min_samples=2)
+        head = "b" * 40
+        issue = {"number": 99, "state": "open", "body":
+                 "## Goal\nChange parser\n## Allowed paths\nsrc/parser.py\n"
+                 "## Acceptance\nParser works\n",
+                 "labels": [{"name": name} for name in
+                            ("queue:worker", "state:proposed", "task-set:parser")]}
+        for number, tier in ((1, "easy"), (2, "easy"), (3, "medium"),
+                             (4, "medium"), (5, "easy")):
+            self.add_job(number, number + 10, "route:auto", head)
+            with state.connect(cfg.state_dir) as conn:
+                conn.execute("UPDATE jobs SET complexity=?,profile_sha=?,task_set=?,"
+                             "pr=? WHERE issue=?", (tier, _profile_sha(cfg, tier),
+                             "parser", None if number == 5 else number + 10, number))
+            if number == 5:
+                self.attempt(number, f"attempt-{number}", 1, cost=0.5, tokens=50)
+            else:
+                self.attempt(number, f"attempt-{number}", 0, cost=0.2, tokens=20)
+                self.journal(number, number + 10, head,
+                             [(head, "reviewed"), (head, "merge_intent"),
+                              (head, "merged")])
+        now = datetime(2026, 10, 10, tzinfo=timezone.utc)
+        result = recommend_effort(cfg, issue, self.maintainer, observed_at=now)
+        self.assertEqual((result["decision"], result["proposed_tier"]),
+                         ("recommended", "medium"))
+        self.assertEqual(result["cohort"]["easy"]["jobs"], 3)
+        self.assertEqual(result["cohort"]["easy"]["attempts"], 3)
+        self.assertEqual(result["cohort"]["easy"]["estimated_cost_all_attempts"], 0.9)
+        self.assertEqual(result["cohort"]["easy"]["failed_attempt_rate"], 1 / 3)
+        self.assertEqual(result["cohort"]["easy"]["first_review_denominator"], 2)
+        self.add_job(6, 16, "route:auto", head)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET complexity=?,profile_sha=?,task_set=?,pr=NULL "
+                         "WHERE issue=6", ("medium", _profile_sha(cfg, "medium"),
+                                           "parser"))
+        self.attempt(6, "attempt-6", 1, cost=0.5, tokens=50)
+        self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
+                                         observed_at=now)["proposed_tier"], "easy")
+        self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
+                                         observed_at=datetime(2026, 11, 10,
+                                                              tzinfo=timezone.utc))
+                         ["refusal_reason"], "cohort_merge_stale_or_future")
+        changed_issue = {**issue, "labels": [*issue["labels"],
+                                              {"name": "task-set:other"}]}
+        self.assertEqual(recommend_effort(cfg, changed_issue, self.maintainer,
+                                         observed_at=now)["refusal_reason"],
+                         "task_set_missing_or_conflicting")
+        self.assertEqual(recommend_effort(replace(cfg, quality_min_samples=3), issue,
+                                         self.maintainer, observed_at=now)
+                         ["refusal_reason"], "insufficient_accepted_prs_per_tier")
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE usage_events SET estimated_cost=NULL WHERE issue=5")
+        self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
+                                         observed_at=now)["refusal_reason"],
+                         "cohort_attempt_usage_or_cost_incomplete")
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE usage_events SET estimated_cost=0.5 WHERE issue=5")
+            conn.execute("UPDATE jobs SET profile_sha=? WHERE issue=1", ("f" * 64,))
+        self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
+                                         observed_at=now)["refusal_reason"],
+                         "cohort_profile_changed_or_unknown")
 
     def test_two_routes_retry_and_failed_attempts_are_in_cost_numerator(self):
         head = "b" * 40
