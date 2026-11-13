@@ -52,11 +52,36 @@ class FakeGitHub:
         self.fail_before_post = False
         self.actor = "publisher"
         self.actor_id = 42
+        self.requests = []
+        self.reported_count = None
+        self.short_page = False
+        self.grow_after_pages = False
+        self.change_timestamp_after_pages = False
+        self.same_count_shift = False
+        self.page2_reads = 0
 
-    def api(self, endpoint):
+    def api(self, endpoint, *, timeout=90):
+        self.requests.append(endpoint)
+        if endpoint == "issues/12":
+            count = len(self.rows) if self.reported_count is None else self.reported_count
+            if self.grow_after_pages and any("comments?" in request
+                                             for request in self.requests):
+                count += 1
+            changed = (self.change_timestamp_after_pages
+                       and any("comments?" in request for request in self.requests))
+            return {"comments": count,
+                    "updated_at": "2026-01-02T00:00:00Z" if changed
+                    else "2026-01-01T00:00:00Z"}
         if endpoint.startswith("issues/12/comments?per_page=100&page="):
             page = int(endpoint.rsplit("=", 1)[1])
-            return self.rows[(page - 1) * 100:page * 100]
+            if page == 2:
+                self.page2_reads += 1
+                if self.same_count_shift and self.page2_reads == 1:
+                    self.rows = [row for row in self.rows if row["id"] != 50]
+                    self.rows.append({"id": 102, "body": "ordinary",
+                                      "user": {"login": "other", "id": 99}})
+            batch = self.rows[(page - 1) * 100:page * 100]
+            return batch[:-1] if self.short_page and page == 1 else batch
         raise AssertionError(endpoint)
 
     def command(self, args):
@@ -104,8 +129,10 @@ class EvidenceTransportTests(unittest.TestCase):
         self.assertEqual(len(self.gh.rows), 1)
         self.assertNotIn("provider/model", self.gh.rows[0]["body"])
         self.assertIsNone(_record(self.gh.rows[0]["body"])["model"])
+        self.gh.requests.clear()
         result, record = fetch_manifest(self.cfg, 12)
         self.assertEqual(result["status"], "current")
+        self.assertEqual(len(self.gh.requests), 3)
         self.assertEqual(record["sha256"], first["sha256"])
         self.assertTrue(self.gh.rows[0]["body"].startswith(MARKER))
         self.assertEqual(record["image_config_digest"], CONFIG_DIGEST)
@@ -187,9 +214,121 @@ class EvidenceTransportTests(unittest.TestCase):
         self.assertEqual(fetch_manifest(self.cfg, 12)[0],
                          {"status": "stale", "reason": "invalid_record"})
         self.gh.rows = [{"id": n, "body": "ordinary", "user": {"login": "other", "id": 99}}
-                        for n in range(1001)]
+                        for n in range(2001)]
         with self.assertRaises(GitHubError):
             fetch_manifest(self.cfg, 12)
+
+    def test_current_evidence_after_first_thousand_mixed_comments(self):
+        self.gh.rows = [{"id": n, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}
+                        for n in range(1, 1002)]
+        published = publish_manifest(self.cfg, 12)
+        self.assertEqual(published["comment_id"], 1002)
+        self.gh.requests.clear()
+        result, record = fetch_manifest(self.cfg, 12)
+        self.assertEqual(result["status"], "current")
+        self.assertEqual(record["sha256"], published["sha256"])
+        self.assertEqual(len(self.gh.requests), 24)
+
+    def test_correction_h2_after_old_h1_with_long_timeline(self):
+        publish_manifest(self.cfg, 12)
+        self.gh.rows.extend({"id": n, "body": "ordinary",
+                             "user": {"login": "other", "id": 99}}
+                            for n in range(2, 1002))
+        self.gh.head = "2" * 40
+        h2 = manifest(head=self.gh.head)
+        with patch("ermik.evidence_transport.export_manifest", return_value=h2):
+            published = publish_manifest(self.cfg, 12)
+        self.assertEqual(published["comment_id"], 1002)
+        status, record = fetch_manifest(self.cfg, 12)
+        self.assertEqual(status["status"], "current")
+        self.assertEqual(record["head"], self.gh.head)
+
+    def test_beyond_old_cap_refusals_and_incomplete_pagination(self):
+        self.gh.rows = [{"id": n, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}
+                        for n in range(1, 1002)]
+        publish_manifest(self.cfg, 12)
+        valid = {**self.gh.rows[-1], "user": dict(self.gh.rows[-1]["user"])}
+        self.gh.head = "2" * 40
+        self.assertEqual(fetch_manifest(self.cfg, 12)[0]["status"], "stale")
+        self.gh.head = HEAD
+        self.gh.rows[-1]["user"] = {"login": "other", "id": 99}
+        self.assertEqual(fetch_manifest(self.cfg, 12), ({"status": "missing"}, None))
+        self.gh.rows[-1] = valid
+        self.gh.rows[-1]["body"] = MARKER + "x" * 17000 + "```"
+        self.assertEqual(fetch_manifest(self.cfg, 12)[0],
+                         {"status": "stale", "reason": "invalid_record"})
+        self.gh.rows[-1]["body"] = _body(manifest(model=None))
+        conflicting = {key: value for key, value in manifest(model=None).items()
+                       if key not in ("version", "sha256", "attempts")}
+        self.gh.rows.append({**valid, "id": 1003,
+                             "body": _body(make_manifest(**conflicting, attempts=2))})
+        duplicate_result = fetch_manifest(self.cfg, 12)[0]
+        self.assertEqual(duplicate_result["status"], "duplicate", duplicate_result)
+        self.gh.rows.pop()
+        self.gh.short_page = True
+        with self.assertRaises(GitHubError):
+            fetch_manifest(self.cfg, 12)
+        self.gh.short_page = False
+        self.gh.requests.clear()
+        self.gh.grow_after_pages = True
+        with self.assertRaises(GitHubError):
+            fetch_manifest(self.cfg, 12)
+        self.gh.grow_after_pages = False
+        self.gh.requests.clear()
+        self.gh.change_timestamp_after_pages = True
+        with self.assertRaises(GitHubError):
+            fetch_manifest(self.cfg, 12)
+
+    def test_scan_wide_deadline_refuses_before_next_page(self):
+        self.gh.rows = [{"id": 1, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}]
+        with patch("ermik.evidence_transport._clock", side_effect=[0, 0, 0, 61]):
+            with self.assertRaisesRegex(GitHubError, "lookup timed out"):
+                fetch_manifest(self.cfg, 12)
+        self.assertEqual(self.gh.requests, ["issues/12"])
+
+    def test_same_count_shift_cannot_hide_conflicting_record(self):
+        record = manifest(model=None)
+        conflicting = {key: value for key, value in record.items()
+                       if key not in ("version", "sha256", "attempts")}
+        self.gh.rows = [{"id": 1, "body": _body(record),
+                         "user": {"login": "publisher", "id": 42}}]
+        self.gh.rows.extend({"id": n, "body": "ordinary",
+                             "user": {"login": "other", "id": 99}}
+                            for n in range(2, 101))
+        self.gh.rows.append({"id": 101,
+                             "body": _body(make_manifest(**conflicting, attempts=2)),
+                             "user": {"login": "publisher", "id": 42}})
+        self.gh.same_count_shift = True
+        with self.assertRaisesRegex(GitHubError, "pagination changed"):
+            fetch_manifest(self.cfg, 12)
+        self.assertEqual(len(self.gh.rows), 101)
+        self.assertEqual(self.gh.page2_reads, 1)
+
+    def test_exact_two_thousand_comment_boundary(self):
+        self.gh.rows = [{"id": n, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}
+                        for n in range(1, 2000)]
+        self.gh.rows.append({"id": 2000, "body": _body(manifest(model=None)),
+                             "user": {"login": "publisher", "id": 42}})
+        status, record = fetch_manifest(self.cfg, 12)
+        self.assertEqual(status["status"], "current")
+        self.assertEqual(record["head"], HEAD)
+        self.assertEqual(len(self.gh.requests), 42)
+        self.gh.rows.append({"id": 2001, "body": "ordinary",
+                             "user": {"login": "other", "id": 99}})
+        with self.assertRaisesRegex(GitHubError, "exceeds limit"):
+            fetch_manifest(self.cfg, 12)
+
+    def test_full_bounded_timeline_refuses_new_publication(self):
+        self.gh.rows = [{"id": n, "body": "ordinary",
+                         "user": {"login": "other", "id": 99}}
+                        for n in range(1, 2001)]
+        with self.assertRaisesRegex(GitHubError, "listing is full"):
+            publish_manifest(self.cfg, 12)
+        self.assertEqual(len(self.gh.rows), 2000)
 
     def test_future_marker_from_pinned_publisher_is_unsupported(self):
         body = "Ermik evidence v4\n\n```json\n{}\n```"

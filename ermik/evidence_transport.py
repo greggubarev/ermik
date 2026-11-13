@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from .config import Config
 from .evidence import (MAX_BYTES, UnsupportedManifestVersion, dumps_manifest,
@@ -16,7 +17,10 @@ MARKER = "Ermik evidence v2\n\n```json\n"
 _MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER,
             3: "Ermik evidence v3\n\n```json\n"}
 _SUFFIX = "```"
-MAX_COMMENTS = 1000
+MAX_COMMENTS = 2000
+LOOKUP_TIMEOUT = 10
+LOOKUP_BUDGET = 60
+_clock = time.monotonic
 
 
 class EvidenceRecordError(GitHubError):
@@ -60,23 +64,72 @@ def _record(body: str) -> dict:
 
 
 def _comments(gh: GitHub, pr_number: int) -> list[dict]:
+    deadline = _clock() + LOOKUP_BUDGET
+
+    def read(endpoint: str):
+        remaining = deadline - _clock()
+        if remaining <= 2:
+            raise GitHubError("evidence comment lookup timed out")
+        # GitHub.command can make three read attempts with two short backoffs.
+        value = gh.api(endpoint, timeout=min(LOOKUP_TIMEOUT, (remaining - 2) / 3))
+        if _clock() >= deadline:
+            raise GitHubError("evidence comment lookup timed out")
+        return value
+
+    before = read(f"issues/{pr_number}")
+    count = before.get("comments") if isinstance(before, dict) else None
+    updated = before.get("updated_at") if isinstance(before, dict) else None
+    if (type(count) is not int or count < 0 or not isinstance(updated, str)
+            or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", updated)):
+        raise GitHubError("evidence comment count is invalid")
+    if count > MAX_COMMENTS:
+        raise GitHubError("evidence comment listing exceeds limit")
     rows: list[dict] = []
-    for page in range(1, MAX_COMMENTS // 100 + 1):
-        batch = gh.api(f"issues/{pr_number}/comments?per_page=100&page={page}")
+    fingerprints: list[tuple] = []
+
+    def fingerprint(row: dict) -> tuple:
+        user = row.get("user")
+        author_id = user.get("id") if isinstance(user, dict) else None
+        return row["id"], row.get("body"), author_id, row.get("updated_at")
+
+    for page in range(1, (count + 99) // 100 + 1):
+        batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
         if not isinstance(batch, list):
             raise GitHubError("evidence comment listing is invalid")
-        if len(batch) > 100 or any(not isinstance(item, dict) for item in batch):
+        expected = min(100, count - len(rows))
+        if (len(batch) != expected
+                or any(not isinstance(item, dict)
+                       or type(item.get("id")) is not int or item["id"] <= 0
+                       for item in batch)):
             raise GitHubError("evidence comment listing is invalid")
+        if rows and batch[0]["id"] <= rows[-1]["id"]:
+            raise GitHubError("evidence comment pagination is incomplete")
+        if any(left["id"] >= right["id"] for left, right in zip(batch, batch[1:])):
+            raise GitHubError("evidence comment pagination is incomplete")
+        fingerprints.extend(fingerprint(item) for item in batch)
         rows.extend(batch)
-        if len(batch) < 100:
-            return rows
-    raise GitHubError("evidence comment listing exceeds limit")
+    if count > 100:
+        for page in range(1, (count + 99) // 100 + 1):
+            batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
+            expected = fingerprints[(page - 1) * 100:page * 100]
+            if (not isinstance(batch, list) or len(batch) != len(expected)
+                    or any(not isinstance(item, dict)
+                           or type(item.get("id")) is not int
+                           or fingerprint(item) != saved
+                           for item, saved in zip(batch, expected))):
+                raise GitHubError("evidence comment pagination changed")
+    after = read(f"issues/{pr_number}")
+    if (not isinstance(after, dict) or type(after.get("comments")) is not int
+            or after["comments"] != count or after.get("updated_at") != updated):
+        raise GitHubError("evidence comment pagination changed")
+    return rows
 
 
-def _published_records(cfg: Config, gh: GitHub, pr_number: int) -> list[tuple[dict, dict]]:
+def _published_records(cfg: Config, gh: GitHub, pr_number: int,
+                       *, rows: list[dict] | None = None) -> list[tuple[dict, dict]]:
     publisher_id = _publisher_id(cfg)
     found: list[tuple[dict, dict]] = []
-    for row in _comments(gh, pr_number):
+    for row in rows if rows is not None else _comments(gh, pr_number):
         body = row.get("body")
         if not isinstance(body, str):
             continue
@@ -136,8 +189,14 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
             or actor["id"] != publisher_id):
         raise GitHubError("evidence publisher identity mismatch")
 
+    scanned_count = 0
+
     def existing() -> dict | None:
-        matches = [(row, saved) for row, saved in _published_records(cfg, gh, pr_number)
+        nonlocal scanned_count
+        rows = _comments(gh, pr_number)
+        scanned_count = len(rows)
+        found = _published_records(cfg, gh, pr_number, rows=rows)
+        matches = [(row, saved) for row, saved in found
                    if saved["head"] == record["head"]]
         if len(matches) > 1:
             raise GitHubError("duplicate evidence for PR HEAD")
@@ -152,6 +211,8 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
     prior = existing()
     if prior is not None:
         return prior
+    if scanned_count == MAX_COMMENTS:
+        raise GitHubError("evidence comment listing is full")
     # Export checked the live identity; recheck immediately before publication.
     if verify_manifest(cfg, pr_number, record)["status"] != "current":
         raise GitHubError("evidence became stale before publication")
