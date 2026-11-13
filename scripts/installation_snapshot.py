@@ -1,6 +1,7 @@
 """Snapshot and restore a stopped controller's private state and workspace."""
 
 import argparse
+from contextlib import closing
 import hashlib
 import json
 import os
@@ -38,7 +39,7 @@ def _digest(path):
 def _db_check(path):
     if not path.is_file() or path.is_symlink():
         raise ValueError("snapshot database is missing or invalid")
-    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         version = db.execute("PRAGMA user_version").fetchone()[0]
         integrity = db.execute("PRAGMA quick_check").fetchone()[0]
     if version not in range(MAX_SCHEMA + 1) or integrity != "ok":
@@ -79,8 +80,8 @@ def backup(config, destination):
         raise ValueError("snapshot destination is invalid or already populated")
     destination.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
-        with sqlite3.connect((state / "state.sqlite3").resolve().as_uri() + "?mode=ro", uri=True) as source, \
-                sqlite3.connect(destination / "state.sqlite3") as target:
+        with closing(sqlite3.connect((state / "state.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as source, \
+                closing(sqlite3.connect(destination / "state.sqlite3")) as target:
             source.backup(target)
         version = _db_check(destination / "state.sqlite3")
         shutil.copytree(state, destination / "state-files", symlinks=True,

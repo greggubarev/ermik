@@ -44,6 +44,10 @@ _WINDOWS_SKIPS = {
     "test_retention.RetentionTests.test_wrong_owner_refuses_cleanup":
         "POSIX ownership only",
 }
+_POSIX_SKIPS = {
+    "test_retention.RetentionTests.test_windows_ambiguous_write_grant_refuses_cleanup":
+        "Windows ACL only",
+}
 
 
 class _DiscardOutput(io.TextIOBase):
@@ -85,7 +89,8 @@ class _Results(unittest.TextTestResult):
 
 def _allowed_skip(test_id: str, reason: str) -> bool:
     """Keep platform exceptions explicit; missing tools remain failures."""
-    return os.name == "nt" and _WINDOWS_SKIPS.get(test_id) == reason
+    return ((os.name == "nt" and _WINDOWS_SKIPS.get(test_id) == reason)
+            or (os.name == "posix" and _POSIX_SKIPS.get(test_id) == reason))
 
 
 def _unit_suite() -> dict:

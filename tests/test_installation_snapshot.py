@@ -1,6 +1,7 @@
 """Focused stopped-installation snapshot checks."""
 
 import hashlib
+from contextlib import closing
 import importlib.util
 import json
 import sqlite3
@@ -31,7 +32,7 @@ class InstallationSnapshotTests(unittest.TestCase):
                                            "workspace": str(self.workspace)}))
         marker = hashlib.sha256(f"example/project\n{self.state}".encode()).hexdigest()[:32]
         (self.state / "container-namespace").write_text(marker + "\n")
-        with sqlite3.connect(self.state / "state.sqlite3") as db:
+        with closing(sqlite3.connect(self.state / "state.sqlite3")) as db, db:
             db.execute("PRAGMA user_version = 6")
             db.execute("CREATE TABLE jobs (issue INTEGER PRIMARY KEY, pr INTEGER)")
             db.execute("INSERT INTO jobs VALUES (7, 8)")
@@ -40,13 +41,13 @@ class InstallationSnapshotTests(unittest.TestCase):
 
     def test_schema_six_restores_state_and_workspace(self):
         snapshot.backup(self.config, self.backup)
-        with sqlite3.connect(self.state / "state.sqlite3") as db:
+        with closing(sqlite3.connect(self.state / "state.sqlite3")) as db, db:
             db.execute("DELETE FROM jobs")
         (self.state / "state.sqlite3-journal").write_text("stale journal")
         (self.state / "review.json").write_text("changed")
         (self.workspace / "checkout.txt").write_text("changed")
         snapshot.restore(self.config, self.backup)
-        with sqlite3.connect(self.state / "state.sqlite3") as db:
+        with closing(sqlite3.connect(self.state / "state.sqlite3")) as db:
             self.assertEqual(db.execute("SELECT * FROM jobs").fetchall(), [(7, 8)])
         self.assertEqual((self.state / "review.json").read_text(), "review-head")
         self.assertFalse((self.state / "state.sqlite3-journal").exists())
@@ -64,7 +65,7 @@ class InstallationSnapshotTests(unittest.TestCase):
 
     def test_newer_schema_preserves_original(self):
         snapshot.backup(self.config, self.backup)
-        with sqlite3.connect(self.backup / "state.sqlite3") as db:
+        with closing(sqlite3.connect(self.backup / "state.sqlite3")) as db, db:
             db.execute("PRAGMA user_version = 7")
         manifest_path = self.backup / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
