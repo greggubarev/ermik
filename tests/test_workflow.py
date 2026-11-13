@@ -251,6 +251,105 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(state.job(conn, 1)["status"], "blocked")
             self.assertNotIn("state:in-progress", FakeHub.issues[1]["names"])
 
+    def test_consumed_retry_requires_controller_receipt_after_old_request(self):
+        spec = runtime.parse_issue(BODY)
+        FakeHub.issues[1]["names"] = {"queue:worker", "state:blocked"}
+        FakeHub.prs[10] = {"state": "OPEN", "headRefName": "work/issue-1-delivery",
+                            "headRefOid": SHA_B, "baseRefOid": SHA_C,
+                            "isDraft": True}
+        old = {"id": 100, "body": f"SEMI_REWORK issue=1 head={SHA_B}\n\nSEMI_REBASE_ONLY",
+               "user": {"login": "owner"}}
+        receipt_prefix = (f"ERMIK_CORRECTION_BLOCKED issue=1 pr=10 head={SHA_B} "
+                          f"base={SHA_C} target={SHA_A} request=100 nonce=")
+        retry = {"id": 102,
+                 "body": "",
+                 "user": {"login": "owner"}}
+        FakeHub.notes[1] = [{"id": 1,
+                             "body": runtime._admission_marker(1, spec),
+                             "user": {"login": "owner"}}]
+        FakeHub.notes[10] = [old]
+        hub = FakeHub("owner/repo")
+
+        def post(number, body):
+            self.assertEqual(number, 1)
+            FakeHub.notes[1].append({"id": 101, "body": body,
+                                     "user": {"login": "owner"}})
+            raise runtime.GitHubError("comment response lost")
+
+        with patch.object(runtime, "main_sha", return_value=SHA_A), state.connect(
+                self.cfg.state_dir) as conn:
+            conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?)",
+                         (1, spec.body_sha256, '["src/example.py"]'))
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,head_sha,pr,status,"
+                         "allowed_json,last_request,reason_code) VALUES(?,?,?,?,?,?,?,?,?)",
+                         (1, "work/issue-1-delivery", SHA_A, SHA_B, 10,
+                          "blocked", '["src/example.py"]', 100, "local_check_failed"))
+            state.event(conn, 1, "correction_started", head_sha=SHA_B)
+            FakeHub.notes[1].append({"id": 101,
+                                     "body": receipt_prefix + "n" * 22,
+                                     "user": {"login": "owner"}})
+            with patch.object(hub, "comment", side_effect=AssertionError("forged receipt")):
+                self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            self.assertFalse(runtime._correction_receipt_path(self.cfg, 1).exists())
+            FakeHub.notes[1].pop()
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            with patch.object(hub, "comment", side_effect=post) as publish:
+                self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            publish.assert_called_once()
+            self.assertIsNone(runtime.read_evidence(
+                runtime._correction_receipt_path(self.cfg, 1))["receipt"])
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            FakeHub.notes[1].append({"id": 103,
+                                     "body": FakeHub.notes[1][1]["body"],
+                                     "user": {"login": "owner"}})
+            with patch.object(hub, "comment", side_effect=AssertionError("duplicate POST")):
+                self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            FakeHub.notes[1].pop()
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            with patch.object(hub, "comment", side_effect=AssertionError("duplicate POST")):
+                self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            saved_receipt = runtime.read_evidence(
+                runtime._correction_receipt_path(self.cfg, 1))
+            self.assertEqual(FakeHub.notes[1][1]["body"].splitlines()[0],
+                             receipt_prefix + saved_receipt["nonce"])
+            self.assertEqual(saved_receipt["base"], SHA_C)
+            retry["body"] = (f"SEMI_REWORK issue=1 head={SHA_B}\n"
+                             f"ERMIK_RETRY_OF request=100 receipt=101 "
+                             f"target={SHA_A} nonce={saved_receipt['nonce']}\n\nSEMI_REBASE_ONLY")
+            FakeHub.notes[10].append(retry)
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            FakeHub.notes[1][1]["user"]["login"] = "wrong-author"
+            self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            self.assertEqual(state.job(conn, 1)["last_request"], 100)
+            FakeHub.notes[1][1]["user"]["login"] = "owner"
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            receipt_path = runtime._correction_receipt_path(self.cfg, 1)
+            saved = runtime.read_evidence(receipt_path)
+            runtime.write_evidence(receipt_path, {**saved, "receipt": None})
+            FakeHub.notes[10] = [old]
+            observed = FakeHub.notes[1].pop()
+            with patch.object(hub, "comment", side_effect=AssertionError("duplicate POST")):
+                self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            FakeHub.notes[1].append(observed)
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            self.assertEqual(state.job(conn, 1)["last_request"], 100)
+            self.assertEqual(runtime.read_evidence(receipt_path)["receipt"], 101)
+            FakeHub.notes[10] = [old, retry]
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            FakeHub.notes[10][1]["id"] = 101
+            self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            self.assertEqual(state.job(conn, 1)["last_request"], 100)
+            FakeHub.notes[10][1]["id"] = 102
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            with patch.object(runtime, "main_sha", return_value=SHA_B):
+                self.assertIsNone(runtime._correction(hub, self.cfg, conn))
+            self.assertEqual(state.job(conn, 1)["last_request"], 100)
+            conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=1")
+            selected = runtime._correction(hub, self.cfg, conn)
+            self.assertEqual(selected[2], 102)
+            self.assertEqual(state.job(conn, 1)["last_request"], 102)
+
     def test_ready_label_without_maintainer_admission_is_ignored(self):
         FakeHub.issues[1]["names"] = {"queue:worker", "state:ready"}
         with state.connect(self.cfg.state_dir) as conn:

@@ -17,7 +17,8 @@ from .policy import parse_issue, validate_changed_paths
 from .runtime import (WorkflowError, _approved_on_github, git, local_checks,
                       mirror, main_sha, _portable_image_digest,
                       _resolve_image_id, published_image_id,
-                      published_image_config_digest)
+                      published_image_config_digest, BLOCKED_CORRECTION,
+                      REWORK)
 from . import state
 
 
@@ -228,8 +229,79 @@ def _request_changes_locked(cfg: Config, number: int, note_file: Path) -> dict:
     _record_decision(cfg, record, "reviewed")
     check_decision(cfg, record, "changes_requested")
     marker = f"SEMI_REWORK issue={issue_num} head={record['head']}"
-    body = marker + "\n\n" + note
     comments = gh.comments(number)
+    blocked = any(row.get("name") == "state:blocked" for row in issue.get("labels", []))
+    same_head = any(row.get("user", {}).get("login") == cfg.maintainer
+                    and (row.get("body") or "").splitlines()[:1] == [marker]
+                    for row in comments)
+    if blocked and same_head:
+        if (record.get("pr") != number or record.get("issue") != issue_num
+                or record.get("repo") != cfg.repo
+                or record.get("head_repository") != (cfg.publish_repo or cfg.repo)
+                or record.get("branch") != pr["headRefName"]):
+            raise WorkflowError("reviewed PR identity changed")
+        target = main_sha(gh, cfg)
+        receipts = []
+        for row in gh.comments(issue_num):
+            first_line = (row.get("body") or "").splitlines()[:1]
+            match = (BLOCKED_CORRECTION.fullmatch(first_line[0])
+                     if first_line else None)
+            if (match and tuple(match.groups()[:2]) == (str(issue_num), str(number))
+                    and match.group(3) == record["head"]
+                    and match.group(4) == record["base"]
+                    and match.group(5) == target
+                    and type(row.get("id")) is int and row["id"] > 0):
+                request_id = int(match.group(6))
+                prior = [item for item in comments
+                         if item.get("id") == request_id
+                         and item.get("user", {}).get("login") == cfg.maintainer
+                         and (item.get("body") or "").splitlines()[:1] == [marker]]
+                if len(prior) == 1 and row["id"] > request_id:
+                    receipts.append((row["id"], request_id, match.group(7)))
+        if not receipts:
+            raise WorkflowError("consumed exact-head correction receipt is missing or ambiguous")
+        latest_request = max(item[1] for item in receipts)
+        current_receipts = [item for item in receipts if item[1] == latest_request]
+        if len(current_receipts) != 1:
+            raise WorkflowError("consumed exact-head correction receipt is ambiguous")
+        receipt_id, request_id, nonce = current_receipts[0]
+        body = (marker + f"\nERMIK_RETRY_OF request={request_id} "
+                f"receipt={receipt_id} target={target} nonce={nonce}\n\n" + note)
+        intent = record.get("retry_intent")
+        expected_intent = {"receipt": receipt_id, "request": request_id,
+                           "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest()}
+        if intent is not None and intent["receipt"] >= receipt_id:
+            if intent != expected_intent:
+                raise WorkflowError("correction retry intent changed or is uncertain")
+            existing = [row for row in comments if row.get("body") == body and
+                        row.get("user", {}).get("login") == cfg.maintainer]
+            if len(existing) != 1 or existing[0].get("id", 0) <= receipt_id:
+                raise WorkflowError("correction retry publication is uncertain")
+            if any(type(row.get("id")) is int and row["id"] > request_id
+                   and row.get("user", {}).get("login") == cfg.maintainer
+                   and (row.get("body") or "").splitlines()[:1] == [marker]
+                   and row is not existing[0] for row in comments):
+                raise WorkflowError("another exact-head correction request exists")
+            _record_decision(cfg, record, "changes_requested")
+            return {"pr": number, "issue": issue_num, "head": record["head"],
+                    "request": "already-present"}
+        if any(type(row.get("id")) is int and row["id"] > request_id
+               and row.get("user", {}).get("login") == cfg.maintainer
+               and (row.get("body") or "").splitlines()[:1] == [marker]
+               for row in comments):
+            raise WorkflowError("unconsumed exact-head correction request already exists")
+        record["retry_intent"] = expected_intent
+        _save(cfg, number, record)
+        gh.comment(number, body)
+        confirmed = [row for row in gh.comments(number) if row.get("body") == body
+                     and row.get("user", {}).get("login") == cfg.maintainer
+                     and type(row.get("id")) is int and row["id"] > receipt_id]
+        if len(confirmed) != 1:
+            raise WorkflowError("exact-head correction retry comment is not confirmed")
+        _record_decision(cfg, record, "changes_requested")
+        return {"pr": number, "issue": issue_num, "head": record["head"],
+                "request": "posted"}
+    body = marker + "\n\n" + note
     existing = [row for row in comments if row.get("body") == body and
                 row.get("user", {}).get("login") == cfg.maintainer]
     already_present = bool(existing)

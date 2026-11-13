@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import sqlite3
 import socket
 import stat
@@ -38,6 +39,112 @@ from . import state
 
 REWORK = re.compile(r"^SEMI_REWORK issue=(\d+) head=([0-9a-f]{40})$", re.MULTILINE)
 REBASE_ONLY = re.compile(r"^SEMI_REBASE_ONLY$", re.MULTILINE)
+RETRY_OF = re.compile(r"^ERMIK_RETRY_OF request=([1-9][0-9]*) receipt=([1-9][0-9]*) target=([0-9a-f]{40}) nonce=([A-Za-z0-9_-]{22})$", re.MULTILINE)
+BLOCKED_CORRECTION = re.compile(
+    r"^ERMIK_CORRECTION_BLOCKED issue=([1-9][0-9]*) pr=([1-9][0-9]*) "
+    r"head=([0-9a-f]{40}) base=([0-9a-f]{40}) target=([0-9a-f]{40}) "
+    r"request=([1-9][0-9]*) "
+    r"nonce=([A-Za-z0-9_-]{22})$",
+    re.MULTILINE)
+
+
+def _correction_receipt_path(cfg: Config, issue: int) -> Path:
+    return cfg.state_dir / "correction-receipts" / f"issue-{issue}.json"
+
+
+def _ensure_correction_receipt(cfg: Config, gh: GitHub, row: sqlite3.Row,
+                               pr: dict, comments: list[dict]) -> int:
+    """Publish once after a blocked correction, or reconcile its pending POST."""
+    issue, number, head, request = (row["issue"], row["pr"], row["head_sha"],
+                                    row["last_request"])
+    if (row["status"] != "blocked" or row["reason_code"] != "local_check_failed"
+            or type(request) is not int or request <= 0
+            or pr.get("state") != "OPEN" or pr.get("isDraft") is not True
+            or pr.get("headRefOid") != head
+            or not isinstance(pr.get("baseRefOid"), str)
+            or not re.fullmatch(r"[0-9a-f]{40}", pr["baseRefOid"])):
+        raise WorkflowError("blocked correction identity is not current")
+    base = pr["baseRefOid"]
+    target = main_sha(gh, cfg)
+    prior = [item for item in comments if item.get("id") == request
+             and item.get("user", {}).get("login") == cfg.maintainer
+             and (item.get("body") or "").splitlines()[:1]
+             == [f"SEMI_REWORK issue={issue} head={head}"]]
+    if len(prior) != 1:
+        raise WorkflowError("consumed correction request is missing")
+    identity = {"issue": issue, "pr": number, "head": head,
+                "base": base, "target": target, "request": request}
+    path = _correction_receipt_path(cfg, issue)
+    try:
+        if path.lstat().st_size > 512:
+            raise WorkflowError("blocked correction receipt is too large")
+        saved = read_evidence(path)
+    except FileNotFoundError:
+        saved = None
+    if saved is not None and {key: saved.get(key) for key in identity} != identity:
+        if (saved.get("issue") == issue and saved.get("pr") == number
+                and type(saved.get("receipt")) is int
+                and request > saved["receipt"]):
+            saved = None
+        else:
+            raise WorkflowError("blocked correction receipt identity changed")
+    if saved is None:
+        if any((candidate := BLOCKED_CORRECTION.fullmatch(
+                    (item.get("body") or "").splitlines()[0]))
+               and candidate.groups()[:6] == (str(issue), str(number), head,
+                                              base, target, str(request))
+               and item.get("user", {}).get("login") == gh.identity()
+               and type(item.get("id")) is int and item["id"] > request
+               for item in gh.comments(issue) if (item.get("body") or "").splitlines()):
+            raise WorkflowError("unrecorded blocked correction receipt requires inspection")
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        saved = {**identity, "nonce": secrets.token_urlsafe(16), "receipt": None}
+        write_evidence(path, saved, mode=0o600, max_bytes=512)
+        post = True
+    else:
+        if (type(saved.get("nonce")) is not str
+                or not re.fullmatch(r"[A-Za-z0-9_-]{22}", saved["nonce"])
+                or saved.get("receipt") is not None
+                and (type(saved["receipt"]) is not int
+                     or saved["receipt"] <= request)):
+            raise WorkflowError("blocked correction receipt identity changed")
+        post = False
+    first_line = (f"ERMIK_CORRECTION_BLOCKED issue={issue} pr={number} "
+                  f"head={head} base={base} target={target} "
+                  f"request={request} nonce={saved['nonce']}")
+    if post:
+        gh.comment(issue, first_line + "\n\nExecution blocked: local checks failed. Inspect local controller state.")
+    matches = [item for item in gh.comments(issue)
+               if (item.get("body") or "").splitlines()[:1] == [first_line]
+               and item.get("user", {}).get("login") == gh.identity()
+               and type(item.get("id")) is int and item["id"] > request]
+    if len(matches) != 1:
+        raise WorkflowError("blocked correction receipt publication is uncertain")
+    receipt_id = matches[0]["id"]
+    if saved["receipt"] is not None and saved["receipt"] != receipt_id:
+        raise WorkflowError("blocked correction receipt changed")
+    if saved["receipt"] is None:
+        write_evidence(path, {**identity, "nonce": saved["nonce"],
+                              "receipt": receipt_id},
+                       mode=0o600, max_bytes=512)
+    return receipt_id
+
+
+def _receipt_matches_controller_state(cfg: Config, *, issue: int, pr: int,
+                                      head: str, base: str, target: str, request: int,
+                                      receipt: int, nonce: str) -> bool:
+    try:
+        path = _correction_receipt_path(cfg, issue)
+        if path.lstat().st_size > 512:
+            return False
+        value = read_evidence(path)
+    except (OSError, ValueError):
+        return False
+    return value == {"issue": issue, "pr": pr, "head": head, "base": base,
+                     "target": target,
+                     "request": request, "receipt": receipt, "nonce": nonce}
+
+
 STATUS_ACTIVE = ("running", "correcting", "awaiting_review")
 MAX_CONTAINER_OUTPUT = 1024 * 1024
 _CLEANED_NAMESPACES: set[str] = set()
@@ -1026,12 +1133,66 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
             conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                          (now + 60, row["issue"]))
             continue
+        if (row["status"] == "blocked" and row["reason_code"] == "local_check_failed"
+                and row["last_request"]):
+            try:
+                _ensure_correction_receipt(cfg, gh, row, pr, comments)
+            except (GitHubError, WorkflowError, OSError, ValueError):
+                conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
+                             (now + 60, row["issue"]))
+                continue
         for comment in comments:
             match = REWORK.search(comment.get("body") or "")
             if (comment["id"] <= row["last_request"] or not match
                     or comment.get("user", {}).get("login") != cfg.maintainer
                     or int(match.group(1)) != row["issue"]
                     or match.group(2) != row["head_sha"]):
+                continue
+            retry_line = (comment.get("body") or "").splitlines()[:2]
+            retry = (RETRY_OF.fullmatch(retry_line[1])
+                     if len(retry_line) == 2 else None)
+            if row["status"] == "blocked" and row["last_request"]:
+                prior = [item for item in comments
+                         if item.get("id") == row["last_request"]
+                         and item.get("user", {}).get("login") == cfg.maintainer
+                         and (old := REWORK.search(item.get("body") or ""))
+                         and int(old.group(1)) == row["issue"]
+                         and old.group(2) == row["head_sha"]]
+                if prior:
+                    if not retry or int(retry.group(1)) != row["last_request"]:
+                        continue
+                    receipt_id = int(retry.group(2))
+                    target = retry.group(3)
+                    nonce = retry.group(4)
+                    receipt_body = (f"ERMIK_CORRECTION_BLOCKED issue={row['issue']} "
+                                    f"pr={row['pr']} head={row['head_sha']} "
+                                    f"base={pr['baseRefOid']} target={target} "
+                                    f"request={row['last_request']} "
+                                    f"nonce={nonce}")
+                    receipts = [item for item in gh.comments(row["issue"])
+                                if item.get("id") == receipt_id
+                                and (item.get("body") or "").splitlines()[:1]
+                                == [receipt_body]
+                                and item.get("user", {}).get("login") == gh.identity()]
+                    if (len(receipts) != 1 or not row["last_request"] < receipt_id
+                            < comment["id"] or main_sha(gh, cfg) != target
+                            or not _receipt_matches_controller_state(
+                                cfg, issue=row["issue"], pr=row["pr"],
+                                head=row["head_sha"], base=pr["baseRefOid"],
+                                target=target, request=row["last_request"],
+                                receipt=receipt_id,
+                                nonce=nonce)):
+                        continue
+                elif conn.execute(
+                        "SELECT 1 FROM events WHERE issue=? AND kind='correction_started' "
+                        "AND head_sha=? LIMIT 1",
+                        (row["issue"], row["head_sha"])).fetchone():
+                    # A deleted consumed comment cannot turn a retry into a
+                    # fresh request on the same HEAD.
+                    continue
+                elif retry:
+                    continue
+            elif retry:
                 continue
             if cfg.evidence_publisher and not conn.execute(
                     "SELECT 1 FROM events WHERE issue=? AND kind='evidence_delivered' "
@@ -1100,6 +1261,21 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                 conn.execute("UPDATE jobs SET review_next_check_at=? WHERE issue=?",
                              (now + 60, row["issue"]))
                 break
+            if retry:
+                fresh_issue = gh.issue(row["issue"])
+                fresh_pr = gh.pr(row["pr"])
+                if (parse_issue(fresh_issue.get("body") or "").body_sha256
+                        != spec.body_sha256
+                        or not {"queue:worker", expected_state}.issubset(
+                            labels(fresh_issue))
+                        or not _approved_on_github(
+                            gh, cfg, row["issue"], spec, fresh_issue)
+                        or fresh_pr.get("baseRefOid") != pr["baseRefOid"]
+                        or main_sha(gh, cfg) != target
+                        or fresh_pr.get("isDraft") is not True):
+                    continue
+                _require_pr(gh, fresh_pr, cfg, branch=row["branch"],
+                            number=row["pr"], head_sha=row["head_sha"])
             if row["status"] == "blocked":
                 # A fresh, exact-head maintainer request is the sole way to
                 # reset a blocked correction's bounded retry state.
@@ -2294,11 +2470,19 @@ def run_once(cfg: Config) -> list[dict]:
                                  (type(exc).__name__,
                                   reason_code if decision.status in ("blocked", "retry_wait") else None,
                                   number))
+                    if (pr is not None and decision.status == "blocked"
+                            and reason_code == "local_check_failed"):
+                        conn.execute("UPDATE jobs SET review_next_check_at=0 WHERE issue=?",
+                                     (number,))
                     state.event(conn, number,
                                 "retry_scheduled" if decision.status == "retry_wait" else "blocked")
                 if decision.status == "blocked":
+                    if pr is None or reason_code != "local_check_failed":
+                        try:
+                            gh.comment(number, f"Execution blocked: {type(exc).__name__}. Inspect local controller state.")
+                        except GitHubError:
+                            pass
                     try:
-                        gh.comment(number, f"Execution blocked: {type(exc).__name__}. Inspect local controller state.")
                         gh.label(number, add="state:blocked", remove="state:in-progress")
                     except GitHubError:
                         pass

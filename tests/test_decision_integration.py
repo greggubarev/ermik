@@ -23,7 +23,11 @@ BODY = "## Goal\nChange a file.\n\n## Allowed paths\nsrc/a.py\n\n## Acceptance\n
 class Hub:
     def __init__(self):
         self.head = HEADS[0]
+        self.target = BASE
         self.comments_list = []
+        self.issue_comments = []
+        self.blocked = False
+        self.next_comment_id = 100
         self.lose_comment = False
         self.writes = []
 
@@ -40,16 +44,19 @@ class Hub:
 
     def issue(self, _number):
         return {"body": BODY, "labels": [{"name": "queue:worker"},
-                                            {"name": "state:in-progress"}]}
+                                            {"name": "state:blocked" if self.blocked
+                                             else "state:in-progress"}]}
 
     def validate_pr_identity(self, *_args, **_kwargs):
         pass
 
-    def comments(self, _number):
-        return list(self.comments_list)
+    def comments(self, number):
+        return list(self.issue_comments if number == 7 else self.comments_list)
 
     def comment(self, _number, body):
-        self.comments_list.append({"body": body, "user": {"login": "maintainer"}})
+        self.next_comment_id += 1
+        self.comments_list.append({"id": self.next_comment_id,
+                                   "body": body, "user": {"login": "maintainer"}})
         self.writes.append("comment")
         if self.lose_comment:
             self.lose_comment = False
@@ -71,7 +78,7 @@ class DecisionIntegrationTests(unittest.TestCase):
                             ("_approved_on_github", True),
                             ("_resolve_image_id", IMAGE),
                             ("_portable_image_digest", CONFIG_DIGEST),
-                            ("main_sha", BASE),
+                            ("main_sha", lambda *_args: self.hub.target),
                             ("_checkout_pr", self._checkout),
                             ("verify_changed_tree", ["src/a.py"]),
                             ("local_checks", self._checks),
@@ -153,6 +160,67 @@ class DecisionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.hub.writes, ["comment"])
         self.assertEqual([e["decision"] for e in self._decisions()],
                          ["reviewed", "changes_requested"])
+
+    def test_blocked_consumed_request_posts_one_bound_retry(self):
+        review.review(self.cfg, 19)
+        note = self._note("SEMI_REBASE_ONLY\n\nPlease correct the stale base.")
+        review.request_changes(self.cfg, 19, note)
+        old = self.hub.comments_list[-1]["id"]
+        self.hub.blocked = True
+        self.hub.target = HEADS[2]
+        self.hub.issue_comments.append({
+            "id": old + 1,
+            "body": (f"ERMIK_CORRECTION_BLOCKED issue=7 pr=19 "
+                     f"head={HEADS[0]} base={BASE} target={HEADS[2]} request={old} "
+                     f"nonce={'n' * 22}\n\nExecution blocked."),
+            "user": {"login": "controller"}})
+        self.hub.next_comment_id = old + 1
+        self.hub.target = HEADS[1]
+        with self.assertRaisesRegex(WorkflowError, "receipt is missing"):
+            review.request_changes(self.cfg, 19, note)
+        self.hub.target = HEADS[2]
+        self.assertEqual(review.request_changes(self.cfg, 19, note)["request"], "posted")
+        self.assertIn(f"ERMIK_RETRY_OF request={old} receipt={old + 1}",
+                      self.hub.comments_list[-1]["body"])
+        self.assertIn("SEMI_REBASE_ONLY", self.hub.comments_list[-1]["body"])
+        self.assertEqual(review.request_changes(self.cfg, 19, note)["request"],
+                         "already-present")
+        self.assertEqual(self.hub.writes, ["comment", "comment"])
+
+    def test_blocked_retry_refuses_unconsumed_duplicate_and_uncertain_post(self):
+        review.review(self.cfg, 19)
+        note = self._note()
+        review.request_changes(self.cfg, 19, note)
+        old = self.hub.comments_list[-1]["id"]
+        self.hub.blocked = True
+        with self.assertRaisesRegex(WorkflowError, "receipt is missing"):
+            review.request_changes(self.cfg, 19, note)
+        self.hub.issue_comments.append({
+            "id": old + 1,
+            "body": (f"ERMIK_CORRECTION_BLOCKED issue=7 pr=19 "
+                     f"head={HEADS[0]} base={BASE} target={BASE} "
+                     f"request={old} nonce={'n' * 22}"),
+            "user": {"login": "controller"}})
+        self.hub.issue_comments.append({
+            "id": old + 2,
+            "body": (f"ERMIK_CORRECTION_BLOCKED issue=7 pr=19 "
+                     f"head={HEADS[0]} base={BASE} target={BASE} "
+                     f"request={old} nonce={'f' * 22}"),
+            "user": {"login": "maintainer"}})
+        with self.assertRaisesRegex(WorkflowError, "ambiguous"):
+            review.request_changes(self.cfg, 19, note)
+        self.hub.issue_comments.pop()
+        self.hub.next_comment_id = old + 1
+        self.hub.lose_comment = True
+        with self.assertRaises(GitHubError):
+            review.request_changes(self.cfg, 19, note)
+        self.assertEqual(review.request_changes(self.cfg, 19, note)["request"],
+                         "already-present")
+        self.hub.comments_list.append({"id": old + 3,
+                                       "body": self.hub.comments_list[-1]["body"],
+                                       "user": {"login": "maintainer"}})
+        with self.assertRaisesRegex(WorkflowError, "publication is uncertain"):
+            review.request_changes(self.cfg, 19, note)
 
     def test_interrupted_review_append_reconciles_from_saved_record(self):
         with patch.object(review, "append_decision", side_effect=OSError("interrupted")):
