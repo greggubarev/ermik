@@ -39,6 +39,10 @@ from . import state
 
 REWORK = re.compile(r"^SEMI_REWORK issue=(\d+) head=([0-9a-f]{40})$", re.MULTILINE)
 REBASE_ONLY = re.compile(r"^SEMI_REBASE_ONLY$", re.MULTILINE)
+STALE_REBASE = re.compile(
+    r"^ERMIK_STALE_BASE base=([0-9a-f]{40}) target=([0-9a-f]{40}) "
+    r"body=([0-9a-f]{64}) scope=([0-9a-f]{64})$", re.MULTILINE)
+STALE_REBASE_NOTE = "Rebase onto the specified base and rerun local checks."
 RETRY_OF = re.compile(r"^ERMIK_RETRY_OF request=([1-9][0-9]*) receipt=([1-9][0-9]*) target=([0-9a-f]{40}) nonce=([A-Za-z0-9_-]{22})$", re.MULTILINE)
 BLOCKED_CORRECTION = re.compile(
     r"^ERMIK_CORRECTION_BLOCKED issue=([1-9][0-9]*) pr=([1-9][0-9]*) "
@@ -46,6 +50,18 @@ BLOCKED_CORRECTION = re.compile(
     r"request=([1-9][0-9]*) "
     r"nonce=([A-Za-z0-9_-]{22})$",
     re.MULTILINE)
+
+
+def _scope_digest(paths: tuple[str, ...]) -> str:
+    encoded = json.dumps(paths, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _stale_rebase_body(issue: int, head: str, base: str, target: str,
+                       body_sha: str, scope_sha: str) -> str:
+    return (f"SEMI_REWORK issue={issue} head={head}\n"
+            f"ERMIK_STALE_BASE base={base} target={target} body={body_sha} "
+            f"scope={scope_sha}\nSEMI_REBASE_ONLY\n\n{STALE_REBASE_NOTE}")
 
 
 def _correction_receipt_path(cfg: Config, issue: int) -> Path:
@@ -1148,6 +1164,44 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                     or int(match.group(1)) != row["issue"]
                     or match.group(2) != row["head_sha"]):
                 continue
+            lines = (comment.get("body") or "").splitlines()
+            stale = (STALE_REBASE.fullmatch(lines[1])
+                     if len(lines) >= 2 else None)
+            if stale:
+                base, target, body_sha, scope_sha = stale.groups()
+                if (row["status"] != "awaiting_review"
+                        or pr.get("isDraft") is not True
+                        or row["base_sha"] != base
+                        or pr.get("baseRefOid") != base
+                        or main_sha(gh, cfg) != target
+                        or spec.body_sha256 != body_sha
+                        or _scope_digest(spec.allowed_paths) != scope_sha
+                        or comment["body"] != _stale_rebase_body(
+                            row["issue"], row["head_sha"], base, target,
+                            body_sha, scope_sha)
+                        or not conn.execute(
+                            "SELECT 1 FROM events WHERE issue=? AND kind='checks_passed' "
+                            "AND head_sha=? LIMIT 1",
+                            (row["issue"], row["head_sha"])).fetchone()):
+                    continue
+                try:
+                    saved = read_evidence(cfg.state_dir / "evidence" /
+                                          str(row["issue"]) /
+                                          f"{row['head_sha']}.json")
+                    checks = saved["ci"]["checks"]
+                    if (not _published_evidence_matches(conn, saved, row, pr, spec)
+                            or saved["ci"].get("head") != row["head_sha"]
+                            or saved["ci"].get("committed_diff_base") != base
+                            or len(checks) != len(cfg.checks)
+                            or any(item.get("command") != list(command)
+                                   or item.get("exit_code") != 0
+                                   for item, command in zip(checks, cfg.checks))):
+                        continue
+                except (OSError, ValueError, KeyError, TypeError,
+                        AttributeError, WorkflowError):
+                    continue
+            elif any(line.startswith("ERMIK_STALE_BASE") for line in lines[1:]):
+                continue
             retry_line = (comment.get("body") or "").splitlines()[:2]
             retry = (RETRY_OF.fullmatch(retry_line[1])
                      if len(retry_line) == 2 else None)
@@ -1273,6 +1327,21 @@ def _correction(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                         or fresh_pr.get("baseRefOid") != pr["baseRefOid"]
                         or main_sha(gh, cfg) != target
                         or fresh_pr.get("isDraft") is not True):
+                    continue
+                _require_pr(gh, fresh_pr, cfg, branch=row["branch"],
+                            number=row["pr"], head_sha=row["head_sha"])
+            if stale:
+                fresh_issue = gh.issue(row["issue"])
+                fresh_pr = gh.pr(row["pr"])
+                if (parse_issue(fresh_issue.get("body") or "").body_sha256
+                        != spec.body_sha256
+                        or not {"queue:worker", "state:in-progress"}.issubset(
+                            labels(fresh_issue))
+                        or not _approved_on_github(
+                            gh, cfg, row["issue"], spec, fresh_issue)
+                        or fresh_pr.get("baseRefOid") != base
+                        or fresh_pr.get("isDraft") is not True
+                        or main_sha(gh, cfg) != target):
                     continue
                 _require_pr(gh, fresh_pr, cfg, branch=row["branch"],
                             number=row["pr"], head_sha=row["head_sha"])
@@ -2019,6 +2088,16 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
     gh = _github(cfg)
     rebase_only = pr_number is not None and bool(
         REBASE_ONLY.search(correction_note or ""))
+    stale_lines = (correction_note or "").splitlines()
+    stale_request = (STALE_REBASE.fullmatch(stale_lines[1])
+                     if len(stale_lines) >= 2 else None)
+    if (stale_request and (not rebase_only or correction_note !=
+            _stale_rebase_body(issue, expected_head or "", expected_base,
+                               stale_request.group(2), spec.body_sha256,
+                               _scope_digest(spec.allowed_paths)))
+            or not stale_request and any(
+                line.startswith("ERMIK_STALE_BASE") for line in stale_lines)):
+        raise WorkflowError("stale-base request changed before execution")
     current = gh.issue(issue)
     if spec.body_sha256 != parse_issue(current.get("body") or "").body_sha256:
         raise WorkflowError("issue changed after admission")
@@ -2054,6 +2133,9 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
         original = gh.pr(pr_number)
         _require_pr(gh, original, cfg, branch=branch, number=pr_number,
                     head_sha=expected_head)
+        if stale_request and (original.get("baseRefOid") != stale_request.group(1)
+                              or original.get("isDraft") is not True):
+            raise WorkflowError("stale-base PR changed before execution")
         with state.connect(cfg.state_dir) as conn:
             prior = state.job(conn, issue)
         if prior is None or not prior["image_id"] or published_image_id(
@@ -2062,6 +2144,8 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
                         prior["image_id"], prior["image_id"]):
             raise WorkflowError("correction PR image differs from recorded execution image")
     base = main_sha(gh, cfg) if pr_number is not None else expected_base
+    if stale_request and base != stale_request.group(2):
+        raise WorkflowError("requested rebase target changed before execution")
     checkout = _checkout(cfg, issue, branch, correction=pr_number is not None)
     pushed = False
     try:
@@ -2229,6 +2313,9 @@ def _perform(cfg: Config, issue: int, branch: str, spec: IssueSpec,
             existing = gh.pr(pr_number)
             _require_pr(gh, existing, cfg, branch=branch, number=pr_number,
                         head_sha=expected_head)
+            if stale_request and (existing.get("baseRefOid") != stale_request.group(1)
+                                  or existing.get("isDraft") is not True):
+                raise WorkflowError("stale-base PR changed before publication")
         if cfg.publish_repo:
             if not cfg.publish_token_env or not os.environ.get(cfg.publish_token_env):
                 raise PublishCredentialUnavailable("fork publication credential is unavailable")
