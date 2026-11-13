@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 
@@ -166,7 +168,8 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
             row["estimated_cost"] is None for row in rows)
         providers = [row["provider_id"] for row in rows if row["provider_id"]]
         results.append({
-            "issue": issue, "pr": pr, "period": admission_month, "route": route,
+            "issue": issue, "pr": pr, "head": job["head_sha"],
+            "period": admission_month, "route": route,
             "accepted": accepted, "decision_state": decision_state,
             "accepted_at": accepted_at.isoformat() if accepted_at else None,
             "elapsed_ms": elapsed_ms,
@@ -279,7 +282,8 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
 
 
 def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
-                           *, observed_at: datetime | None = None) -> dict:
+                           *, observed_at: datetime | None = None,
+                           source_report: dict | None = None) -> dict:
     """Measure first-review acceptance among confirmed, single-provider merges.
 
     Each eligible merged PR contributes one sample. Incomplete or ambiguous
@@ -288,7 +292,8 @@ def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
     instant = datetime.now(timezone.utc) if observed_at is None else observed_at
     if instant.tzinfo is None or instant.utcoffset() is None:
         raise ValueError("observed_at must have a timezone")
-    report = build_outcome_report(cfg, maintainer_state_dir)
+    report = (build_outcome_report(cfg, maintainer_state_dir)
+              if source_report is None else source_report)
     providers: dict[str, dict] = {
         provider_id: {"samples": 0, "first_review_acceptances": 0,
                       "quality_score": None}
@@ -313,3 +318,26 @@ def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
     return {"version": 1, "repo": cfg.repo,
             "observed_at": instant.astimezone(timezone.utc).isoformat(),
             "providers": providers}
+
+
+def audit_cohort(report: dict) -> dict:
+    """Identify the exact accepted PRs and the full bounded source report."""
+    accepted = sorted(({"issue": row["issue"], "pr": row["pr"],
+                        "head": row["head"],
+                        "provider": row["observed_providers"][0],
+                        "first_review_accepted": row["first_review_accepted"]}
+                       for row in report["jobs"]
+                       if row["decision_state"] == "confirmed_merged"
+                       and row["attempt_history_complete"]
+                       and not row["pending_attempts"]
+                       and row["provider_attribution_complete"]
+                       and len(row["observed_providers"]) == 1),
+                      key=lambda row: (row["issue"], row["pr"]))
+    if len(accepted) > 256:
+        raise ValueError("audit cohort exceeds 256 accepted PRs")
+    def digest(value: object) -> str:
+        data = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True).encode("ascii")
+        return hashlib.sha256(data).hexdigest()
+    return {"accepted_prs": accepted, "accepted_prs_sha256": digest(accepted),
+            "source_report_sha256": digest(report)}

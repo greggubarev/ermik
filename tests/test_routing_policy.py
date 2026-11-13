@@ -11,7 +11,7 @@ import tempfile
 import unittest
 
 from ermik.providers import ModelCandidate
-from ermik.routing_policy import order_candidates
+from ermik.routing_policy import audit_route_order, order_candidates
 
 
 KIMI = ModelCandidate("kimi-code", "k3-256k", "KIMI_CODE_API_KEY")
@@ -130,6 +130,17 @@ class QualityRoutingTests(unittest.TestCase):
         except (OSError, NotImplementedError):
             self.skipTest("symlinks unavailable")
         self.assert_priority()
+
+    def test_audit_refusal_preserves_active_runtime_quality_order(self):
+        self.write()
+        missing_audit = Path(self.temp.name) / "missing-audit.json"
+        result = audit_route_order(self.cfg, {}, missing_audit, (KIMI, GO), NOW)
+        self.assertEqual(result["configured_order"], [KIMI.ref, GO.ref])
+        self.assertEqual(result["current_policy"], "quality")
+        self.assertEqual(result["current_order"], [GO.ref, KIMI.ref])
+        self.assertEqual(result["proposed_order"], [GO.ref, KIMI.ref])
+        self.assertEqual(result["fallback"], "current_runtime_order")
+        self.assertEqual(result["decision"], "refused")
 
 
 if __name__ == "__main__":

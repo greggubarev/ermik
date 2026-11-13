@@ -15,7 +15,7 @@ import uuid
 from .config import load_config
 from .github import GitHub
 from .review import merge, request_changes, request_rebase, review
-from .runtime import admit, checked, main_sha, poll, run_once
+from .runtime import _routed_models, admit, checked, main_sha, poll, run_once
 from .observability import QUOTA_FILE, quota_status, status_snapshot
 from .quota import probe, unknown
 from .dashboard import create_server
@@ -27,7 +27,8 @@ from .delivery_loop import deliver_pending
 from .review_packet import build_review_packet
 from .maintainer_view import queue_snapshot, create_server as create_maintainer_server
 from .decision_trail import read_decisions
-from .outcomes import build_outcome_report, build_quality_snapshot
+from .outcomes import audit_cohort, build_outcome_report, build_quality_snapshot
+from .routing_policy import audit_route_order
 from .event_digest import deliver_once
 
 
@@ -174,6 +175,12 @@ def main(argv: list[str] | None = None) -> int:
     metrics_parser = commands.add_parser("route-metrics")
     metrics_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     metrics_parser.add_argument("--output", type=Path, required=True)
+    metrics_parser.add_argument("--audit-output", type=Path)
+    audit_parser = commands.add_parser("route-audit")
+    audit_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
+    audit_parser.add_argument("--snapshot", type=Path, required=True)
+    audit_parser.add_argument("--complexity", choices=("easy", "medium", "hard"))
+    audit_parser.add_argument("--route", default="route:auto")
     correction_parser = commands.add_parser("request-changes")
     correction_parser.add_argument("pr", type=int)
     correction_parser.add_argument("--note-file", type=Path, required=True)
@@ -275,11 +282,38 @@ def main(argv: list[str] | None = None) -> int:
             result = build_outcome_report(cfg, args.maintainer_state_dir,
                                           period=args.period)
         elif args.command == "route-metrics":
-            snapshot = build_quality_snapshot(cfg, args.maintainer_state_dir)
+            if args.audit_output and (args.audit_output.resolve() == args.output.resolve()
+                                      or args.audit_output.exists()
+                                      or args.output.exists()):
+                raise ValueError("metric and audit outputs must be distinct new files")
+            report = build_outcome_report(cfg, args.maintainer_state_dir)
+            snapshot = build_quality_snapshot(cfg, args.maintainer_state_dir,
+                                              source_report=report)
+            if args.audit_output:
+                cohort = audit_cohort(report)
+                audit = {**snapshot, "version": 2, "cohort": cohort,
+                         "thresholds": {"min_samples": cfg.quality_min_samples,
+                                        "max_age_seconds": cfg.quality_max_age_seconds},
+                         "gates": {"admission": "required", "checks": "required",
+                                   "maintainer_review": "required"}}
+                if len(json.dumps(audit, sort_keys=True).encode("utf-8")) > 65536:
+                    raise ValueError("audit snapshot exceeds 64 KiB")
+            if args.audit_output:
+                _write_private_output(args.audit_output, (json.dumps(audit, sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8"))
             _write_private_output(args.output, (json.dumps(snapshot, sort_keys=True,
                 separators=(",", ":"), ensure_ascii=True) + "\n").encode("utf-8"))
             result = {"repo": cfg.repo, "output": str(args.output),
                       "providers": len(snapshot["providers"]), "result": "written"}
+            if args.audit_output:
+                result["audit_output"] = str(args.audit_output)
+        elif args.command == "route-audit":
+            report = build_outcome_report(cfg, args.maintainer_state_dir)
+            route_labels = [{"name": args.route}]
+            if args.complexity:
+                route_labels.append({"name": "complexity:" + args.complexity})
+            candidates = _routed_models(cfg, {"labels": route_labels})
+            result = audit_route_order(cfg, report, args.snapshot, candidates)
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "request-rebase":
