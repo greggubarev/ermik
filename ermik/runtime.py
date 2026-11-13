@@ -1443,7 +1443,7 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
         except (ValueError, TypeError):
             continue
         try:
-            approved = _approved_on_github(gh, cfg, number, spec)
+            approved = _approved_on_github(gh, cfg, number, spec, issue)
         except GitHubError:
             continue
         if not approved:
@@ -1453,6 +1453,20 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
             continue
         if state.conflicting(conn, spec.allowed_paths):
             continue
+        try:
+            fresh = gh.issue(number)
+            fresh_spec = parse_issue(fresh.get("body") or "")
+            stable = (fresh_spec.body_sha256 == spec.body_sha256
+                      and fresh_spec.allowed_paths == spec.allowed_paths
+                      and {"queue:worker", "state:ready"}.issubset(labels(fresh))
+                      and _route_key(fresh) == _route_key(issue)
+                      and _admission_marker(number, spec, cfg, fresh)
+                      == _admission_marker(number, spec, cfg, issue)
+                      and _approved_on_github(gh, cfg, number, spec, fresh))
+        except (GitHubError, ValueError, TypeError):
+            continue
+        if not stable:
+            continue
         if cfg.publish_repo:
             gh.validate_publish_access()
         conn.execute("INSERT INTO admissions(issue,body_sha,allowed_json) VALUES(?,?,?) "
@@ -1461,14 +1475,14 @@ def _claim_new(gh: GitHub, cfg: Config, conn: sqlite3.Connection,
                      (number, spec.body_sha256, json.dumps(spec.allowed_paths)))
         base = main_sha(gh, cfg)
         branch = f"work/issue-{number}-delivery"
-        tier_key = _complexity_key(issue) if cfg.complexity_profiles else None
+        tier_key = _complexity_key(fresh) if cfg.complexity_profiles else None
         tier = tier_key.removeprefix("complexity:") if tier_key else None
         conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,route_key,"
                      "complexity,profile_sha,task_set) VALUES(?,?,?,?,?,?,?,?,?)",
                      (number, branch, base, "running", json.dumps(spec.allowed_paths),
-                      _route_key(issue), tier,
-                      _profile_sha(cfg, tier, _route_key(issue)) if tier else None,
-                      _task_set(issue)))
+                      _route_key(fresh), tier,
+                      _profile_sha(cfg, tier, _route_key(fresh)) if tier else None,
+                      _task_set(fresh)))
         state.event(conn, number, "claimed")
         conn.commit()  # The local intent must exist before the external label write.
         gh.label(number, add="state:in-progress", remove="state:ready")

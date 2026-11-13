@@ -133,6 +133,44 @@ class WorkflowTests(unittest.TestCase):
                                      expected_base=SHA_A, expected_head=None)
                 checkout.assert_not_called()
 
+    def test_claim_refuses_task_set_changed_between_issue_reads(self):
+        spec = runtime.parse_issue(BODY)
+        base_names = {"queue:worker", "state:ready"}
+        old_issue = {"body": BODY, "labels": [
+            {"name": name} for name in base_names | {"task-set:parser-v1"}]}
+        new_issue = {"body": BODY, "labels": [
+            {"name": name} for name in base_names | {"task-set:parser-v2"}]}
+        markers = [runtime._admission_marker(1, spec, self.cfg, current)
+                   for current in (old_issue, new_issue)]
+
+        class ChangingHub:
+            def __init__(self):
+                self.reads = 0
+                self.label_changes = []
+
+            def ready_issues(self):
+                return [1]
+
+            def issue(self, number):
+                self.reads += 1
+                return old_issue if self.reads == 1 else new_issue
+
+            def comments(self, number):
+                return [{"body": marker, "user": {"login": "owner"}}
+                        for marker in markers]
+
+            def label(self, number, *, add, remove):
+                self.label_changes.append((add, remove))
+
+        hub = ChangingHub()
+        with state.connect(self.cfg.state_dir) as conn, patch.object(
+                runtime, "main_sha", return_value=SHA_A), patch.object(
+                runtime, "resource_guard", return_value={"admit": True}):
+            self.assertIsNone(runtime._claim_new(hub, self.cfg, conn))
+            self.assertIsNone(state.job(conn, 1))
+        self.assertEqual(hub.reads, 2)
+        self.assertEqual(hub.label_changes, [])
+
     def test_task_set_conflict_and_unbounded_slug_are_refused(self):
         with patch.object(runtime, "GitHub", FakeHub):
             with self.assertRaisesRegex(runtime.WorkflowError, "bounded lowercase slug"):
