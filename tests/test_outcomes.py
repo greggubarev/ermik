@@ -158,8 +158,9 @@ class OutcomeTests(unittest.TestCase):
             self.add_job(number, number + 10, "route:auto", head)
             with state.connect(cfg.state_dir) as conn:
                 conn.execute("UPDATE jobs SET complexity=?,profile_sha=?,task_set=?,"
-                             "pr=? WHERE issue=?", (tier, _profile_sha(cfg, tier),
-                             "parser", None if number == 5 else number + 10, number))
+                             "pr=?,status=? WHERE issue=?", (tier, _profile_sha(cfg, tier),
+                             "parser", None if number == 5 else number + 10,
+                             "blocked" if number == 5 else "merged", number))
             if number == 5:
                 self.attempt(number, f"attempt-{number}", 1, cost=0.5, tokens=50)
             else:
@@ -178,12 +179,21 @@ class OutcomeTests(unittest.TestCase):
         self.assertEqual(result["cohort"]["easy"]["first_review_denominator"], 2)
         self.add_job(6, 16, "route:auto", head)
         with state.connect(cfg.state_dir) as conn:
-            conn.execute("UPDATE jobs SET complexity=?,profile_sha=?,task_set=?,pr=NULL "
+            conn.execute("UPDATE jobs SET complexity=?,profile_sha=?,task_set=?,"
+                         "pr=NULL,status='blocked' "
                          "WHERE issue=6", ("medium", _profile_sha(cfg, "medium"),
                                            "parser"))
         self.attempt(6, "attempt-6", 1, cost=0.5, tokens=50)
         self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
                                          observed_at=now)["proposed_tier"], "easy")
+        for unfinished in ("running", "retry_wait"):
+            with state.connect(cfg.state_dir) as conn:
+                conn.execute("UPDATE jobs SET status=? WHERE issue=6", (unfinished,))
+            self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
+                                             observed_at=now)["refusal_reason"],
+                             "cohort_unfinished_job_without_pr")
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET status='blocked' WHERE issue=6")
         self.assertEqual(recommend_effort(cfg, issue, self.maintainer,
                                          observed_at=datetime(2026, 11, 10,
                                                               tzinfo=timezone.utc))

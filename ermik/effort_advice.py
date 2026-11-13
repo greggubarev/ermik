@@ -74,6 +74,8 @@ def recommend_effort(cfg: Config, issue: dict, maintainer_state_dir,
            or row["unknown_duration_attempts"] or row["legacy_phase_attempts"]
            for row in rows):
         return refuse("cohort_attempt_usage_or_cost_incomplete")
+    if any(row["pr"] is None and row["job_status"] != "blocked" for row in rows):
+        return refuse("cohort_unfinished_job_without_pr")
     if any((row["pr"] and row["decision_state"] != "confirmed_merged")
            or (row["accepted"] and not row["first_review_observed"])
            or (not row["accepted"] and row["pr"])

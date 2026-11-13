@@ -169,6 +169,7 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
         providers = [row["provider_id"] for row in rows if row["provider_id"]]
         results.append({
             "issue": issue, "pr": pr, "head": job["head_sha"],
+            "job_status": job["status"],
             "period": admission_month, "route": route, "task_set": job["task_set"],
             "complexity": job["complexity"], "profile_sha256": job["profile_sha"],
             "accepted": accepted, "decision_state": decision_state,
