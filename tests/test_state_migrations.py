@@ -140,12 +140,43 @@ def evidence(root: Path) -> dict:
 
 
 class StateMigrationTests(unittest.TestCase):
+    def test_populated_v6_adds_nullable_task_set_and_rolls_back_on_failure(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root))
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            conn.executescript(state.SCHEMA.replace(",\n  task_set TEXT", ""))
+            conn.execute("PRAGMA user_version = 6")
+            conn.execute("INSERT INTO jobs(issue,branch,base_sha,status,allowed_json,"
+                         "complexity,profile_sha) VALUES(7,'work-7',?,'running','[]',"
+                         "'easy',?)", ("a" * 40, "b" * 64))
+            conn.commit()
+        original = state._migrate_v6
+
+        def interrupted(conn):
+            original(conn)
+            raise OSError("interrupted task-set migration")
+
+        with patch.object(state, "_migrate_v6", side_effect=interrupted):
+            with self.assertRaisesRegex(OSError, "interrupted task-set migration"):
+                state.initialize(root)
+        with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertNotIn("task_set", {column[1] for column in
+                             conn.execute("PRAGMA table_info(jobs)")})
+        state.initialize(root)
+        with state.connect(root) as conn:
+            row = state.job(conn, 7)
+            self.assertEqual((row["complexity"], row["profile_sha"], row["task_set"]),
+                             ("easy", "b" * 64, None))
+        state.initialize(root)
+
     def test_v5_upgrade_adds_complexity_fields_without_changing_prior_jobs(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: shutil.rmtree(root))
         old = (state.SCHEMA.replace(",\n  complexity TEXT", "")
                .replace(",\n  profile_sha TEXT", "")
                .replace(",\n  result_effort TEXT", "")
+               .replace(",\n  task_set TEXT", "")
                .replace(",\n  effort TEXT", ""))
         with closing(sqlite3.connect(root / "state.sqlite3")) as conn:
             conn.executescript(old)
@@ -185,6 +216,7 @@ class StateMigrationTests(unittest.TestCase):
         return (state.SCHEMA.replace(",\n  complexity TEXT", "")
                 .replace(",\n  profile_sha TEXT", "")
                 .replace(",\n  result_effort TEXT", "")
+                .replace(",\n  task_set TEXT", "")
                 .replace(",\n  effort TEXT", "")
                 .replace("\n  ,complexity TEXT", "")
                 .replace(",\n  route_key TEXT", "")
@@ -198,6 +230,7 @@ class StateMigrationTests(unittest.TestCase):
         return (state.SCHEMA.replace(",\n  complexity TEXT", "")
                 .replace(",\n  profile_sha TEXT", "")
                 .replace(",\n  result_effort TEXT", "")
+                .replace(",\n  task_set TEXT", "")
                 .replace(",\n  effort TEXT", "")
                 .replace("\n  ,complexity TEXT", "")
                 .replace(",\n  policy_version INTEGER,\n  eligible_json TEXT,\n  decision_reason TEXT", ""))

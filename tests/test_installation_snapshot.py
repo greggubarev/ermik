@@ -33,13 +33,13 @@ class InstallationSnapshotTests(unittest.TestCase):
         marker = hashlib.sha256(f"example/project\n{self.state}".encode()).hexdigest()[:32]
         (self.state / "container-namespace").write_text(marker + "\n")
         with closing(sqlite3.connect(self.state / "state.sqlite3")) as db, db:
-            db.execute("PRAGMA user_version = 6")
+            db.execute("PRAGMA user_version = 7")
             db.execute("CREATE TABLE jobs (issue INTEGER PRIMARY KEY, pr INTEGER)")
             db.execute("INSERT INTO jobs VALUES (7, 8)")
         (self.state / "review.json").write_text("review-head")
         (self.workspace / "checkout.txt").write_text("pending-work")
 
-    def test_schema_six_restores_state_and_workspace(self):
+    def test_schema_seven_restores_state_and_workspace(self):
         snapshot.backup(self.config, self.backup)
         with closing(sqlite3.connect(self.state / "state.sqlite3")) as db, db:
             db.execute("DELETE FROM jobs")
@@ -63,14 +63,23 @@ class InstallationSnapshotTests(unittest.TestCase):
         self.assertEqual((self.workspace / "checkout.txt").read_text(), "pending-work")
         self.assertFalse(self.state.with_name("state.post-upgrade-backup").exists())
 
+    def test_schema_six_snapshot_remains_supported(self):
+        with closing(sqlite3.connect(self.state / "state.sqlite3")) as db, db:
+            db.execute("PRAGMA user_version = 6")
+        snapshot.backup(self.config, self.backup)
+        snapshot.restore(self.config, self.backup)
+        with closing(sqlite3.connect(self.state / "state.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("SELECT * FROM jobs").fetchall(), [(7, 8)])
+
     def test_newer_schema_preserves_original(self):
         snapshot.backup(self.config, self.backup)
         with closing(sqlite3.connect(self.backup / "state.sqlite3")) as db, db:
-            db.execute("PRAGMA user_version = 7")
+            db.execute("PRAGMA user_version = 8")
         manifest_path = self.backup / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
         manifest["database"] = snapshot._digest(self.backup)["state.sqlite3"]
-        manifest["schema"] = 7
+        manifest["schema"] = 8
         manifest_path.write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, "unsupported schema"):
             snapshot.restore(self.config, self.backup)

@@ -9,6 +9,8 @@ The maintainer selects issues, admits them to the queue, reviews each draft PR, 
 3. Describe the observable change in `Goal`. In `Acceptance`, state positive and negative cases, manual checks, and scope limits. Local check commands belong in `config.json` under `checks`, not in the issue. Confirm that this configuration's common checks fit the task.
 4. Inspect dependencies, resources, path overlap with active jobs, and controller permissions. Run `python -m ermik --config config.json doctor` and `status`. After deciding to admit the issue, run `admit NUMBER` **on the maintainer's computer**, using their GitHub account. It publishes an approval comment bound to hashes of the body and allowed paths, and changes `state:proposed` to `state:ready`. The server reads that approval from GitHub; a shared SQLite database is unnecessary. An issue body edit invalidates admission and requires review and a new admission.
 
+For comparable work, create the repository label `task-set:<slug>` first, then use `admit NUMBER --task-set <slug>`. The slug starts with a lowercase letter and has at most 40 lowercase letters, digits, or hyphens. Admission binds exactly one such Issue label to the maintainer approval and freezes it in the job. A changed or conflicting label blocks execution; a blocked job cannot switch task sets. Existing jobs with no task set remain unknown in outcome reports.
+
 Example issue body:
 
 ```md

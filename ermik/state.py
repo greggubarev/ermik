@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   route_key TEXT,
   complexity TEXT,
   profile_sha TEXT,
-  result_effort TEXT
+  result_effort TEXT,
+  task_set TEXT
 );
 CREATE TABLE IF NOT EXISTS retry_state (
   issue INTEGER PRIMARY KEY REFERENCES jobs(issue),
@@ -79,14 +80,14 @@ CREATE TABLE IF NOT EXISTS usage_events (
 CREATE INDEX IF NOT EXISTS usage_events_issue ON usage_events(issue,created_at);
 """
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 _TABLE_COLUMNS = {
     "admissions": {"issue", "body_sha", "allowed_json", "admitted_at"},
     "jobs": {"issue", "branch", "base_sha", "head_sha", "pr", "status",
              "allowed_json", "last_request", "error", "updated_at", "last_model",
              "result_model", "attempts_count", "review_next_check_at", "image_id",
-             "reason_code", "route_key", "complexity", "profile_sha", "result_effort"},
+             "reason_code", "route_key", "complexity", "profile_sha", "result_effort", "task_set"},
     "retry_state": {"issue", "attempts", "category", "resume_status",
                     "next_retry_at", "lease_token", "lease_expires_at", "failure_id"},
     "events": {"id", "issue", "kind", "model", "head_sha", "created_at",
@@ -121,7 +122,7 @@ def _schema_objects(conn: sqlite3.Connection) -> tuple[set[str], set[str]]:
 def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
                      v1: bool = False, v2: bool = False,
                      v3: bool = False, v4: bool = False,
-                     v5: bool = False) -> None:
+                     v5: bool = False, v6: bool = False) -> None:
     tables, indexes = _schema_objects(conn)
     if (not set(_TABLE_COLUMNS).issubset(tables)
             or tables - set(_TABLE_COLUMNS) - set(_PROVIDER_COLUMNS)
@@ -133,14 +134,16 @@ def _validate_schema(conn: sqlite3.Connection, *, preview: bool = False,
         if table in reference:
             expected = reference[table]
             if table == "jobs":
-                if preview and len(actual) in (len(expected) - 6, len(expected) - 5):
+                if preview and len(actual) in (len(expected) - 7, len(expected) - 6):
                     expected = expected[:len(actual)]
                 elif v1:
-                    expected = expected[:-5]
+                    expected = expected[:-6]
                 elif v2 or v3:
-                    expected = expected[:-4]
+                    expected = expected[:-5]
                 elif v4 or v5:
-                    expected = expected[:-3]
+                    expected = expected[:-4]
+                elif v6:
+                    expected = expected[:-1]
             elif table == "usage_events" and (preview or v1 or v2 or v3):
                 expected = expected[:-3]
             elif table == "events":
@@ -246,7 +249,8 @@ def _migrate_v2(conn: sqlite3.Connection) -> None:
                     if statement.lstrip().startswith("CREATE TABLE IF NOT EXISTS jobs ("))
     jobs_ddl = jobs_ddl.replace(",\n  route_key TEXT", "")
     jobs_ddl = jobs_ddl.replace(",\n  complexity TEXT", "").replace(
-        ",\n  profile_sha TEXT", "").replace(",\n  result_effort TEXT", "")
+        ",\n  profile_sha TEXT", "").replace(",\n  result_effort TEXT", "").replace(
+        ",\n  task_set TEXT", "")
     conn.execute(jobs_ddl.replace("CREATE TABLE IF NOT EXISTS jobs (",
                                   "CREATE TABLE jobs_v3 (", 1))
     names = ",".join(columns)
@@ -290,6 +294,10 @@ def _migrate_v5(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_v6(conn: sqlite3.Connection) -> None:
+    conn.execute("ALTER TABLE jobs ADD COLUMN task_set TEXT")
+
+
 def initialize(root: Path) -> Path:
     if root.is_symlink():
         raise ValueError("state_dir cannot be a symlink")
@@ -316,7 +324,7 @@ def initialize(root: Path) -> Path:
         elif version == 1:
             _validate_schema(conn, v1=True)
             _migrate_v1(conn)
-        elif version in (2, 3, 4, 5):
+        elif version in (2, 3, 4, 5, 6):
             pass
         elif version != SCHEMA_VERSION:
             raise ValueError(f"unsupported SQLite state schema version: {version}")
@@ -332,6 +340,9 @@ def initialize(root: Path) -> Path:
         if version in (0, 1, 2, 3, 4, 5) and not fresh:
             _validate_schema(conn, v5=True)
             _migrate_v5(conn)
+        if version in (0, 1, 2, 3, 4, 5, 6) and not fresh:
+            _validate_schema(conn, v6=True)
+            _migrate_v6(conn)
         _validate_schema(conn)
         if version != SCHEMA_VERSION:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")

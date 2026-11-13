@@ -163,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     admit_parser = commands.add_parser("admit")
     admit_parser.add_argument("issue", type=int)
     admit_parser.add_argument("--complexity", choices=("easy", "medium", "hard"))
+    admit_parser.add_argument("--task-set")
     review_parser = commands.add_parser("review")
     review_parser.add_argument("pr", type=int)
     packet_parser = commands.add_parser("review-packet")
@@ -219,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
                           sources={provider: source.kind for provider, source
                                    in cfg.quota_sources.items()})}
         elif args.command == "admit":
-            result = admit(cfg, args.issue, args.complexity)
+            result = admit(cfg, args.issue, args.complexity, args.task_set)
         elif args.command == "run-once":
             try:
                 work = run_once(cfg)

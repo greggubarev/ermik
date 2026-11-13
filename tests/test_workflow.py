@@ -108,6 +108,85 @@ class WorkflowTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_task_set_admission_freezes_single_label_before_worker(self):
+        with patch.object(runtime, "GitHub", FakeHub), patch.object(
+                runtime, "main_sha", return_value=SHA_A), patch.object(
+                runtime, "resource_guard", return_value={"admit": True}):
+            result = runtime.admit(self.cfg, 1, task_set="parser-v1")
+            self.assertEqual(result["task_set"], "parser-v1")
+            marker = FakeHub.notes[1][0]["body"].splitlines()[0]
+            self.assertIn(" task_set=parser-v1", marker)
+            self.assertTrue(runtime._approved_on_github(
+                FakeHub(self.cfg.repo), self.cfg, 1, runtime.parse_issue(BODY)))
+            with state.connect(self.cfg.state_dir) as conn:
+                claim = runtime._claim_new(FakeHub(self.cfg.repo), self.cfg, conn)
+                self.assertEqual(state.job(conn, 1)["task_set"], "parser-v1")
+            self.assertEqual(claim[0], 1)
+            FakeHub.issues[1]["names"].remove("task-set:parser-v1")
+            FakeHub.issues[1]["names"].add("task-set:parser-v2")
+            self.assertFalse(runtime._approved_on_github(
+                FakeHub(self.cfg.repo), self.cfg, 1, runtime.parse_issue(BODY)))
+            with patch.object(runtime, "_checkout") as checkout:
+                with self.assertRaisesRegex(runtime.WorkflowError, "task-set changed"):
+                    runtime._perform(self.cfg, 1, claim[1], claim[2],
+                                     correction_note=None, pr_number=None,
+                                     expected_base=SHA_A, expected_head=None)
+                checkout.assert_not_called()
+
+    def test_claim_refuses_task_set_changed_between_issue_reads(self):
+        spec = runtime.parse_issue(BODY)
+        base_names = {"queue:worker", "state:ready"}
+        old_issue = {"body": BODY, "labels": [
+            {"name": name} for name in base_names | {"task-set:parser-v1"}]}
+        new_issue = {"body": BODY, "labels": [
+            {"name": name} for name in base_names | {"task-set:parser-v2"}]}
+        markers = [runtime._admission_marker(1, spec, self.cfg, current)
+                   for current in (old_issue, new_issue)]
+
+        class ChangingHub:
+            def __init__(self):
+                self.reads = 0
+                self.label_changes = []
+
+            def ready_issues(self):
+                return [1]
+
+            def issue(self, number):
+                self.reads += 1
+                return old_issue if self.reads == 1 else new_issue
+
+            def comments(self, number):
+                return [{"body": marker, "user": {"login": "owner"}}
+                        for marker in markers]
+
+            def label(self, number, *, add, remove):
+                self.label_changes.append((add, remove))
+
+        hub = ChangingHub()
+        with state.connect(self.cfg.state_dir) as conn, patch.object(
+                runtime, "main_sha", return_value=SHA_A), patch.object(
+                runtime, "resource_guard", return_value={"admit": True}):
+            self.assertIsNone(runtime._claim_new(hub, self.cfg, conn))
+            self.assertIsNone(state.job(conn, 1))
+        self.assertEqual(hub.reads, 2)
+        self.assertEqual(hub.label_changes, [])
+
+    def test_task_set_conflict_and_unbounded_slug_are_refused(self):
+        with patch.object(runtime, "GitHub", FakeHub):
+            with self.assertRaisesRegex(runtime.WorkflowError, "bounded lowercase slug"):
+                runtime.admit(self.cfg, 1, task_set="Bad Set")
+            FakeHub.issues[1]["names"].update({"task-set:one", "task-set:two"})
+            with self.assertRaisesRegex(runtime.WorkflowError, "conflicting task-set"):
+                runtime.admit(self.cfg, 1, task_set="one")
+            self.assertEqual(FakeHub.notes, {})
+
+    def test_invalid_complexity_does_not_change_task_set_label(self):
+        with patch.object(runtime, "GitHub", FakeHub):
+            with self.assertRaisesRegex(runtime.WorkflowError,
+                                        "requires complexity_profiles"):
+                runtime.admit(self.cfg, 1, "easy", task_set="parser")
+        self.assertNotIn("task-set:parser", FakeHub.issues[1]["names"])
+
     def test_admit_claim_review_correction_same_pr(self):
         with patch.object(runtime, "GitHub", FakeHub), patch.object(runtime, "main_sha", return_value=SHA_A):
             admitted = runtime.admit(self.cfg, 1)
