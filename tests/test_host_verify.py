@@ -7,6 +7,16 @@ from ermik import host_verify
 
 
 class HostVerifyTests(unittest.TestCase):
+    def test_posix_windows_acl_skip_requires_exact_case_and_reason(self):
+        case = "test_retention.RetentionTests.test_windows_ambiguous_write_grant_refuses_cleanup"
+        with patch.object(host_verify.os, "name", "posix"):
+            self.assertTrue(host_verify._allowed_skip(case, "Windows ACL only"))
+            self.assertFalse(host_verify._allowed_skip(case, "unexpected environment"))
+            self.assertFalse(host_verify._allowed_skip("test_retention.RetentionTests.test_other_case",
+                                                       "Windows ACL only"))
+        with patch.object(host_verify.os, "name", "nt"):
+            self.assertFalse(host_verify._allowed_skip(case, "Windows ACL only"))
+
     def test_windows_retention_skips_require_exact_case_and_reason(self):
         expected = {
             "test_retention.RetentionTests.test_world_readable_evidence_in_public_parent_remains":
