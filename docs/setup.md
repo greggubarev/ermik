@@ -295,6 +295,13 @@ If `main` advances and the accepted file contents need no changes, put `SEMI_REB
 
 Stop this unit before changing its checkout, image, config or secret file. Ensure no other controller or maintenance command is using the same `state_dir`. Preserve its state and workspace and reconcile any interrupted Issue, branch and PR with GitHub before retrying a write. The first database open by the updated controller migrates a preview or version 1 through 6 SQLite database in place to schema version 7. Back up the complete private state before that open. Record the old commit and image ID so a rollback targets exact versions:
 
+| Checkout | SQLite schema | Evidence compatibility |
+| --- | ---: | --- |
+| v0.7.0-preview.1 | 6 | Reads versions 1–3. Reports missing portable image identity for version 1 when current review requires it. |
+| Current candidate | 7 | Reads versions 1–3. A current review still requires matching image, admission, and PR identity. |
+
+Keep the current config keys when switching between these two revisions. A later config format may require restoring the saved configuration. See [evidence compatibility](evidence.md) for the record-level rules.
+
 Prepare a separate checkout at the reviewed target commit and set `target_checkout` to its absolute path before stopping the service. Keep that checkout until the trial and any rollback finish. It supplies the snapshot helper while the installed checkout still runs the older preview.
 
 ```sh
@@ -310,10 +317,12 @@ if test -f "$HOME/.config/ermik/publisher.env"; then cp -a "$HOME/.config/ermik/
 cp -a "$HOME/.config/systemd/user/ermik.service" "$HOME/.config/systemd/user/ermik-preflight.service" "$backup_dir/"
 cp "$target_checkout/scripts/installation_snapshot.py" "$backup_dir/installation_snapshot.py"
 python3 "$backup_dir/installation_snapshot.py" backup --config config.json --snapshot "$backup_dir"
+rollback_schema="$(python3 -c 'from ermik.state import SCHEMA_VERSION; print(SCHEMA_VERSION)')"
+python3 "$backup_dir/installation_snapshot.py" verify --config config.json --snapshot "$backup_dir" --max-schema "$rollback_schema"
 find "$backup_dir" -maxdepth 1 -type f -exec chmod 0600 {} +
 ```
 
-The backup contains the commit SHA, image ID, config, a consistent SQLite copy, the other state files, and the complete workspace. Its manifest records file hashes and exact installation paths; the database backup includes committed data from any SQLite journal. Preserve this private backup and its helper outside the checkout. Use an immutable image tag or digest, and save the image separately only when it cannot be rebuilt or pulled from its pinned source. The controller records the resolved image ID in the job ledger before launching its first container. Retries, corrections, and recovery use that ID even if the configured tag moves; they stop if the old image is unavailable. Keep an image with the published config digest available on the maintainer host until each PR is finished; its local ID may differ. A new image applies to newly claimed jobs. Run `review` again after any image update. Jobs created by an earlier version without a saved image ID require inspection before resumption; do not infer an ID from a mutable tag. Check available disk space before a large state backup, and retain only backups still needed for rollback after verifying their exact paths. Keep backups outside the checkout and protect them as controller state. Update to a reviewed exact commit, install the matching unit copies if changed, rebuild or pull the pinned image, and run the systemd preflight above before restarting. A shell-level `doctor` is insufficient for this gate. Do not start polling while another controller uses the same state directory.
+The backup contains the commit SHA, image ID, config, a consistent SQLite copy, the other state files, and the complete workspace. Its manifest binds the state database, state files, workspace, and installation paths. Inspect the separately saved configuration, unit files, commit, and image ID before reinstalling them. The verification command keeps both live directories in place and checks the snapshot against the selected controller schema. The database backup includes committed data from any SQLite journal. Preserve this private backup and its helper outside the checkout. Use an immutable image tag or digest, and save the image separately only when it cannot be rebuilt or pulled from its pinned source. The controller records the resolved image ID in the job ledger before launching its first container. Retries, corrections, and recovery use that ID even if the configured tag moves; they stop if the old image is unavailable. Keep an image with the published config digest available on the maintainer host until each PR is finished; its local ID may differ. A new image applies to newly claimed jobs. Run `review` again after any image update. Jobs created by an earlier version without a saved image ID require inspection before resumption; do not infer an ID from a mutable tag. Check available disk space before a large state backup, and retain only backups still needed for rollback after verifying their exact paths. Keep backups outside the checkout and protect them as controller state. Update to a reviewed exact commit, install the matching unit copies if changed, rebuild or pull the pinned image, and run the systemd preflight above before restarting. A shell-level `doctor` is insufficient for this gate. Do not start polling while another controller uses the same state directory.
 
 The migration runs automatically when the updated controller opens the database; there is no separate migration command. It preserves admissions, jobs, retry state, events and usage records. Version 4 adds a frozen route cohort and records each worker attempt before execution; older attempts retain unknown phase and duration. Version 5 adds route-decision fields and optional lease reservations; older events and leases retain null or zero values. Version 6 adds approved complexity profiles. Version 7 adds a nullable task set; older jobs remain unknown. If the migration fails, leave the service stopped and inspect the error and backed-up database before retrying. An unknown newer schema version is rejected. After the systemd preflight, migrate the stopped installation locally and verify it before polling:
 
@@ -361,19 +370,8 @@ Reconcile remote state before running any command from the old checkout against 
 set -e
 # Compare every affected Issue, branch, PR HEAD and local event with the snapshot first.
 # Stop if any identity differs or a remote write is uncertain.
-python3 - "$backup_dir/state.sqlite3" <<'PY'
-import sqlite3
-import sys
-from pathlib import Path
-from ermik.state import SCHEMA_VERSION
-
-with sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True) as db:
-    version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version > SCHEMA_VERSION:
-        raise RuntimeError("restored schema is newer than the selected controller")
-    print("snapshot schema version", version)
-PY
-python3 "$backup_dir/installation_snapshot.py" restore --config config.json --snapshot "$backup_dir"
+rollback_schema="$(python3 -c 'from ermik.state import SCHEMA_VERSION; print(SCHEMA_VERSION)')"
+python3 "$backup_dir/installation_snapshot.py" restore --config config.json --snapshot "$backup_dir" --max-schema "$rollback_schema"
 state_dir="$(python3 -c 'import json; print(json.load(open("config.json"))["state_dir"])')"
 ```
 
