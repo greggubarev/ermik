@@ -8,7 +8,7 @@ The name is inspired by the [ermine](https://www.nature.scot/plants-animals-and-
 
 ## Design focus
 
-Issue-to-PR automation already exists. Ermik's distinct focus is the handoff around execution: who admitted the exact task, what paths and checks were allowed, which commit was reviewed, what happened after interruption, and who may merge.
+Ermik automates the work between maintainer decisions. The maintainer admits an exact task and decides what to merge. The controller runs approved work, publishes the evidence needed for review, and resumes safe interruptions.
 
 - **An explicit handoff.** Admission binds the issue body and allowed paths. The controller publishes one draft PR per issue; a correction continues on that PR. A changed HEAD invalidates the previous review.
 - **A real publication boundary.** The task container receives neither GitHub credentials nor the Docker socket. Fork mode can keep upstream Contents write and merge permission off the execution host; the [security guide](docs/security.md) states the trusted parts and remaining limits.
@@ -49,6 +49,8 @@ python3 -m ermik --config config.json status
 The maintainer admits an issue; the server's `run-once` or `poll` takes only admitted `queue:worker` and `state:ready` issues. The maintainer reviews the draft PR, sends corrections to the same PR if needed, and explicitly merges after reviewing the new HEAD. [Maintainer commands](docs/maintainer.md) and [worker operation](docs/worker.md) give the exact steps.
 
 ## Roadmap
+
+Start with the provider-independent upgrade rehearsal, then qualify separate-host review, measured routing, and stable adoption. See the [ordered plan](docs/roadmap.md#product-direction) for the evidence each step requires.
 
 | Milestone | Focus | Closed issues | What remains |
 | --- | --- | ---: | --- |
