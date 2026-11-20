@@ -307,6 +307,26 @@ class EvidenceTransportTests(unittest.TestCase):
         self.assertEqual(len(self.gh.rows), 101)
         self.assertEqual(self.gh.page2_reads, 1)
 
+    def test_second_pass_rejects_edit_to_ordinary_comment_at_same_count(self):
+        self.gh.rows = [{"id": number, "body": "ordinary", "user": {"id": 99}}
+                        for number in range(1, 102)]
+        self.gh.rows.append({"id": 102, "body": _body(manifest(model=None)),
+                             "user": {"id": 42}})
+        read = self.gh.api
+        first_page_reads = 0
+
+        def api(endpoint, *, timeout):
+            nonlocal first_page_reads
+            if endpoint.endswith("page=1"):
+                first_page_reads += 1
+                if first_page_reads == 2:
+                    self.gh.rows[50]["body"] = "edited"
+            return read(endpoint, timeout=timeout)
+
+        with patch.object(self.gh, "api", side_effect=api):
+            with self.assertRaisesRegex(GitHubError, "pagination changed"):
+                fetch_manifest(self.cfg, 12)
+
     def test_exact_two_thousand_comment_boundary(self):
         self.gh.rows = [{"id": n, "body": "ordinary",
                          "user": {"login": "other", "id": 99}}

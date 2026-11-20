@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -16,6 +17,7 @@ from .github import GitHub, GitHubError
 MARKER = "Ermik evidence v2\n\n```json\n"
 _MARKERS = {1: "Ermik evidence v1\n\n```json\n", 2: MARKER,
             3: "Ermik evidence v3\n\n```json\n"}
+_EVIDENCE_PREFIX = "Ermik evidence v"
 _SUFFIX = "```"
 MAX_COMMENTS = 2000
 LOOKUP_TIMEOUT = 10
@@ -63,7 +65,7 @@ def _record(body: str) -> dict:
     return record
 
 
-def _comments(gh: GitHub, pr_number: int) -> list[dict]:
+def _comments(gh: GitHub, pr_number: int, publisher_id: int) -> tuple[int, list[dict]]:
     deadline = _clock() + LOOKUP_BUDGET
 
     def read(endpoint: str):
@@ -84,52 +86,62 @@ def _comments(gh: GitHub, pr_number: int) -> list[dict]:
         raise GitHubError("evidence comment count is invalid")
     if count > MAX_COMMENTS:
         raise GitHubError("evidence comment listing exceeds limit")
-    rows: list[dict] = []
-    fingerprints: list[tuple] = []
+    candidates: list[dict] = []
+    page_digests: list[bytes] = []
+    page_count = (count + 99) // 100
+    previous_id = 0
 
-    def fingerprint(row: dict) -> tuple:
-        user = row.get("user")
-        author_id = user.get("id") if isinstance(user, dict) else None
-        return row["id"], row.get("body"), author_id, row.get("updated_at")
-
-    for page in range(1, (count + 99) // 100 + 1):
+    def read_page(page: int) -> list[dict]:
         batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
-        if not isinstance(batch, list):
-            raise GitHubError("evidence comment listing is invalid")
-        expected = min(100, count - len(rows))
-        if (len(batch) != expected
+        expected = min(100, count - (page - 1) * 100)
+        if (not isinstance(batch, list) or len(batch) != expected
                 or any(not isinstance(item, dict)
                        or type(item.get("id")) is not int or item["id"] <= 0
                        for item in batch)):
             raise GitHubError("evidence comment listing is invalid")
-        if rows and batch[0]["id"] <= rows[-1]["id"]:
-            raise GitHubError("evidence comment pagination is incomplete")
-        if any(left["id"] >= right["id"] for left, right in zip(batch, batch[1:])):
-            raise GitHubError("evidence comment pagination is incomplete")
-        fingerprints.extend(fingerprint(item) for item in batch)
-        rows.extend(batch)
-    if count > 100:
-        for page in range(1, (count + 99) // 100 + 1):
-            batch = read(f"issues/{pr_number}/comments?per_page=100&page={page}")
-            expected = fingerprints[(page - 1) * 100:page * 100]
-            if (not isinstance(batch, list) or len(batch) != len(expected)
-                    or any(not isinstance(item, dict)
-                           or type(item.get("id")) is not int
-                           or fingerprint(item) != saved
-                           for item, saved in zip(batch, expected))):
-                raise GitHubError("evidence comment pagination changed")
+        return batch
+
+    def fingerprint(batch: list[dict]) -> bytes:
+        digest = hashlib.sha256()
+        for row in batch:
+            user = row.get("user")
+            author_id = user.get("id") if isinstance(user, dict) else None
+            fields = (row["id"], row.get("body"), author_id, row.get("updated_at"))
+            digest.update(json.dumps(fields, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=True).encode("ascii"))
+        return digest.digest()
+
+    for page in range(1, page_count + 1):
+        batch = read_page(page)
+        for row in batch:
+            if row["id"] <= previous_id:
+                raise GitHubError("evidence comment pagination is incomplete")
+            previous_id = row["id"]
+            body = row.get("body")
+            user = row.get("user")
+            if (isinstance(body, str) and body.startswith(_EVIDENCE_PREFIX)
+                    and isinstance(user, dict) and type(user.get("id")) is int
+                    and user["id"] == publisher_id):
+                candidates.append({"id": previous_id, "body": body,
+                                   "user": {"id": publisher_id}})
+        if count > 100:
+            page_digests.append(fingerprint(batch))
+
+    for page, expected in enumerate(page_digests, 1):
+        if fingerprint(read_page(page)) != expected:
+            raise GitHubError("evidence comment pagination changed")
     after = read(f"issues/{pr_number}")
     if (not isinstance(after, dict) or type(after.get("comments")) is not int
             or after["comments"] != count or after.get("updated_at") != updated):
         raise GitHubError("evidence comment pagination changed")
-    return rows
+    return count, candidates
 
 
 def _published_records(cfg: Config, gh: GitHub, pr_number: int,
                        *, rows: list[dict] | None = None) -> list[tuple[dict, dict]]:
     publisher_id = _publisher_id(cfg)
     found: list[tuple[dict, dict]] = []
-    for row in rows if rows is not None else _comments(gh, pr_number):
+    for row in rows if rows is not None else _comments(gh, pr_number, publisher_id)[1]:
         body = row.get("body")
         if not isinstance(body, str):
             continue
@@ -138,7 +150,7 @@ def _published_records(cfg: Config, gh: GitHub, pr_number: int,
                 or user["id"] != publisher_id):
             continue
         marker = re.match(r"Ermik evidence v([0-9]+)(?:\n|\Z)", body)
-        if body.startswith("Ermik evidence v") and marker is None:
+        if body.startswith(_EVIDENCE_PREFIX) and marker is None:
             raise EvidenceRecordError("publisher evidence comment is malformed")
         if marker:
             try:
@@ -193,8 +205,7 @@ def publish_manifest(cfg: Config, pr_number: int) -> dict:
 
     def existing() -> dict | None:
         nonlocal scanned_count
-        rows = _comments(gh, pr_number)
-        scanned_count = len(rows)
+        scanned_count, rows = _comments(gh, pr_number, publisher_id)
         found = _published_records(cfg, gh, pr_number, rows=rows)
         matches = [(row, saved) for row, saved in found
                    if saved["head"] == record["head"]]
