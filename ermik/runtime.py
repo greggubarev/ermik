@@ -1742,8 +1742,8 @@ def _push_checked_interrupted_job(gh: GitHub, cfg: Config, conn,
     return True
 
 
-def _restore_blocked_prepublication_label(gh: GitHub, issue: int) -> bool:
-    """Compensate a possibly applied label write without overriding other states."""
+def _mark_issue_blocked(gh: GitHub, issue: int) -> bool:
+    """Move an in-progress Issue to blocked without overriding other states."""
     try:
         current = labels(gh.issue(issue))
         if "state:blocked" in current and "state:in-progress" not in current:
@@ -1874,7 +1874,7 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
                 raise
         except (GitHubError, TransientFailure):
             if label_attempted:
-                restored = _restore_blocked_prepublication_label(gh, row["issue"])
+                restored = _mark_issue_blocked(gh, row["issue"])
                 if readmit_id is not None:
                     conn.execute("UPDATE jobs SET last_request=? WHERE issue=? AND status='blocked'",
                                  (readmit_id, row["issue"]))
@@ -1887,7 +1887,7 @@ def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -
         except (WorkflowError, ValueError, TypeError, KeyError, OSError,
                 sqlite3.Error) as exc:
             restored = (not label_attempted or
-                        _restore_blocked_prepublication_label(gh, row["issue"]))
+                        _mark_issue_blocked(gh, row["issue"]))
             if label_attempted and readmit_id is not None:
                 conn.execute("UPDATE jobs SET last_request=? WHERE issue=? AND status='blocked'",
                              (readmit_id, row["issue"]))
@@ -1909,8 +1909,10 @@ def _reconcile_interrupted(gh: GitHub, cfg: Config, conn) -> None:
             approved = state.admission(conn, row["issue"])
             if (approved is None or approved["body_sha"] != spec.body_sha256
                     or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
-                    or not _approved_on_github(gh, cfg, row["issue"], spec)
+                    or not _approved_on_github(gh, cfg, row["issue"], spec, issue)
                     or not _job_complexity_matches(cfg, issue, row)
+                    or (row["route_key"] is not None
+                        and _route_key(issue) != row["route_key"])
                     or "queue:worker" not in labels(issue)
                     or not ({"state:ready", "state:in-progress"} & labels(issue))):
                 raise WorkflowError("interrupted job identity changed")
@@ -2474,6 +2476,7 @@ def run_once(cfg: Config) -> list[dict]:
         work: list[tuple[int, str, IssueSpec, str | None, int | None, RecoveryClaim | None]] = []
         reserved_providers: dict[str, int] = {}
         selected_providers: dict[int, str] = {}
+        blocked_retries: list[int] = []
         review_budget = [min(10, max(1, cfg.poll_seconds // 5))]
         with state.connect(cfg.state_dir) as conn:
             _readmit_prepublication(gh, cfg, conn)
@@ -2493,6 +2496,16 @@ def run_once(cfg: Config) -> list[dict]:
                         row = state.job(conn, claim.issue)
                         try:
                             issue = gh.issue(claim.issue)
+                            spec = parse_issue(issue.get("body") or "")
+                            approved = state.admission(conn, claim.issue)
+                            if (approved is None or approved["body_sha"] != spec.body_sha256
+                                    or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
+                                    or not _approved_on_github(gh, cfg, claim.issue, spec, issue)
+                                    or not _job_complexity_matches(cfg, issue, row)
+                                    or (row["route_key"] is not None
+                                        and _route_key(issue) != row["route_key"])
+                                    or not {"queue:worker", "state:in-progress"}.issubset(labels(issue))):
+                                raise WorkflowError("retry identity changed")
                             provider = _route_provider(conn, cfg, issue,
                                                        reserved_providers)
                             if provider is None:
@@ -2504,14 +2517,6 @@ def run_once(cfg: Config) -> list[dict]:
                                              (int(time.time()) + 60, claim.issue,
                                               claim.token))
                                 continue
-                            spec = parse_issue(issue.get("body") or "")
-                            approved = state.admission(conn, claim.issue)
-                            if (approved is None or approved["body_sha"] != spec.body_sha256
-                                    or tuple(json.loads(row["allowed_json"])) != spec.allowed_paths
-                                    or not _approved_on_github(gh, cfg, claim.issue, spec)
-                                    or not _job_complexity_matches(cfg, issue, row)
-                                    or not {"queue:worker", "state:in-progress"}.issubset(labels(issue))):
-                                raise WorkflowError("retry identity changed")
                             note = None
                             if claim.resume_status == "correcting":
                                 pr = gh.pr(row["pr"])
@@ -2542,19 +2547,18 @@ def run_once(cfg: Config) -> list[dict]:
                                     reserved_providers.get(provider, 0) + 1)
                             selected_providers[claim.issue] = provider
                             continue
-                        except GitHubError:
-                            record_failure(conn, claim.issue, "transient",
-                                           failure_id=f"retry-transport-{claim.token}",
-                                           resume_status=claim.resume_status,
-                                           lease_token=claim.token)
-                            state.event(conn, claim.issue, "retry_scheduled")
-                            continue
-                        except (WorkflowError, ValueError, KeyError, TypeError):
-                            record_failure(conn, claim.issue, "identity",
-                                           failure_id=f"retry-verify-{claim.token}",
-                                           resume_status=claim.resume_status,
-                                           lease_token=claim.token)
-                            state.event(conn, claim.issue, "blocked")
+                        except (GitHubError, WorkflowError, ValueError, KeyError, TypeError) as exc:
+                            category = "transient" if isinstance(exc, GitHubError) else "identity"
+                            decision = record_failure(conn, claim.issue, category,
+                                                      failure_id=f"retry-verify-{claim.token}",
+                                                      resume_status=claim.resume_status,
+                                                      lease_token=claim.token)
+                            if decision.status == "blocked":
+                                conn.execute("UPDATE jobs SET error=? WHERE issue=?",
+                                             ("Retry verification requires inspection", claim.issue))
+                                blocked_retries.append(claim.issue)
+                            state.event(conn, claim.issue, "blocked" if decision.status == "blocked"
+                                        else "retry_scheduled")
                             continue
                 correction = _correction(gh, cfg, conn, review_budget,
                                          reserved_providers, selected_providers)
@@ -2570,6 +2574,8 @@ def run_once(cfg: Config) -> list[dict]:
                     break
                 number, branch, spec = claimed
                 work.append((number, branch, spec, None, None, None))
+        for issue in blocked_retries:
+            _mark_issue_blocked(gh, issue)
         if not work:
             return []
 
