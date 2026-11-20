@@ -198,6 +198,70 @@ class RuntimeRecoveryTests(unittest.TestCase):
             self.assertEqual(state.job(conn, 1)["status"], "blocked")
         self.assertEqual(Hub.opened, [])
 
+    def test_retry_refuses_route_changed_between_reconciliation_and_scheduling(self):
+        Hub.issues[1]["names"].add("route:primary")
+        due = self._first_failure()
+        read_issue = Hub.issue
+        issue_reads = 0
+
+        def change_at_second_read(hub, number):
+            nonlocal issue_reads
+            issue_reads += 1
+            if issue_reads == 2:
+                Hub.issues[number]["names"].discard("route:primary")
+                Hub.issues[number]["names"].add("route:secondary")
+            return read_issue(hub, number)
+
+        with patch.object(Hub, "issue", change_at_second_read), patch.object(
+                runtime, "_route_provider", return_value=None) as capacity:
+            result = self._run_due(due, AssertionError("worker must not run"))
+        capacity.assert_not_called()
+        self.assertEqual(result, [])
+        with state.connect(self.cfg.state_dir) as conn:
+            self.assertEqual(state.job(conn, 1)["status"], "blocked")
+            self.assertIsNone(conn.execute(
+                "SELECT next_retry_at FROM retry_state WHERE issue=1").fetchone()[0])
+        self.assertIn("state:blocked", Hub.issues[1]["names"])
+        self.assertNotIn("state:in-progress", Hub.issues[1]["names"])
+
+    def test_terminal_retry_transport_failure_reports_blocked(self):
+        due = self._first_failure()
+        read_issue = Hub.issue
+        for expected_status, expected_event in (("retry_wait", "retry_scheduled"),
+                                                 ("blocked", "blocked")):
+            reads = 0
+
+            def fail_retry_verification(hub, number):
+                nonlocal reads
+                reads += 1
+                if reads == 2:
+                    raise runtime.GitHubError("temporary read failure")
+                return read_issue(hub, number)
+
+            with patch.object(Hub, "issue", fail_retry_verification), patch.object(
+                    runtime, "_mark_issue_blocked", return_value=False):
+                self.assertEqual(self._run_due(due, AssertionError("worker must not run")),
+                                 [])
+            with state.connect(self.cfg.state_dir) as conn:
+                self.assertEqual(state.job(conn, 1)["status"], expected_status)
+                self.assertEqual(conn.execute(
+                    "SELECT kind FROM events WHERE issue=1 AND kind IN "
+                    "('retry_scheduled','blocked') ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0], expected_event)
+                retry = conn.execute(
+                    "SELECT next_retry_at,lease_token FROM retry_state WHERE issue=1"
+                ).fetchone()
+                due = retry["next_retry_at"]
+                self.assertIsNone(retry["lease_token"])
+        self.assertIsNone(due)
+        self.assertIn("state:in-progress", Hub.issues[1]["names"])
+        self.assertEqual(runtime.run_once(self.cfg), [])
+        self.assertIn("state:blocked", Hub.issues[1]["names"])
+        self.assertNotIn("state:in-progress", Hub.issues[1]["names"])
+        with patch.object(runtime, "_mark_issue_blocked") as mark_blocked:
+            self.assertEqual(runtime.run_once(self.cfg), [])
+        mark_blocked.assert_not_called()
+
     def test_preexisting_branch_pr_blocks_retry_without_second_pr(self):
         due = self._first_failure()
         Hub.prs[10] = {"state": "OPEN", "headRefName": "work/issue-1-delivery",
