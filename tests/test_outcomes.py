@@ -15,6 +15,7 @@ from ermik.effort_advice import recommend_effort
 from ermik.providers import ModelCandidate
 from ermik.routing_policy import audit_route_order
 from ermik.runtime import _profile_sha
+from ermik.__main__ import _audit_scope
 
 
 class OutcomeTests(unittest.TestCase):
@@ -449,67 +450,156 @@ class OutcomeTests(unittest.TestCase):
                        [("c" * 40, "reviewed"), ("c" * 40, "changes_requested"),
                         (head, "reviewed"), (head, "merge_intent"), (head, "merged")])
             self.journal(issue, issue + 10, head, journal)
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET task_set='parser'")
+        for issue in range(5, 9):
+            self.add_job(issue, issue + 10, "route:other", head)
+            self.attempt(issue, f"attempt-{issue}", 0, provider="one")
+            self.journal(issue, issue + 10, head,
+                         [(head, "reviewed"), (head, "merge_intent"), (head, "merged")])
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET task_set='parser' WHERE issue >= 5")
+        scope = {"task_set": "parser", "route": "route:auto",
+                 "complexity": None, "profile_sha256": None}
         now = datetime(2026, 11, 13, 12, tzinfo=timezone.utc)
         report = build_outcome_report(cfg, self.maintainer)
         quality = build_quality_snapshot(cfg, self.maintainer, observed_at=now,
-                                         source_report=report)
-        audit = {**quality, "version": 2, "cohort": audit_cohort(report),
+                                         source_report=report, audit_scope=scope)
+        audit = {**quality, "version": 3, "scope": scope,
+                 "cohort": audit_cohort(report, scope),
                  "thresholds": {"min_samples": 2, "max_age_seconds": 3600},
                  "gates": {"admission": "required", "checks": "required",
                            "maintainer_review": "required"}}
         path = cfg.state_dir.parent / "audit.json"
         path.write_text(json.dumps(audit), encoding="utf-8")
-        result = audit_route_order(cfg, report, path, candidates, now)
+        result = audit_route_order(cfg, report, path, candidates, now, scope=scope)
         self.assertEqual(result["decision"], "audited")
         self.assertEqual(result["proposed_order"], [candidates[1].ref, candidates[0].ref])
         self.assertEqual(len(result["cohort"]["accepted_prs"]), 4)
+        self.assertEqual(result["provider_samples"], {"one": 2, "two": 2})
         self.assertEqual(result["cohort"]["accepted_prs"][0]["head"], head)
         audit["thresholds"]["min_samples"] = 20
         path.write_text(json.dumps(audit), encoding="utf-8")
         sparse = audit_route_order(replace(cfg, quality_min_samples=20), report,
-                                   path, candidates, now)
+                                   path, candidates, now, scope=scope)
         self.assertEqual(sparse["decision"], "refused")
         self.assertEqual(sparse["refusal_reason"],
                          "insufficient_or_stale_measurements")
         self.assertEqual(sparse["provider_samples"], {"one": 2, "two": 2})
-        self.assertEqual(sparse["cohort"], audit_cohort(report))
+        self.assertEqual(sparse["cohort"], audit_cohort(report, scope))
         self.assertEqual(sparse["observed_at"], now.isoformat())
         self.assertEqual(sparse["proposed_order"], [item.ref for item in candidates])
         audit["thresholds"]["min_samples"] = 2
         audit["cohort"]["accepted_prs"][0]["issue"] = 99
         path.write_text(json.dumps(audit), encoding="utf-8")
-        refused = audit_route_order(cfg, report, path, candidates, now)
+        refused = audit_route_order(cfg, report, path, candidates, now, scope=scope)
         self.assertEqual((refused["decision"], refused["proposed_order"]),
                          ("refused", [item.ref for item in candidates]))
         self.assertNotIn("cohort", refused)
-        audit["cohort"] = audit_cohort(report)
+        audit["cohort"] = audit_cohort(report, scope)
         path.write_text(json.dumps(audit), encoding="utf-8")
         changed_report = json.loads(json.dumps(report))
         changed_report["jobs"][0]["route"] = "route:changed"
-        self.assertEqual(audit_route_order(cfg, changed_report, path, candidates, now)
+        self.assertEqual(audit_route_order(cfg, changed_report, path, candidates, now, scope=scope)
                          ["decision"], "refused")
-        audit["cohort"] = audit_cohort(report)
+        audit["cohort"] = audit_cohort(report, scope)
         audit["observed_at"] = (now - timedelta(seconds=3601)).isoformat()
         path.write_text(json.dumps(audit), encoding="utf-8")
-        self.assertEqual(audit_route_order(cfg, report, path, candidates, now)["decision"],
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now, scope=scope)["decision"],
                          "refused")
         audit["observed_at"] = now.isoformat()
         audit["gates"]["checks"] = "skipped"
         path.write_text(json.dumps(audit), encoding="utf-8")
-        self.assertEqual(audit_route_order(cfg, report, path, candidates, now)["decision"],
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now, scope=scope)["decision"],
                          "refused")
         audit["gates"]["checks"] = "required"
         audit["thresholds"]["min_samples"] = 1
         path.write_text(json.dumps(audit), encoding="utf-8")
-        self.assertEqual(audit_route_order(cfg, report, path, candidates, now)["decision"],
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now, scope=scope)["decision"],
                          "refused")
         audit["thresholds"]["min_samples"] = 2
         audit["gates"]["checks"] = "required"
         audit["observed_at"] = "private invalid date"
         path.write_text(json.dumps(audit), encoding="utf-8")
-        refusal = audit_route_order(cfg, report, path, candidates, now)
+        refusal = audit_route_order(cfg, report, path, candidates, now, scope=scope)
         self.assertEqual(refusal["refusal_reason"], "invalid_or_incomplete_evidence")
         self.assertNotIn("private", json.dumps(refusal))
+
+        audit["observed_at"] = now.isoformat()
+        audit["thresholds"]["min_samples"] = 2
+        audit["scope"]["task_set"] = "other"
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        self.assertEqual(audit_route_order(cfg, report, path, candidates, now,
+                                           scope=scope)["refusal_reason"],
+                         "invalid_or_incomplete_evidence")
+        audit.pop("scope")
+        audit["version"] = 2
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        legacy = audit_route_order(cfg, report, path, candidates, now, scope=scope)
+        self.assertEqual((legacy["decision"], legacy["refusal_reason"]),
+                         ("refused", "legacy_unscoped_audit"))
+
+    def test_scoped_samples_exclude_other_task_route_and_profile(self):
+        head = "b" * 40
+        candidates = (ModelCandidate("one", "model", "ONE_API_KEY",
+                                     base_url="https://example.com"),
+                      ModelCandidate("two", "model", "TWO_API_KEY",
+                                     base_url="https://example.com"))
+        cfg = replace(self.cfg, models=candidates, quality_min_samples=2)
+        for issue in range(1, 7):
+            route = "route:auto" if issue != 4 else "route:other"
+            self.add_job(issue, issue + 10, route, head)
+            self.attempt(issue, f"attempt-{issue}", 0,
+                         provider="one" if issue < 4 else "two")
+            self.journal(issue, issue + 10, head,
+                         [(head, "reviewed"), (head, "merge_intent"), (head, "merged")])
+        with state.connect(cfg.state_dir) as conn:
+            conn.execute("UPDATE jobs SET task_set='parser' WHERE issue != 5")
+            conn.execute("UPDATE jobs SET profile_sha=? WHERE issue=3", ("f" * 64,))
+        report = build_outcome_report(cfg, self.maintainer)
+        scope = {"task_set": "parser", "route": "route:auto",
+                 "complexity": None, "profile_sha256": None}
+        quality = build_quality_snapshot(cfg, self.maintainer, source_report=report,
+                                         audit_scope=scope)
+        self.assertEqual({key: row["samples"] for key, row in
+                          quality["providers"].items()}, {"one": 2, "two": 1})
+        self.assertEqual([row["issue"] for row in
+                          audit_cohort(report, scope)["accepted_prs"]], [1, 2, 6])
+        audit = {**quality, "version": 3, "scope": scope,
+                 "cohort": audit_cohort(report, scope),
+                 "thresholds": {"min_samples": 2,
+                                "max_age_seconds": cfg.quality_max_age_seconds},
+                 "gates": {"admission": "required", "checks": "required",
+                           "maintainer_review": "required"}}
+        path = cfg.state_dir.parent / "scoped-audit.json"
+        path.write_text(json.dumps(audit), encoding="utf-8")
+        result = audit_route_order(cfg, report, path, candidates,
+                                   datetime.fromisoformat(quality["observed_at"]),
+                                   scope=scope)
+        self.assertEqual(result["refusal_reason"], "insufficient_or_stale_measurements")
+        self.assertEqual(result["provider_samples"], {"one": 2, "two": 1})
+        self.assertEqual(result["scope"], scope)
+        single = audit_route_order(cfg, report, path, candidates[:1],
+                                   datetime.fromisoformat(quality["observed_at"]),
+                                   scope=scope)
+        self.assertEqual(single["decision"], "refused")
+        self.assertEqual(single["proposed_order"], [candidates[0].ref])
+
+    def test_audit_scope_requires_matching_profile_mode(self):
+        candidate = ModelCandidate("one", "model", "ONE_API_KEY",
+                                   base_url="https://example.com")
+        cfg = replace(self.cfg, models=(candidate,))
+        self.assertEqual(_audit_scope(cfg, "parser", "route:auto", None),
+                         {"task_set": "parser", "route": "route:auto",
+                          "complexity": None, "profile_sha256": None})
+        with self.assertRaisesRegex(ValueError, "requires configured profiles"):
+            _audit_scope(cfg, "parser", "route:auto", "easy")
+        cfg = replace(cfg, complexity_profiles={tier: (candidate,)
+                          for tier in ("easy", "medium", "hard")})
+        with self.assertRaisesRegex(ValueError, "required by configured profiles"):
+            _audit_scope(cfg, "parser", "route:auto", None)
+        self.assertEqual(_audit_scope(cfg, "parser", "route:auto", "easy")
+                         ["profile_sha256"], _profile_sha(cfg, "easy", "route:auto"))
 
 
 if __name__ == "__main__":

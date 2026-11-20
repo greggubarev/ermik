@@ -141,6 +141,10 @@ class QualityRoutingTests(unittest.TestCase):
         self.assertEqual(result["proposed_order"], [GO.ref, KIMI.ref])
         self.assertEqual(result["fallback"], "current_runtime_order")
         self.assertEqual(result["decision"], "refused")
+        missing_audit.write_text('{"version":2}', encoding="utf-8")
+        legacy = audit_route_order(self.cfg, {}, missing_audit, (KIMI, GO), NOW)
+        self.assertEqual(legacy["refusal_reason"], "legacy_unscoped_audit")
+        self.assertEqual(legacy["proposed_order"], [GO.ref, KIMI.ref])
 
 
 if __name__ == "__main__":
