@@ -128,7 +128,8 @@ def order_candidates(cfg: Config, candidates: Sequence[ModelCandidate],
 
 def audit_route_order(cfg: Config, report: dict, snapshot_path: Path,
                       candidates: Sequence[ModelCandidate],
-                      now: datetime | None = None) -> dict:
+                      now: datetime | None = None,
+                      *, scope: dict | None = None) -> dict:
     """Preview a frozen cohort's order; never update routing or controller state."""
     priority = tuple(candidates)
     configured = [candidate.ref for candidate in priority]
@@ -147,19 +148,27 @@ def audit_route_order(cfg: Config, report: dict, snapshot_path: Path,
               "quality_max_age_seconds": cfg.quality_max_age_seconds}
     try:
         snapshot = _read_snapshot(Path(snapshot_path))
+        if snapshot.get("version") == 2:
+            result["refusal_reason"] = "legacy_unscoped_audit"
+            return result
+        if scope is None:
+            result["refusal_reason"] = "task_set_required"
+            return result
         if (set(snapshot) != {"version", "repo", "observed_at", "providers",
-                              "cohort", "gates", "thresholds"}
-                or type(snapshot["version"]) is not int or snapshot["version"] != 2
+                              "cohort", "gates", "thresholds", "scope"}
+                or type(snapshot["version"]) is not int or snapshot["version"] != 3
                 or snapshot["repo"] != cfg.repo
+                or scope is None or snapshot["scope"] != scope
                 or snapshot["thresholds"] != {
                     "min_samples": cfg.quality_min_samples,
                     "max_age_seconds": cfg.quality_max_age_seconds}
                 or snapshot["gates"] != result["gates"]):
             raise ValueError("invalid audit snapshot")
-        cohort = audit_cohort(report)
+        cohort = audit_cohort(report, scope)
         if cohort != snapshot["cohort"]:
             raise ValueError("mismatched cohort")
         expected = build_quality_snapshot(cfg, cfg.state_dir, source_report=report,
+                                          audit_scope=scope,
                                           observed_at=datetime.fromisoformat(
                                               snapshot["observed_at"]))
         if snapshot["providers"] != expected["providers"]:
@@ -173,7 +182,8 @@ def audit_route_order(cfg: Config, report: dict, snapshot_path: Path,
     except (OSError, ValueError, UnicodeError, TypeError, OverflowError, KeyError):
         result["refusal_reason"] = "invalid_or_incomplete_evidence"
         return result
-    result.update({"observed_at": observed.isoformat(), "cohort": cohort,
+    result.update({"observed_at": observed.isoformat(), "scope": scope,
+                   "cohort": cohort,
                    "provider_samples": {
                        provider: expected["providers"].get(provider, {}).get("samples")
                        for provider in sorted({item.provider_id for item in priority})}})

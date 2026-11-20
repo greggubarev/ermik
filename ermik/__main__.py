@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import uuid
 from .config import load_config
 from .github import GitHub
 from .review import merge, request_changes, request_rebase, review
-from .runtime import _routed_models, admit, checked, main_sha, poll, run_once
+from .runtime import TASK_SET, _profile_sha, _routed_models, admit, checked, main_sha, poll, run_once
 from .observability import QUOTA_FILE, quota_status, status_snapshot
 from .quota import probe, unknown
 from .dashboard import create_server
@@ -31,6 +32,23 @@ from .outcomes import audit_cohort, build_outcome_report, build_quality_snapshot
 from .effort_advice import recommend_effort
 from .routing_policy import audit_route_order
 from .event_digest import deliver_once
+
+
+def _audit_scope(cfg, task_set: str, route: str, complexity: str | None) -> dict:
+    if not task_set or TASK_SET.fullmatch("task-set:" + task_set) is None:
+        raise ValueError("audit task_set must be an explicit valid task set")
+    if route != "route:auto" and route not in cfg.routes:
+        raise ValueError("audit route must be configured")
+    if cfg.complexity_profiles:
+        if complexity not in cfg.complexity_profiles:
+            raise ValueError("audit complexity is required by configured profiles")
+        profile = _profile_sha(cfg, complexity, route)
+    else:
+        if complexity is not None:
+            raise ValueError("audit complexity requires configured profiles")
+        profile = None
+    return {"task_set": task_set, "route": route,
+            "complexity": complexity, "profile_sha256": profile}
 
 
 def doctor(cfg) -> dict:
@@ -181,9 +199,13 @@ def main(argv: list[str] | None = None) -> int:
     metrics_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     metrics_parser.add_argument("--output", type=Path, required=True)
     metrics_parser.add_argument("--audit-output", type=Path)
+    metrics_parser.add_argument("--audit-task-set")
+    metrics_parser.add_argument("--audit-route")
+    metrics_parser.add_argument("--audit-complexity", choices=("easy", "medium", "hard"))
     audit_parser = commands.add_parser("route-audit")
     audit_parser.add_argument("--maintainer-state-dir", type=Path, required=True)
     audit_parser.add_argument("--snapshot", type=Path, required=True)
+    audit_parser.add_argument("--task-set")
     audit_parser.add_argument("--complexity", choices=("easy", "medium", "hard"))
     audit_parser.add_argument("--route", default="route:auto")
     correction_parser = commands.add_parser("request-changes")
@@ -290,6 +312,14 @@ def main(argv: list[str] | None = None) -> int:
             result = recommend_effort(cfg, GitHub(cfg.repo).issue(args.issue),
                                       args.maintainer_state_dir)
         elif args.command == "route-metrics":
+            scoped = args.audit_task_set is not None or args.audit_route is not None
+            if scoped and (not args.audit_output or args.audit_task_set is None
+                           or args.audit_route is None):
+                raise ValueError("scoped audit requires output, task set, and route")
+            if args.audit_complexity is not None and not scoped:
+                raise ValueError("audit complexity requires task set and route")
+            scope = (_audit_scope(cfg, args.audit_task_set, args.audit_route,
+                                  args.audit_complexity) if scoped else None)
             if args.audit_output and (args.audit_output.resolve() == args.output.resolve()
                                       or args.audit_output.exists()
                                       or args.output.exists()):
@@ -298,12 +328,19 @@ def main(argv: list[str] | None = None) -> int:
             snapshot = build_quality_snapshot(cfg, args.maintainer_state_dir,
                                               source_report=report)
             if args.audit_output:
-                cohort = audit_cohort(report)
-                audit = {**snapshot, "version": 2, "cohort": cohort,
+                cohort = audit_cohort(report, scope)
+                audit_quality = (build_quality_snapshot(cfg, args.maintainer_state_dir,
+                                 observed_at=datetime.fromisoformat(
+                                     snapshot["observed_at"]), source_report=report,
+                                 audit_scope=scope) if scope is not None else snapshot)
+                audit = {**audit_quality, "version": 3 if scope is not None else 2,
+                         "cohort": cohort,
                          "thresholds": {"min_samples": cfg.quality_min_samples,
                                         "max_age_seconds": cfg.quality_max_age_seconds},
                          "gates": {"admission": "required", "checks": "required",
                                    "maintainer_review": "required"}}
+                if scope is not None:
+                    audit["scope"] = scope
                 if len(json.dumps(audit, sort_keys=True).encode("utf-8")) > 65536:
                     raise ValueError("audit snapshot exceeds 64 KiB")
             if args.audit_output:
@@ -316,12 +353,18 @@ def main(argv: list[str] | None = None) -> int:
             if args.audit_output:
                 result["audit_output"] = str(args.audit_output)
         elif args.command == "route-audit":
+            scope = (_audit_scope(cfg, args.task_set, args.route, args.complexity)
+                     if args.task_set is not None else None)
             report = build_outcome_report(cfg, args.maintainer_state_dir)
             route_labels = [{"name": args.route}]
             if args.complexity:
                 route_labels.append({"name": "complexity:" + args.complexity})
-            candidates = _routed_models(cfg, {"labels": route_labels})
-            result = audit_route_order(cfg, report, args.snapshot, candidates)
+            if scope is None and cfg.complexity_profiles and args.complexity is None:
+                candidates = cfg.models
+            else:
+                candidates = _routed_models(cfg, {"labels": route_labels})
+            result = audit_route_order(cfg, report, args.snapshot, candidates,
+                                       scope=scope)
         elif args.command == "request-changes":
             result = request_changes(cfg, args.pr, args.note_file)
         elif args.command == "request-rebase":

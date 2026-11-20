@@ -286,7 +286,8 @@ def build_outcome_report(cfg: Config, maintainer_state_dir: Path,
 
 def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
                            *, observed_at: datetime | None = None,
-                           source_report: dict | None = None) -> dict:
+                           source_report: dict | None = None,
+                           audit_scope: dict | None = None) -> dict:
     """Measure first-review acceptance among confirmed, single-provider merges.
 
     Each eligible merged PR contributes one sample. Incomplete or ambiguous
@@ -303,6 +304,8 @@ def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
         for provider_id in sorted({model.provider_id for model in cfg.models})
     }
     for job in report["jobs"]:
+        if audit_scope is not None and not _in_audit_scope(job, audit_scope):
+            continue
         observed = job["observed_providers"]
         if (job["decision_state"] != "confirmed_merged"
                 or not job["attempt_history_complete"]
@@ -323,13 +326,25 @@ def build_quality_snapshot(cfg: Config, maintainer_state_dir: Path,
             "providers": providers}
 
 
-def audit_cohort(report: dict) -> dict:
+def _in_audit_scope(row: dict, scope: dict) -> bool:
+    return (row["task_set"] == scope["task_set"]
+            and row["route"] == scope["route"]
+            and row["complexity"] == scope["complexity"]
+            and row["profile_sha256"] == scope["profile_sha256"])
+
+
+def audit_cohort(report: dict, scope: dict | None = None) -> dict:
     """Identify the exact accepted PRs and the full bounded source report."""
     accepted = sorted(({"issue": row["issue"], "pr": row["pr"],
                         "head": row["head"],
                         "provider": row["observed_providers"][0],
-                        "first_review_accepted": row["first_review_accepted"]}
+                        "first_review_accepted": row["first_review_accepted"],
+                        **({"task_set": row["task_set"], "route": row["route"],
+                            "complexity": row["complexity"],
+                            "profile_sha256": row["profile_sha256"]}
+                           if scope is not None else {})}
                        for row in report["jobs"]
+                       if scope is None or _in_audit_scope(row, scope)
                        if row["decision_state"] == "confirmed_merged"
                        and row["attempt_history_complete"]
                        and not row["pending_attempts"]
