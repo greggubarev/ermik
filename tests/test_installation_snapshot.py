@@ -55,6 +55,25 @@ class InstallationSnapshotTests(unittest.TestCase):
         preserved = self.workspace.with_name("workspace.post-upgrade-backup")
         self.assertEqual((preserved / "checkout.txt").read_text(), "changed")
 
+    def test_verify_checks_selected_controller_schema_without_moving_files(self):
+        snapshot.backup(self.config, self.backup)
+        snapshot.verify(self.config, self.backup, max_schema=7)
+        for action in (snapshot.verify, snapshot.restore):
+            with self.subTest(action=action.__name__):
+                with self.assertRaisesRegex(ValueError, "unsupported schema"):
+                    action(self.config, self.backup, max_schema=6)
+        self.assertEqual((self.workspace / "checkout.txt").read_text(), "pending-work")
+        self.assertFalse(self.state.with_name("state.post-upgrade-backup").exists())
+        self.assertFalse(self.workspace.with_name("workspace.post-upgrade-backup").exists())
+
+    def test_verify_refuses_missing_empty_workspace(self):
+        (self.workspace / "checkout.txt").unlink()
+        snapshot.backup(self.config, self.backup)
+        (self.backup / "workspace").rmdir()
+        with self.assertRaisesRegex(ValueError, "incomplete or changed"):
+            snapshot.verify(self.config, self.backup)
+        self.assertTrue(self.workspace.is_dir())
+
     def test_incomplete_snapshot_preserves_original(self):
         snapshot.backup(self.config, self.backup)
         (self.backup / "workspace" / "checkout.txt").unlink()

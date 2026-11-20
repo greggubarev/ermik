@@ -17,6 +17,15 @@ EXCLUDED_DB = {"state.sqlite3", "state.sqlite3-wal", "state.sqlite3-shm",
                "state.sqlite3-journal"}
 
 
+def _file_digest(path):
+    h = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            h.update(chunk)
+        size = os.fstat(source.fileno()).st_size
+    return ["file", size, h.hexdigest()]
+
+
 def _digest(path):
     result = {}
     for entry in sorted(path.rglob("*")):
@@ -26,23 +35,19 @@ def _digest(path):
         elif entry.is_dir():
             result[name] = ["dir"]
         elif entry.is_file():
-            h = hashlib.sha256()
-            with entry.open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    h.update(chunk)
-            result[name] = ["file", entry.stat().st_size, h.hexdigest()]
+            result[name] = _file_digest(entry)
         else:
             raise ValueError(f"unsupported snapshot entry: {name}")
     return result
 
 
-def _db_check(path):
+def _db_check(path, max_schema=MAX_SCHEMA):
     if not path.is_file() or path.is_symlink():
         raise ValueError("snapshot database is missing or invalid")
     with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         version = db.execute("PRAGMA user_version").fetchone()[0]
         integrity = db.execute("PRAGMA quick_check").fetchone()[0]
-    if version not in range(MAX_SCHEMA + 1) or integrity != "ok":
+    if version not in range(max_schema + 1) or integrity != "ok":
         raise ValueError("snapshot database has unsupported schema or failed integrity")
     return version
 
@@ -93,7 +98,7 @@ def backup(config, destination):
         manifest = {"repo": repo, "state_dir": str(state), "workspace": str(workspace),
                     "schema": version, "state_files": _digest(destination / "state-files"),
                     "workspace_files": _digest(destination / "workspace"),
-                    "database": _digest(destination)["state.sqlite3"]}
+                    "database": _file_digest(destination / "state.sqlite3")}
         (destination / "manifest.json").write_text(json.dumps(manifest, sort_keys=True), encoding="utf-8")
         os.chmod(destination / "manifest.json", 0o600)
         os.chmod(destination / "state.sqlite3", 0o600)
@@ -104,24 +109,46 @@ def backup(config, destination):
     print(f"snapshot schema {version}: {destination}")
 
 
-def restore(config, snapshot):
+def _verified_snapshot(config, snapshot, max_schema):
+    if type(max_schema) is not int or not 0 <= max_schema <= MAX_SCHEMA:
+        raise ValueError("invalid maximum schema version")
     repo, state, workspace = _locations(config)
     if snapshot == state or snapshot == workspace or state in snapshot.parents or workspace in snapshot.parents:
         raise ValueError("snapshot must be outside live directories")
-    manifest = json.loads((snapshot / "manifest.json").read_text(encoding="utf-8"))
+    manifest_path = snapshot / "manifest.json"
+    db_path = snapshot / "state.sqlite3"
+    for entry in (manifest_path, db_path):
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError("snapshot is incomplete or changed")
+    for entry in (snapshot / "state-files", snapshot / "workspace"):
+        if entry.is_symlink() or not entry.is_dir():
+            raise ValueError("snapshot is incomplete or changed")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("invalid snapshot manifest")
     if (manifest.get("repo") != repo or manifest.get("state_dir") != str(state)
             or manifest.get("workspace") != str(workspace)):
         raise ValueError("snapshot installation identity differs")
-    if (_digest(snapshot / "state-files") != manifest.get("state_files")
-            or _digest(snapshot / "workspace") != manifest.get("workspace_files")
-            or _digest(snapshot).get("state.sqlite3") != manifest.get("database")):
+    if (_file_digest(db_path) != manifest.get("database")
+            or _digest(snapshot / "state-files") != manifest.get("state_files")
+            or _digest(snapshot / "workspace") != manifest.get("workspace_files")):
         raise ValueError("snapshot is incomplete or changed")
-    version = _db_check(snapshot / "state.sqlite3")
-    if version != manifest.get("schema"):
+    version = _db_check(db_path, max_schema)
+    if type(manifest.get("schema")) is not int or version != manifest["schema"]:
         raise ValueError("snapshot schema differs from manifest")
     expected = _namespace(repo, state)
     _check_marker(state, expected)
     _check_marker(snapshot / "state-files", expected)
+    return state, workspace, manifest, version
+
+
+def verify(config, snapshot, *, max_schema=MAX_SCHEMA):
+    _, _, _, version = _verified_snapshot(config, snapshot, max_schema)
+    print(f"verified snapshot schema {version}")
+
+
+def restore(config, snapshot, *, max_schema=MAX_SCHEMA):
+    state, workspace, manifest, version = _verified_snapshot(config, snapshot, max_schema)
     saved_state = state.with_name(f"{state.name}.post-upgrade-{snapshot.name}")
     saved_workspace = workspace.with_name(f"{workspace.name}.post-upgrade-{snapshot.name}")
     if saved_state.exists() or saved_workspace.exists():
@@ -161,14 +188,21 @@ def restore(config, snapshot):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("backup", "restore"))
+    parser.add_argument("action", choices=("backup", "verify", "restore"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--max-schema", type=int,
+                        choices=range(MAX_SCHEMA + 1),
+                        help="highest schema the selected controller supports")
     args = parser.parse_args()
     if args.action == "backup":
+        if args.max_schema is not None:
+            parser.error("--max-schema applies to verify and restore")
         backup(args.config, args.snapshot.absolute())
-    else:
-        restore(args.config, args.snapshot.resolve(strict=True))
+        return
+    action = verify if args.action == "verify" else restore
+    max_schema = MAX_SCHEMA if args.max_schema is None else args.max_schema
+    action(args.config, args.snapshot.resolve(strict=True), max_schema=max_schema)
 
 
 if __name__ == "__main__":
