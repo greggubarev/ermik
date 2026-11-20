@@ -435,7 +435,7 @@ def event(conn: sqlite3.Connection, issue: int, kind: str, *,
             "admitted", "readmitted", "claimed", "retry_scheduled", "retry_started", "model_selected",
             "quota_paused", "checks_passed", "pr_published", "awaiting_review", "blocked",
             "correction_started", "merged", "evidence_delivered",
-            "route_decision"}:
+            "route_decision", "retry_block_label_pending", "retry_block_label_synced"}:
         raise ValueError("invalid event")
     if kind == "route_decision":
         model_ref = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}/[A-Za-z0-9][A-Za-z0-9._-]{0,79}")

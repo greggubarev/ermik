@@ -238,13 +238,15 @@ class RuntimeRecoveryTests(unittest.TestCase):
                     raise runtime.GitHubError("temporary read failure")
                 return read_issue(hub, number)
 
-            with patch.object(Hub, "issue", fail_retry_verification):
+            with patch.object(Hub, "issue", fail_retry_verification), patch.object(
+                    runtime, "_mark_issue_blocked", return_value=False):
                 self.assertEqual(self._run_due(due, AssertionError("worker must not run")),
                                  [])
             with state.connect(self.cfg.state_dir) as conn:
                 self.assertEqual(state.job(conn, 1)["status"], expected_status)
                 self.assertEqual(conn.execute(
-                    "SELECT kind FROM events WHERE issue=1 ORDER BY id DESC LIMIT 1"
+                    "SELECT kind FROM events WHERE issue=1 AND kind IN "
+                    "('retry_scheduled','blocked') ORDER BY id DESC LIMIT 1"
                 ).fetchone()[0], expected_event)
                 retry = conn.execute(
                     "SELECT next_retry_at,lease_token FROM retry_state WHERE issue=1"
@@ -252,8 +254,13 @@ class RuntimeRecoveryTests(unittest.TestCase):
                 due = retry["next_retry_at"]
                 self.assertIsNone(retry["lease_token"])
         self.assertIsNone(due)
+        self.assertIn("state:in-progress", Hub.issues[1]["names"])
+        self.assertEqual(runtime.run_once(self.cfg), [])
         self.assertIn("state:blocked", Hub.issues[1]["names"])
         self.assertNotIn("state:in-progress", Hub.issues[1]["names"])
+        with patch.object(runtime, "_mark_issue_blocked") as mark_blocked:
+            self.assertEqual(runtime.run_once(self.cfg), [])
+        mark_blocked.assert_not_called()
 
     def test_preexisting_branch_pr_blocks_retry_without_second_pr(self):
         due = self._first_failure()

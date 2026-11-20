@@ -1758,6 +1758,24 @@ def _mark_issue_blocked(gh: GitHub, issue: int) -> bool:
         return False
 
 
+def _reconcile_blocked_retry_labels(gh: GitHub, conn: sqlite3.Connection) -> None:
+    """Retry a bounded batch of label updates for durably blocked retries."""
+    pending = conn.execute(
+        "SELECT j.issue FROM jobs j JOIN events e ON e.id=("
+        "SELECT id FROM events WHERE issue=j.issue AND kind IN "
+        "('blocked','retry_block_label_pending','retry_block_label_synced') "
+        "ORDER BY id DESC LIMIT 1) "
+        "WHERE j.status='blocked' AND e.kind='retry_block_label_pending' "
+        "ORDER BY e.id LIMIT 9").fetchall()
+    for row in pending[:8]:
+        issue = row[0]
+        if _mark_issue_blocked(gh, issue):
+            state.event(conn, issue, "retry_block_label_synced")
+        elif len(pending) > 8:
+            # Let later items proceed if this Issue is temporarily unavailable.
+            state.event(conn, issue, "retry_block_label_pending")
+
+
 def _readmit_prepublication(gh: GitHub, cfg: Config, conn: sqlite3.Connection) -> None:
     """Resume only a blocked job for which execution provably never began."""
     if not cfg.complexity_profiles:
@@ -2476,9 +2494,9 @@ def run_once(cfg: Config) -> list[dict]:
         work: list[tuple[int, str, IssueSpec, str | None, int | None, RecoveryClaim | None]] = []
         reserved_providers: dict[str, int] = {}
         selected_providers: dict[int, str] = {}
-        blocked_retries: list[int] = []
         review_budget = [min(10, max(1, cfg.poll_seconds // 5))]
         with state.connect(cfg.state_dir) as conn:
+            _reconcile_blocked_retry_labels(gh, conn)
             _readmit_prepublication(gh, cfg, conn)
             _reconcile_interrupted(gh, cfg, conn)
             recovered = recover_stale_worktrees(cfg.workspace, conn)
@@ -2556,9 +2574,13 @@ def run_once(cfg: Config) -> list[dict]:
                             if decision.status == "blocked":
                                 conn.execute("UPDATE jobs SET error=? WHERE issue=?",
                                              ("Retry verification requires inspection", claim.issue))
-                                blocked_retries.append(claim.issue)
-                            state.event(conn, claim.issue, "blocked" if decision.status == "blocked"
-                                        else "retry_scheduled")
+                                state.event(conn, claim.issue, "blocked")
+                                state.event(conn, claim.issue, "retry_block_label_pending")
+                                conn.commit()
+                                if _mark_issue_blocked(gh, claim.issue):
+                                    state.event(conn, claim.issue, "retry_block_label_synced")
+                            else:
+                                state.event(conn, claim.issue, "retry_scheduled")
                             continue
                 correction = _correction(gh, cfg, conn, review_budget,
                                          reserved_providers, selected_providers)
@@ -2574,8 +2596,6 @@ def run_once(cfg: Config) -> list[dict]:
                     break
                 number, branch, spec = claimed
                 work.append((number, branch, spec, None, None, None))
-        for issue in blocked_retries:
-            _mark_issue_blocked(gh, issue)
         if not work:
             return []
 
